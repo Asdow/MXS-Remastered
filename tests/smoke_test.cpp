@@ -9,8 +9,9 @@
 //     cl /nologo /EHsc /std:c++17 tests\smoke_test.cpp user32.lib gdi32.lib
 //   Run (a .bmp path saves a screenshot of the panel; --custom expects an mxcam.ini next to the
 //   DLL with CustomCamera=1, HeadHeight=0.1 and [Replay] ChaseCam=1 and checks the custom and 3rd
-//   person cameras instead; --helmet expects [Replay] Camera=2 and checks the helmet replay camera):
-//     smoke_test.exe bin\x64\Release\opengl32.dll [--custom | --helmet] [panel.bmp]
+//   person cameras instead; --helmet expects [Replay] Camera=2 and checks the helmet replay camera,
+//   --side Camera=2 and HelmetMount=2, the helmet camera on the right side of the helmet):
+//     smoke_test.exe bin\x64\Release\opengl32.dll [--custom | --helmet | --side] [panel.bmp]
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -159,18 +160,20 @@ void Swap(bool resetFilters = false)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        printf("usage: smoke_test <path to proxy opengl32.dll> [--custom | --helmet] [panel.bmp]\n");
+        printf("usage: smoke_test <path to proxy opengl32.dll> [--custom | --helmet | --side] [panel.bmp]\n");
         return 2;
     }
     // --custom: the DLL's mxcam.ini sets CustomCamera=1 and HeadHeight=0.1 (otherwise defaults).
-    // --helmet: it sets [Replay] Camera=2 (otherwise defaults).
-    bool custom = false, helmet = false;
+    // --helmet: it sets [Replay] Camera=2 (otherwise defaults); --side also HelmetMount=2.
+    bool custom = false, helmet = false, side = false;
     const char* screenshot = nullptr;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--custom") == 0)
             custom = true;
         else if (strcmp(argv[i], "--helmet") == 0)
             helmet = true;
+        else if (strcmp(argv[i], "--side") == 0)
+            helmet = side = true;
         else
             screenshot = argv[i];
     }
@@ -572,7 +575,7 @@ int main(int argc, char** argv)
             // rider: centres, rotations and a bone count too, and a draw call, followed by the
             // rider's head, a rigid model of its own (as the game draws it), turned 20 degrees to
             // the rider's left and 15 down from the torso.
-            printf("Replay (%s)\n", helmet ? "helmet camera, Camera=2" : (custom ? "3rd person camera, ChaseCam=1" : "game camera"));
+            printf("Replay (%s)\n", side ? "helmet camera on the right side, HelmetMount=2" : helmet ? "helmet camera, Camera=2" : (custom ? "3rd person camera, ChaseCam=1" : "game camera"));
             {
                 const GLuint skinned = helmet
                     ? build("uniform mat4 u_modelview; uniform mat4 u_projection; uniform int u_nbones;\n"
@@ -766,7 +769,15 @@ int main(int argc, char** argv)
                 constexpr double kHeadYaw = -70, kHeadPitch = -15;
                 float headTurn[16];
                 MakeWorld({ 0, 0, 0 }, kHeadYaw, kHeadPitch, 0, headTurn);
-                const V3 kHeadUp{ headTurn[4], headTurn[5], headTurn[6] };
+                const V3 kHeadRight{ headTurn[0], headTurn[1], headTurn[2] }, kHeadUp{ headTurn[4], headTurn[5], headTurn[6] },
+                         kHeadBack{ headTurn[8], headTurn[9], headTurn[10] };
+                // The default mounts: on top, 0.7 above the eyes and tilted 20 degrees down; on the
+                // side, 0.6 out, 0.35 up, 0.6 back and tilted 5 degrees down.
+                const V3 kMount = side ? V3{ 0.6 * kHeadRight.x + 0.35 * kHeadUp.x + 0.6 * kHeadBack.x,
+                                             0.6 * kHeadRight.y + 0.35 * kHeadUp.y + 0.6 * kHeadBack.y,
+                                             0.6 * kHeadRight.z + 0.35 * kHeadUp.z + 0.6 * kHeadBack.z }
+                                       : V3{ 0.7 * kHeadUp.x, 0.7 * kHeadUp.y, 0.7 * kHeadUp.z };
+                const double kTiltDeg = side ? 5 : 20;
                 for (;;) {
                     QueryPerformanceCounter(&now);
                     const double t = double(now.QuadPart - start.QuadPart) / freq.QuadPart;
@@ -793,10 +804,10 @@ int main(int argc, char** argv)
                         V3 chaseEye;
                         Decompose(readback, chaseEye, chaseRoll);
                         // The default placement: 4.5 behind and 1.55 above the rider; for the helmet
-                        // camera 0.7 above the rider's eyes along the head's up axis (the eyes: 1.5 and
-                        // 0.56 half-spans up and forward of the torso bone, which is at the rider).
-                        const V3 wanted = helmet ? V3{ rider.x + 0.56 * 1.456 + 0.7 * kHeadUp.x, rider.y + 1.5 * 1.456 + 0.7 * kHeadUp.y,
-                                                       rider.z + 0.7 * kHeadUp.z }
+                        // camera the mount, on the head's axes, from the rider's eyes (1.5 and 0.56
+                        // half-spans up and forward of the torso bone, which is at the rider).
+                        const V3 wanted = helmet ? V3{ rider.x + 0.56 * 1.456 + kMount.x, rider.y + 1.5 * 1.456 + kMount.y,
+                                                       rider.z + kMount.z }
                                                  : V3{ rider.x - 4.5, rider.y + 1.55, rider.z };
                         if (helmet)
                             helmetEyeError = fmax(helmetEyeError, EyeShift(chaseEye, wanted));  // every frame
@@ -889,11 +900,11 @@ int main(int argc, char** argv)
                         glUniformMatrix4fv(skinnedMv, 1, GL_FALSE, headView);
                         p_glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, kIndices);
                         if (t > 2.2) {
-                            // In the picture the helmet holds still: 20 degrees up from the camera's
-                            // forward (its tilt), always at the same spot.
+                            // In the picture the helmet holds still: tilted up from the camera's forward
+                            // by the camera's tilt, always at the same spot.
                             float drawn[16];
                             glGetUniformfv(skinned, skinnedMv, drawn);
-                            const double s = sin(20 * 3.14159265358979 / 180), c = cos(20 * 3.14159265358979 / 180);
+                            const double s = sin(kTiltDeg * 3.14159265358979 / 180), c = cos(kTiltDeg * 3.14159265358979 / 180);
                             headTiltError = fmax(headTiltError, EyeShift({ drawn[8], drawn[9], drawn[10] }, { 0, -s, c }));
                             const V3 origin{ drawn[12], drawn[13], drawn[14] };
                             if (!haveHeadOrigin)
@@ -917,7 +928,8 @@ int main(int argc, char** argv)
                            chaseHeading, chasePitch, chaseRoll, helmetEyeError);
                     printf("    helmet in the picture: turned %.4f from where it belongs, moved %.4f\n", headTiltError, headShift);
                     Check(fabs(chaseHeading + 20.0) < 1.5, "the camera looks the way the rider's head faces (20 degrees left of the torso)");
-                    Check(fabs(chasePitch + 35.0) < 1.5 && fabs(chaseRoll) < 1.5, "it's angled 20 degrees down from the head (15 down), level");
+                    Check(fabs(chasePitch + 15.0 + kTiltDeg) < 1.5 && fabs(chaseRoll) < 1.5,
+                          "it's angled down by its tilt from the head (15 down), level");
                     Check(helmetEyeError < 0.08, "it sits on top of the helmet, moving with the rider");
                     Check(haveHeadOrigin && headTiltError < 0.002 && headShift < 0.005,
                           "the helmet holds still in the picture while the head shakes");

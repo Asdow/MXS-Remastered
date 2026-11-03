@@ -128,6 +128,11 @@ bool SaveConfig()
         { L"Replay",    L"HelmetHeight",         g_config.helmetHeight },
         { L"Replay",    L"HelmetForward",        g_config.helmetForward },
         { L"Replay",    L"HelmetTiltDeg",        g_config.helmetTiltDeg },
+        { L"Replay",    L"HelmetMount",          static_cast<double>(g_config.helmetMount) },
+        { L"Replay",    L"SideHeight",           g_config.sideHeight },
+        { L"Replay",    L"SideForward",          g_config.sideForward },
+        { L"Replay",    L"SideTiltDeg",          g_config.sideTiltDeg },
+        { L"Replay",    L"SideOut",              g_config.sideOut },
         { L"Replay",    L"HelmetSmoothing",      g_config.helmetSmoothing },
         { L"Replay",    L"HelmetLevel",          g_config.helmetLevel },
     };
@@ -190,6 +195,11 @@ void ResetTunables()
     g_config.helmetHeight         = defaults.helmetHeight;
     g_config.helmetForward        = defaults.helmetForward;
     g_config.helmetTiltDeg        = defaults.helmetTiltDeg;
+    g_config.helmetMount          = defaults.helmetMount;
+    g_config.sideHeight           = defaults.sideHeight;
+    g_config.sideForward          = defaults.sideForward;
+    g_config.sideTiltDeg          = defaults.sideTiltDeg;
+    g_config.sideOut              = defaults.sideOut;
     g_config.helmetSmoothing      = defaults.helmetSmoothing;
     g_config.helmetLevel          = defaults.helmetLevel;
 }
@@ -275,6 +285,11 @@ void ReloadConfig()
     c.helmetHeight    = ReadDouble(L"Replay", L"HelmetHeight", c.helmetHeight);
     c.helmetForward   = ReadDouble(L"Replay", L"HelmetForward", c.helmetForward);
     c.helmetTiltDeg   = ReadDouble(L"Replay", L"HelmetTiltDeg", c.helmetTiltDeg);
+    c.helmetMount     = ReadInt(L"Replay", L"HelmetMount", c.helmetMount);
+    c.sideHeight      = ReadDouble(L"Replay", L"SideHeight", c.sideHeight);
+    c.sideForward     = ReadDouble(L"Replay", L"SideForward", c.sideForward);
+    c.sideTiltDeg     = ReadDouble(L"Replay", L"SideTiltDeg", c.sideTiltDeg);
+    c.sideOut         = ReadDouble(L"Replay", L"SideOut", c.sideOut);
     c.helmetSmoothing = ReadDouble(L"Replay", L"HelmetSmoothing", c.helmetSmoothing);
     c.helmetLevel     = ReadDouble(L"Replay", L"HelmetLevel", c.helmetLevel);
 
@@ -318,6 +333,11 @@ void ReloadConfig()
     c.helmetHeight         = Clamp(c.helmetHeight, -2.0, 5.0);
     c.helmetForward        = Clamp(c.helmetForward, -3.0, 3.0);
     c.helmetTiltDeg        = Clamp(c.helmetTiltDeg, -30.0, 80.0);
+    c.helmetMount          = Clamp(c.helmetMount, 0, 2);
+    c.sideHeight           = Clamp(c.sideHeight, -2.0, 5.0);
+    c.sideForward          = Clamp(c.sideForward, -3.0, 3.0);
+    c.sideTiltDeg          = Clamp(c.sideTiltDeg, -30.0, 80.0);
+    c.sideOut              = Clamp(c.sideOut, 0.0, 3.0);
     c.helmetSmoothing      = Clamp(c.helmetSmoothing, 0.0, 1.0);
     c.helmetLevel          = Clamp(c.helmetLevel, 0.0, 1.0);
 

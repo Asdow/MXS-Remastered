@@ -321,10 +321,14 @@ void PrepareHelmet(Vec3 followed, double dt)
         Log("replay: filming from the rider's %s", head.model ? "helmet (its head model)" : "torso (no head model found)");
     h.onModel = head.model;
 
-    // The mount, on the head's axes: above and forward of the eyes, angled down by the tilt.
+    // The mount, on the head's axes: above, forward and (side mounts) out to the side of the
+    // eyes, angled down by the tilt.
+    const bool side = cfg.helmetMount != 0;
+    const Vec3 local{ side ? (cfg.helmetMount == 1 ? -cfg.sideOut : cfg.sideOut) : 0.0,
+                      side ? cfg.sideHeight : cfg.helmetHeight, -(side ? cfg.sideForward : cfg.helmetForward) };
     const Vec3 up = Rotate(axes, { 0, 1, 0 }), back = Rotate(axes, { 0, 0, 1 });
-    const Vec3 mount = eye + up * cfg.helmetHeight - back * cfg.helmetForward;
-    const double tilt = cfg.helmetTiltDeg * kDegToRad;
+    const Vec3 mount = eye + Rotate(axes, local);
+    const double tilt = (side ? cfg.sideTiltDeg : cfg.helmetTiltDeg) * kDegToRad;
     const Vec3 forward = -(back * std::cos(tilt) + up * std::sin(tilt));
     const Vec3 mountUp = up * std::cos(tilt) - back * std::sin(tilt);
     Quat target = QuatFromBasis(Cross(forward, mountUp), mountUp, -forward);
@@ -333,7 +337,7 @@ void PrepareHelmet(Vec3 followed, double dt)
         const Vec3 right = Normalize(levelRight);
         target = Slerp(target, QuatFromBasis(right, Cross(right, forward), -forward), cfg.helmetLevel);
     }
-    h.mountInModel = h.eyeInModel + Vec3{ 0, cfg.helmetHeight, -cfg.helmetForward };
+    h.mountInModel = h.eyeInModel + local;
     h.cameraInModel = Conjugate(axes) * target;
     const Vec3 offset = ToCamera(mount - g_camera.pos);
 

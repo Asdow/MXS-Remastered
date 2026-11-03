@@ -7,8 +7,8 @@
 //
 //   While a replay is on, the helmet cam is skipped. The replay is shown the way the game films
 //   it, or (Config::replayCamera) from a camera locked behind the rider, like the game's
-//   third-person view when riding, or from a camera mounted on top of the rider's helmet, like a
-//   GoPro. The rider is found through its skinned mesh: 'u_bone_t' carries the bones' world-space
+//   third-person view when riding, or from a camera mounted on the rider's helmet (on top, or on
+//   its left or right side), like a GoPro. The rider is found through its skinned mesh: 'u_bone_t' carries the bones' world-space
 //   positions, and 'u_bone_r' their rotations, which give the head's.
 #pragma once
 

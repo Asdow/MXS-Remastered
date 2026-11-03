@@ -686,6 +686,14 @@ struct RowDef {
     bool             locked = false; // work in progress: drawn dimmed and can't be changed
     int Config::*    option = nullptr;     // Choice of three: 0 / 1 / 2, instead of flag
     const char*      thirdText = nullptr;  // its third option
+    double Config::* sideNumber = nullptr; // Slider: what it sets instead with the helmet camera on a side mount
+
+    RowDef Side(double Config::* field) const
+    {
+        RowDef def = *this;
+        def.sideNumber = field;
+        return def;
+    }
 
     RowDef Help(const char* text) const
     {
@@ -820,8 +828,8 @@ const RowDef kRows[] = {
     // ---- REPLAY ----
     Choice3(3, "REPLAY CAMERA", "Camera",              &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
         .Help("GAME is the replay's own camera, which faces one way while the rider swivels in front "
-              "of it. 3RD PERSON locks the camera behind the rider. HELMET is a GoPro on top of the "
-              "rider's helmet."),
+              "of it. 3RD PERSON locks the camera behind the rider. HELMET is a GoPro on the rider's "
+              "helmet, on top or on its side."),
     Slider(3, "3RD PERSON CAMERA", "Distance behind",  &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
         .Help("3rd person replays: how far behind the rider the camera sits. Lower moves it forward, "
               "closer to the rider."),
@@ -829,12 +837,21 @@ const RowDef kRows[] = {
         .Help("3rd person replays: how high above the rider the camera sits."),
     Slider(3, nullptr,          "Pitch",               &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
         .Help("3rd person replays: how far the camera looks down. Negative looks up."),
-    Slider(3, "HELMET CAMERA",  "Mount height",        &Config::helmetHeight,     -0.5,  2.0,   0.01,   1.0,    2, " m")
+    Choice3(3, "HELMET CAMERA", "Mount",               &Config::helmetMount, "TOP", "LEFT", "RIGHT")
+        .Help("Helmet replays: TOP mounts the camera on top of the helmet, LEFT and RIGHT on its side "
+              "like a GoPro side mount. Each keeps its own height, forward and tilt."),
+    Slider(3, nullptr,          "Mount height",        &Config::helmetHeight,     -0.5,  2.0,   0.01,   1.0,    2, " m")
+        .Side(&Config::sideHeight)
         .Help("Helmet replays: how far above the rider's eyes the camera sits, along the helmet. Raise "
               "it if the helmet gets in the way, lower it if the camera floats over the helmet."),
-    Slider(3, nullptr,          "Mount forward",       &Config::helmetForward,    -1.0,  1.0,   0.01,   1.0,    2, " m")
+    Slider(3, nullptr,          "Mount forward",       &Config::helmetForward,    -1.5,  1.0,   0.01,   1.0,    2, " m")
+        .Side(&Config::sideForward)
         .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet."),
+    Slider(3, nullptr,          "Mount out",           &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
+        .Help("Side-mounted helmet replays: how far out to the side of the head the camera sits. Raise "
+              "it if the camera ends up inside the helmet."),
     Slider(3, nullptr,          "Tilt",                &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
+        .Side(&Config::sideTiltDeg)
         .Help("Helmet replays: how far the camera is angled down from where the helmet faces. More "
               "shows more of the bars and the bike, less shows more of the track ahead."),
     Slider(3, nullptr,          "Stabilization",       &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
@@ -1155,8 +1172,12 @@ bool RowInactive(const RowDef& def, const Config& cfg)
     if (def.tab == 3 && def.number) {  // placement for a replay camera that isn't the one chosen
         const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||
                            def.number == &Config::replayPitchDeg;
+        if (def.number == &Config::sideOut && cfg.helmetMount == 0)
+            return true;
         return cfg.replayCamera != (chase ? 1 : 2);
     }
+    if (def.option == &Config::helmetMount)
+        return cfg.replayCamera != 2;
     return false;
 }
 
@@ -1316,7 +1337,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
         const float labelY = y + std::round((rowH - LineHeight(kFontBody)) * 0.5f);
 
         if (def.kind == RowKind::Slider) {
-            double& value = cfg.*def.number;
+            double& value = cfg.*(def.sideNumber && cfg.helmetMount != 0 ? def.sideNumber : def.number);
             if (hot && in.pressed && !def.locked)
                 g_panel.dragging = i;
             if (active && in.down)
