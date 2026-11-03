@@ -78,7 +78,7 @@ struct Config {
     double replayHeight     = 1.55;       // m above the rider (the middle of its body)
     double replayPitchDeg   = 12.0;       // look-down angle (positive = down)
     // helmet camera: a camera mounted on top of the rider's helmet, placed from its eyes
-    int    helmetMount      = 0;          // 0 = on top of the helmet, 1 = its left side, 2 = its right side
+    int    helmetMount      = 0;          // 0 = on top of the helmet, 1 = its left side, 2 = its right side, 3 = the chest
     double helmetHeight     = 0.7;        // top mount: above the eyes, along the head's up axis
     double helmetForward    = 0.0;        // top mount: along the head's forward axis (+ = forward)
     double helmetTiltDeg    = 20.0;       // top mount: how far the camera is angled down
@@ -86,6 +86,9 @@ struct Config {
     double sideForward      = -0.6;
     double sideTiltDeg      = 5.0;
     double sideOut          = 0.6;        // side mount: how far out from the middle of the head
+    double chestHeight      = -0.55;      // chest mount: above the middle of the shoulders (- = below), along the torso
+    double chestForward     = 0.45;       // chest mount: in front of the shoulders
+    double chestTiltDeg     = 10.0;       // chest mount: how far the camera is angled down from the torso
     double helmetSmoothing  = 0.3;        // 0..1 stabilisation of its rotation (0 = every jolt of the head)
     double helmetLevel      = 0.0;        // 0..1 fraction of the head's roll removed
 };

@@ -684,14 +684,22 @@ struct RowDef {
     int Config::*    key = nullptr;  // Key: a virtual-key code, picked by pressing the key
     const char*      help = nullptr; // shown beside the panel while the row is selected / under the mouse
     bool             locked = false; // work in progress: drawn dimmed and can't be changed
-    int Config::*    option = nullptr;     // Choice of three: 0 / 1 / 2, instead of flag
+    int Config::*    option = nullptr;     // Choice of three or four: 0 / 1 / 2 (/ 3), instead of flag
     const char*      thirdText = nullptr;  // its third option
+    const char*      fourthText = nullptr; // and fourth, if it has one
     double Config::* sideNumber = nullptr; // Slider: what it sets instead with the helmet camera on a side mount
+    double Config::* chestNumber = nullptr; // and on the chest mount
 
     RowDef Side(double Config::* field) const
     {
         RowDef def = *this;
         def.sideNumber = field;
+        return def;
+    }
+    RowDef Chest(double Config::* field) const
+    {
+        RowDef def = *this;
+        def.chestNumber = field;
         return def;
     }
 
@@ -734,6 +742,24 @@ RowDef Choice3(int tab, const char* section, const char* label, int Config::* op
     def.option = option;
     def.thirdText = third;
     return def;
+}
+
+RowDef Choice4(int tab, const char* section, const char* label, int Config::* option, const char* first,
+               const char* second, const char* third, const char* fourth)
+{
+    RowDef def = Choice3(tab, section, label, option, first, second, third);
+    def.fourthText = fourth;
+    return def;
+}
+
+// The field a slider sets: per helmet camera mount where it has them.
+double Config::* SliderField(const RowDef& def, const Config& cfg)
+{
+    if (def.chestNumber && cfg.helmetMount == 3)
+        return def.chestNumber;
+    if (def.sideNumber && (cfg.helmetMount == 1 || cfg.helmetMount == 2))
+        return def.sideNumber;
+    return def.number;
 }
 
 RowDef KeyRow(int tab, const char* section, const char* label, int Config::* key)
@@ -837,21 +863,23 @@ const RowDef kRows[] = {
         .Help("3rd person replays: how high above the rider the camera sits."),
     Slider(3, nullptr,          "Pitch",               &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
         .Help("3rd person replays: how far the camera looks down. Negative looks up."),
-    Choice3(3, "HELMET CAMERA", "Mount",               &Config::helmetMount, "TOP", "LEFT", "RIGHT")
-        .Help("Helmet replays: TOP mounts the camera on top of the helmet, LEFT and RIGHT on its side "
-              "like a GoPro side mount. Each keeps its own height, forward and tilt."),
-    Slider(3, nullptr,          "Mount height",        &Config::helmetHeight,     -0.5,  2.0,   0.01,   1.0,    2, " m")
-        .Side(&Config::sideHeight)
-        .Help("Helmet replays: how far above the rider's eyes the camera sits, along the helmet. Raise "
-              "it if the helmet gets in the way, lower it if the camera floats over the helmet."),
-    Slider(3, nullptr,          "Mount forward",       &Config::helmetForward,    -1.5,  1.0,   0.01,   1.0,    2, " m")
-        .Side(&Config::sideForward)
-        .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet."),
+    Choice4(3, "HELMET CAMERA", "Mount",               &Config::helmetMount, "TOP", "LEFT", "RIGHT", "CHEST")
+        .Help("Helmet replays: TOP mounts the camera on top of the helmet, LEFT and RIGHT on its side, "
+              "CHEST on the rider's chest (it turns with the body, not the head). Each keeps its own "
+              "height, forward and tilt."),
+    Slider(3, nullptr,          "Mount height",        &Config::helmetHeight,     -1.5,  2.0,   0.01,   1.0,    2, " m")
+        .Side(&Config::sideHeight).Chest(&Config::chestHeight)
+        .Help("Helmet replays: how far above the rider's eyes the camera sits (chest mount: above the "
+              "middle of the shoulders, negative is below them)."),
+    Slider(3, nullptr,          "Mount forward",       &Config::helmetForward,    -1.5,  1.5,   0.01,   1.0,    2, " m")
+        .Side(&Config::sideForward).Chest(&Config::chestForward)
+        .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet (chest mount: "
+              "how far in front of the shoulders it sits)."),
     Slider(3, nullptr,          "Mount out",           &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
         .Help("Side-mounted helmet replays: how far out to the side of the head the camera sits. Raise "
               "it if the camera ends up inside the helmet."),
     Slider(3, nullptr,          "Tilt",                &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
-        .Side(&Config::sideTiltDeg)
+        .Side(&Config::sideTiltDeg).Chest(&Config::chestTiltDeg)
         .Help("Helmet replays: how far the camera is angled down from where the helmet faces. More "
               "shows more of the bars and the bike, less shows more of the track ahead."),
     Slider(3, nullptr,          "Stabilization",       &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
@@ -1172,7 +1200,7 @@ bool RowInactive(const RowDef& def, const Config& cfg)
     if (def.tab == 3 && def.number) {  // placement for a replay camera that isn't the one chosen
         const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||
                            def.number == &Config::replayPitchDeg;
-        if (def.number == &Config::sideOut && cfg.helmetMount == 0)
+        if (def.number == &Config::sideOut && cfg.helmetMount != 1 && cfg.helmetMount != 2)
             return true;
         return cfg.replayCamera != (chase ? 1 : 2);
     }
@@ -1337,7 +1365,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
         const float labelY = y + std::round((rowH - LineHeight(kFontBody)) * 0.5f);
 
         if (def.kind == RowKind::Slider) {
-            double& value = cfg.*(def.sideNumber && cfg.helmetMount != 0 ? def.sideNumber : def.number);
+            double& value = cfg.*SliderField(def, cfg);
             if (hot && in.pressed && !def.locked)
                 g_panel.dragging = i;
             if (active && in.down)
@@ -1391,9 +1419,9 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             Text(kFontSmall, bx + boxPad, boxY + std::round((boxH - LineHeight(kFontSmall)) * 0.5f), text,
                  waiting ? kPanelSolid : valueColor, S(2));
             Text(kFontBody, x, labelY, def.label, labelColor, 0);
-        } else {  // Choice: two or three segments, e.g. GAME | CUSTOM
-            const char* options[3] = { def.offText, def.onText, def.thirdText };
-            const int count = def.option ? 3 : 2;
+        } else {  // Choice: two to four segments, e.g. GAME | CUSTOM
+            const char* options[4] = { def.offText, def.onText, def.thirdText, def.fourthText };
+            const int count = def.option ? (def.fourthText ? 4 : 3) : 2;
             const int current = def.option ? cfg.*def.option : (cfg.*def.flag ? 1 : 0);
             const auto Pick = [&](int o) {
                 if (def.option)
@@ -1402,7 +1430,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
                     SetFlag(cfg.*def.flag, o == 1);
             };
             const float segH = S(26), segPad = S(12), segY = std::round(y + (rowH - segH) * 0.5f);
-            float segW[3], total = 0;
+            float segW[4], total = 0;
             for (int o = 0; o < count; ++o) {
                 segW[o] = TextWidth(kFontSmall, options[o], S(2)) + 2 * segPad;
                 total += segW[o];

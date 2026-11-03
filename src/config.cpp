@@ -133,6 +133,9 @@ bool SaveConfig()
         { L"Replay",    L"SideForward",          g_config.sideForward },
         { L"Replay",    L"SideTiltDeg",          g_config.sideTiltDeg },
         { L"Replay",    L"SideOut",              g_config.sideOut },
+        { L"Replay",    L"ChestHeight",          g_config.chestHeight },
+        { L"Replay",    L"ChestForward",         g_config.chestForward },
+        { L"Replay",    L"ChestTiltDeg",         g_config.chestTiltDeg },
         { L"Replay",    L"HelmetSmoothing",      g_config.helmetSmoothing },
         { L"Replay",    L"HelmetLevel",          g_config.helmetLevel },
     };
@@ -200,6 +203,9 @@ void ResetTunables()
     g_config.sideForward          = defaults.sideForward;
     g_config.sideTiltDeg          = defaults.sideTiltDeg;
     g_config.sideOut              = defaults.sideOut;
+    g_config.chestHeight          = defaults.chestHeight;
+    g_config.chestForward         = defaults.chestForward;
+    g_config.chestTiltDeg         = defaults.chestTiltDeg;
     g_config.helmetSmoothing      = defaults.helmetSmoothing;
     g_config.helmetLevel          = defaults.helmetLevel;
 }
@@ -290,6 +296,9 @@ void ReloadConfig()
     c.sideForward     = ReadDouble(L"Replay", L"SideForward", c.sideForward);
     c.sideTiltDeg     = ReadDouble(L"Replay", L"SideTiltDeg", c.sideTiltDeg);
     c.sideOut         = ReadDouble(L"Replay", L"SideOut", c.sideOut);
+    c.chestHeight     = ReadDouble(L"Replay", L"ChestHeight", c.chestHeight);
+    c.chestForward    = ReadDouble(L"Replay", L"ChestForward", c.chestForward);
+    c.chestTiltDeg    = ReadDouble(L"Replay", L"ChestTiltDeg", c.chestTiltDeg);
     c.helmetSmoothing = ReadDouble(L"Replay", L"HelmetSmoothing", c.helmetSmoothing);
     c.helmetLevel     = ReadDouble(L"Replay", L"HelmetLevel", c.helmetLevel);
 
@@ -333,11 +342,14 @@ void ReloadConfig()
     c.helmetHeight         = Clamp(c.helmetHeight, -2.0, 5.0);
     c.helmetForward        = Clamp(c.helmetForward, -3.0, 3.0);
     c.helmetTiltDeg        = Clamp(c.helmetTiltDeg, -30.0, 80.0);
-    c.helmetMount          = Clamp(c.helmetMount, 0, 2);
+    c.helmetMount          = Clamp(c.helmetMount, 0, 3);
     c.sideHeight           = Clamp(c.sideHeight, -2.0, 5.0);
     c.sideForward          = Clamp(c.sideForward, -3.0, 3.0);
     c.sideTiltDeg          = Clamp(c.sideTiltDeg, -30.0, 80.0);
     c.sideOut              = Clamp(c.sideOut, 0.0, 3.0);
+    c.chestHeight          = Clamp(c.chestHeight, -3.0, 3.0);
+    c.chestForward         = Clamp(c.chestForward, -3.0, 3.0);
+    c.chestTiltDeg         = Clamp(c.chestTiltDeg, -30.0, 80.0);
     c.helmetSmoothing      = Clamp(c.helmetSmoothing, 0.0, 1.0);
     c.helmetLevel          = Clamp(c.helmetLevel, 0.0, 1.0);
 

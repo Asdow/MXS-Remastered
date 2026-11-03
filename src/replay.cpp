@@ -20,6 +20,7 @@
 //   camera turns with it. Where the eyes sit inside it isn't known, so the eye the torso bone
 //   gives is carried into the head model's frame and averaged there: on average the camera sits
 //   where the torso puts the eyes, but it moves and turns rigidly with the helmet.
+//   The chest mount rides on the torso bone instead, placed from the middle of the shoulders.
 //   The camera works from last frame's head carried forward, and stabilised, while the game
 //   draws the head where it really is this frame. Right under the lens the smallest difference
 //   shows, so the helmet would wobble in the picture; it is drawn where the camera put it
@@ -129,6 +130,7 @@ struct Head {
 struct Helmet {
     bool   have      = false;      // the next frame's view is prepared
     bool   onModel   = false;      // it rides on the head model (not the torso)
+    int    anchor    = -1;         // what it rides on: 0 the torso (no head model), 1 the head model, 2 the chest
     int    headless  = 0;          // frames in a row without the rider's head
     Vec3   lastCentre;             // the rider followed last frame
     Vec3   eyeInModel;             // the eye in the head model's frame, averaged
@@ -159,6 +161,7 @@ int          g_headCount = 0;
 int          g_pendingHead = -1;    // the head whose body was just drawn: the next model may be its head
 
 constexpr int kHelmetCamera = 2;  // Config::replayCamera
+constexpr int kChestMount   = 3;  // Config::helmetMount
 
 Vec3 WorldUp()
 {
@@ -303,8 +306,12 @@ void PrepareHelmet(Vec3 followed, double dt)
     const Head& head = g_heads[found];
     const bool sameRider = h.eyeSamples > 0 && Length(head.centre - h.lastCentre) < kMountJump;
     h.lastCentre = head.centre;
+    // The chest mount rides on the torso (it turns with the body, not the head), placed from the
+    // middle of the shoulders; the others on the head model.
+    const bool chest = cfg.helmetMount == kChestMount;
+    const bool onModel = head.model && !chest;
     Quat axes = head.rot;
-    Vec3 eye = head.eye;
+    Vec3 eye = chest && head.haveShoulders ? head.shoulders : head.eye;
     if (head.model) {
         const Vec3 sample = Rotate(Conjugate(head.modelRot), head.eye - head.modelPos);
         if (!sameRider) {
@@ -314,21 +321,28 @@ void PrepareHelmet(Vec3 followed, double dt)
             h.eyeSamples = h.eyeSamples < kEyeSamples ? h.eyeSamples + 1 : kEyeSamples;
             h.eyeInModel = h.eyeInModel + (sample - h.eyeInModel) / h.eyeSamples;
         }
-        axes = head.modelRot;
-        eye = head.modelPos + Rotate(head.modelRot, h.eyeInModel);
+        if (onModel) {
+            axes = head.modelRot;
+            eye = head.modelPos + Rotate(head.modelRot, h.eyeInModel);
+        }
     }
-    if (head.model != h.onModel || !h.have)
-        Log("replay: filming from the rider's %s", head.model ? "helmet (its head model)" : "torso (no head model found)");
-    h.onModel = head.model;
+    const int anchor = chest ? 2 : (onModel ? 1 : 0);
+    if (anchor != h.anchor || !h.have) {
+        static const char* const kAnchors[] = { "torso (no head model found)", "helmet (its head model)", "chest" };
+        Log("replay: filming from the rider's %s", kAnchors[anchor]);
+    }
+    h.anchor = anchor;
+    h.onModel = onModel;
 
-    // The mount, on the head's axes: above, forward and (side mounts) out to the side of the
-    // eyes, angled down by the tilt.
-    const bool side = cfg.helmetMount != 0;
-    const Vec3 local{ side ? (cfg.helmetMount == 1 ? -cfg.sideOut : cfg.sideOut) : 0.0,
-                      side ? cfg.sideHeight : cfg.helmetHeight, -(side ? cfg.sideForward : cfg.helmetForward) };
+    // The mount, on the head's (chest mount: the torso's) axes: above, forward and (side mounts)
+    // out to the side of the eyes (chest mount: the middle of the shoulders), angled down by the tilt.
+    const bool side = cfg.helmetMount == 1 || cfg.helmetMount == 2;
+    const Vec3 local = chest ? Vec3{ 0, cfg.chestHeight, -cfg.chestForward }
+                     : side  ? Vec3{ cfg.helmetMount == 1 ? -cfg.sideOut : cfg.sideOut, cfg.sideHeight, -cfg.sideForward }
+                             : Vec3{ 0, cfg.helmetHeight, -cfg.helmetForward };
     const Vec3 up = Rotate(axes, { 0, 1, 0 }), back = Rotate(axes, { 0, 0, 1 });
     const Vec3 mount = eye + Rotate(axes, local);
-    const double tilt = (side ? cfg.sideTiltDeg : cfg.helmetTiltDeg) * kDegToRad;
+    const double tilt = (chest ? cfg.chestTiltDeg : side ? cfg.sideTiltDeg : cfg.helmetTiltDeg) * kDegToRad;
     const Vec3 forward = -(back * std::cos(tilt) + up * std::sin(tilt));
     const Vec3 mountUp = up * std::cos(tilt) - back * std::sin(tilt);
     Quat target = QuatFromBasis(Cross(forward, mountUp), mountUp, -forward);
