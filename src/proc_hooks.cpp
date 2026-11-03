@@ -23,9 +23,10 @@
 //     - reflections look up an environment map through 'u_envmat' (eye -> world rotation, the
 //       transpose of the view's), which becomes u_envmat * C^T so reflections stay put.
 //   - replays are recognised by replay.cpp and skip all of the above: they are passed through
-//     untouched, or corrected to its chase camera (the rider is found through 'u_bone_t').
-//     The game culls the terrain patches behind its own replay camera, so with the chase camera
-//     the missing ones are drawn when the game is done with the terrain program (terrain.h).
+//     untouched, or corrected to its chase or helmet camera (the rider is found through
+//     'u_bone_t', its head through the whole skeleton). The game culls the terrain patches
+//     behind its own replay camera, so with those cameras the missing ones are drawn when the
+//     game is done with the terrain program (terrain.h).
 //   TraceKey (F11) records a per-frame trace (mxcam_trace.csv) for diagnosing jerks.
 //   Uniform names are logged as the game looks them up, and every upload goes into the F10 dump.
 
@@ -373,7 +374,7 @@ void ConsiderSkyRotation(const double view[16])
 {
     if (g_camera.capturedThisFrame || !g_camera.haveCorrection)
         return;
-    const bool replay = replay::Current() == replay::Mode::Chase;
+    const bool replay = replay::Corrects(replay::Current());
     const double angle = replay ? replay::AngleToCameraDeg(view) : camera::AngleToLastCameraDeg(view);
     if (g_camera.havePreview && std::fabs(angle - g_camera.skyAngle) < 0.01)
         return;  // the same rotation again (u_envmat, then the sky): already previewed
@@ -456,7 +457,7 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
             // A replay: the helmet cam and the bike tracker sit it out.
             if (before == replay::Mode::Off)
                 bike::Reset();
-            g_camera.haveCorrection = mode == replay::Mode::Chase;
+            g_camera.haveCorrection = replay::Corrects(mode);
             if (g_camera.haveCorrection)
                 NoteCorrectedCamera(view);
             char text[256];
@@ -522,15 +523,21 @@ SkinnedProgram* FindSkinned(GLuint program)
     return skin;
 }
 
-void NoteSkinnedView(GLuint program, GLint location, GLsizei count, GLboolean transpose,
-                     const GLfloat* value, const GLfloat* uploaded)
+// Returns what to upload: uploaded, or scratch holding the helmet camera's own helmet.
+const GLfloat* NoteSkinnedView(GLuint program, GLint location, GLsizei count, GLboolean transpose,
+                               const GLfloat* value, const GLfloat* uploaded, GLfloat* scratch)
 {
     SkinnedProgram* skin = value ? FindSkinned(program) : nullptr;
     if (!skin || location != skin->modelviewLoc || location < 0 || count != 1 || transpose)
-        return;
+        return uploaded;
+    if (replay::Current() != replay::Mode::Off && replay::ObserveModelview(value, scratch)) {
+        uploaded = scratch;
+        DumpCall("^ HELMET  the followed rider's head, held still under the helmet camera");
+    }
     std::copy(value, value + 16, skin->rawView);
     std::copy(uploaded, uploaded + 16, skin->usedView);
     skin->haveView = true;
+    return uploaded;
 }
 
 void NoteSkinnedCount(GLint location, GLint value)
@@ -648,6 +655,8 @@ void PrepareSkinnedDraw()
                           skin->positions >= bones && skin->rotations >= bones && skin->haveView;
     if (!complete && !skin->positionEdited && !skin->rotationEdited)
         return;
+    if (complete && replay::Current() != replay::Mode::Off)  // the helmet camera rides on the skeleton
+        replay::ObserveSkeleton(skin->centre, skin->position, skin->rotation, skin->transposed, bones);
 
     const Config& cfg = GetConfig();
     bool hidden[kMaxBones] = {};
@@ -727,7 +736,7 @@ void APIENTRY Wrap_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean t
     DumpUniform("glUniformMatrix4fv", g_program, location, count, transpose, value, 16);
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(g_program, location, count, transpose, value, scratch);
-    NoteSkinnedView(g_program, location, count, transpose, value, uploaded);
+    uploaded = NoteSkinnedView(g_program, location, count, transpose, value, uploaded, scratch);
     real_glUniformMatrix4fv(location, count, transpose, uploaded);
 }
 
@@ -736,7 +745,7 @@ void APIENTRY Wrap_glUniformMatrix4fvARB(GLint location, GLsizei count, GLboolea
     DumpUniform("glUniformMatrix4fvARB", g_program, location, count, transpose, value, 16);
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(g_program, location, count, transpose, value, scratch);
-    NoteSkinnedView(g_program, location, count, transpose, value, uploaded);
+    uploaded = NoteSkinnedView(g_program, location, count, transpose, value, uploaded, scratch);
     real_glUniformMatrix4fvARB(location, count, transpose, uploaded);
 }
 
@@ -745,7 +754,7 @@ void APIENTRY Wrap_glProgramUniformMatrix4fv(GLuint program, GLint location, GLs
     DumpUniform("glProgramUniformMatrix4fv", program, location, count, transpose, value, 16);
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(program, location, count, transpose, value, scratch);
-    NoteSkinnedView(program, location, count, transpose, value, uploaded);
+    uploaded = NoteSkinnedView(program, location, count, transpose, value, uploaded, scratch);
     real_glProgramUniformMatrix4fv(program, location, count, transpose, uploaded);
 }
 
@@ -1035,7 +1044,7 @@ void FinishTerrainPass()
 
     ++g_ground.passes;
     g_ground.game += static_cast<int>(g_terrain.patches.size());
-    const bool wanted = replay::Current() == replay::Mode::Chase || g_terrain.lookingAway;
+    const bool wanted = replay::Corrects(replay::Current()) || g_terrain.lookingAway;
     if (g_variants.empty()) {
         g_ground.note = "no-variants";
         DumpCall("^ TERRAIN  can't be filled in (indices from client memory, or too many draw calls per patch)");

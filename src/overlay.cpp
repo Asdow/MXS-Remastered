@@ -672,18 +672,20 @@ struct RowDef {
     const char*      label;
     RowKind          kind;
     double Config::* number;    // Slider
-    bool Config::*   flag;      // Toggle / Choice
+    bool Config::*   flag;      // Toggle / Choice of two
     double           min, max, step;
     double           display;   // multiplier for the shown value (e.g. fraction -> %)
     int              decimals;
     const char*      unit;
     const char*      zeroText;  // shown instead of the minimum, e.g. "Off"
-    const char*      offText;   // Choice: the two options
+    const char*      offText;   // Choice: the first two options
     const char*      onText;
     bool             customOnly;  // only does something with the custom camera
     int Config::*    key = nullptr;  // Key: a virtual-key code, picked by pressing the key
     const char*      help = nullptr; // shown beside the panel while the row is selected / under the mouse
     bool             locked = false; // work in progress: drawn dimmed and can't be changed
+    int Config::*    option = nullptr;     // Choice of three: 0 / 1 / 2, instead of flag
+    const char*      thirdText = nullptr;  // its third option
 
     RowDef Help(const char* text) const
     {
@@ -715,6 +717,15 @@ RowDef Toggle(int tab, const char* section, const char* label, bool Config::* fl
 RowDef Choice(int tab, const char* section, const char* label, bool Config::* flag, const char* offText, const char* onText)
 {
     return { tab, section, label, RowKind::Choice, nullptr, flag, 0, 1, 1, 1, 0, "", nullptr, offText, onText, false };
+}
+
+RowDef Choice3(int tab, const char* section, const char* label, int Config::* option, const char* first,
+               const char* second, const char* third)
+{
+    RowDef def = Choice(tab, section, label, nullptr, first, second);
+    def.option = option;
+    def.thirdText = third;
+    return def;
 }
 
 RowDef KeyRow(int tab, const char* section, const char* label, int Config::* key)
@@ -807,9 +818,10 @@ const RowDef kRows[] = {
     Slider(2, nullptr,          "Height smoothing",    &Config::verticalResponse, 0.0,   60.0,  1.0,    1.0,    0, " /s", "Off")
         .Help("Smooths small up / down head jitter. Higher follows the bike's height more closely."),
     // ---- REPLAY ----
-    Choice(3, "REPLAY CAMERA",  "Camera",              &Config::replayChaseCam, "GAME", "3RD PERSON")
+    Choice3(3, "REPLAY CAMERA", "Camera",              &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
         .Help("GAME is the replay's own camera, which faces one way while the rider swivels in front "
-              "of it. 3RD PERSON locks the camera behind the rider, like the 3rd person view when riding."),
+              "of it. 3RD PERSON locks the camera behind the rider. HELMET is a GoPro on top of the "
+              "rider's helmet."),
     Slider(3, "3RD PERSON CAMERA", "Distance behind",  &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
         .Help("3rd person replays: how far behind the rider the camera sits. Lower moves it forward, "
               "closer to the rider."),
@@ -817,6 +829,20 @@ const RowDef kRows[] = {
         .Help("3rd person replays: how high above the rider the camera sits."),
     Slider(3, nullptr,          "Pitch",               &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
         .Help("3rd person replays: how far the camera looks down. Negative looks up."),
+    Slider(3, "HELMET CAMERA",  "Mount height",        &Config::helmetHeight,     -0.5,  2.0,   0.01,   1.0,    2, " m")
+        .Help("Helmet replays: how far above the rider's eyes the camera sits, along the helmet. Raise "
+              "it if the helmet gets in the way, lower it if the camera floats over the helmet."),
+    Slider(3, nullptr,          "Mount forward",       &Config::helmetForward,    -1.0,  1.0,   0.01,   1.0,    2, " m")
+        .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet."),
+    Slider(3, nullptr,          "Tilt",                &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
+        .Help("Helmet replays: how far the camera is angled down from where the helmet faces. More "
+              "shows more of the bars and the bike, less shows more of the track ahead."),
+    Slider(3, nullptr,          "Stabilization",       &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Helmet replays: smooths the camera's rotation, like a GoPro's stabilization. Off shakes "
+              "with every jolt of the rider's head."),
+    Slider(3, nullptr,          "Horizon lock",        &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Helmet replays: how much of the rider's lean is taken out of the view. 0% leans with "
+              "the head, 100% keeps the horizon level."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -1111,6 +1137,14 @@ void SetFlag(bool& flag, bool wanted)
     }
 }
 
+void SetOption(int& option, int wanted)
+{
+    if (option != wanted) {
+        option = wanted;
+        g_panel.dirty = true;
+    }
+}
+
 // Rows that currently have no effect are drawn dimmed (they can still be adjusted).
 bool RowInactive(const RowDef& def, const Config& cfg)
 {
@@ -1118,8 +1152,11 @@ bool RowInactive(const RowDef& def, const Config& cfg)
         return true;
     if (def.number == &Config::cameraAngleDeg && cfg.keepGameAngle)
         return true;
-    if (def.tab == 3 && def.number && !cfg.replayChaseCam)  // replay camera placement, game camera chosen
-        return true;
+    if (def.tab == 3 && def.number) {  // placement for a replay camera that isn't the one chosen
+        const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||
+                           def.number == &Config::replayPitchDeg;
+        return cfg.replayCamera != (chase ? 1 : 2);
+    }
     return false;
 }
 
@@ -1333,23 +1370,30 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             Text(kFontSmall, bx + boxPad, boxY + std::round((boxH - LineHeight(kFontSmall)) * 0.5f), text,
                  waiting ? kPanelSolid : valueColor, S(2));
             Text(kFontBody, x, labelY, def.label, labelColor, 0);
-        } else {  // Choice: two segments, e.g. GAME | CUSTOM
-            bool& flag = cfg.*def.flag;
-            const char* options[2] = { def.offText, def.onText };
+        } else {  // Choice: two or three segments, e.g. GAME | CUSTOM
+            const char* options[3] = { def.offText, def.onText, def.thirdText };
+            const int count = def.option ? 3 : 2;
+            const int current = def.option ? cfg.*def.option : (cfg.*def.flag ? 1 : 0);
+            const auto Pick = [&](int o) {
+                if (def.option)
+                    SetOption(cfg.*def.option, o);
+                else
+                    SetFlag(cfg.*def.flag, o == 1);
+            };
             const float segH = S(26), segPad = S(12), segY = std::round(y + (rowH - segH) * 0.5f);
-            float segW[2], total = 0;
-            for (int o = 0; o < 2; ++o) {
+            float segW[3], total = 0;
+            for (int o = 0; o < count; ++o) {
                 segW[o] = TextWidth(kFontSmall, options[o], S(2)) + 2 * segPad;
                 total += segW[o];
             }
             float sx = x + innerW - total;
             RoundedRect(sx - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, White(0.22f));
             RoundedRect(sx, segY, total, segH, segH * 0.5f, kPanelSolid);
-            for (int o = 0; o < 2; ++o) {
-                const bool selected = flag == (o == 1);
+            for (int o = 0; o < count; ++o) {
+                const bool selected = current == o;
                 const bool segHot = in.Inside(sx, segY, segW[o], segH);
                 if (segHot && in.pressed)
-                    SetFlag(flag, o == 1);
+                    Pick(o);
                 if (selected)
                     RoundedRect(sx, segY, segW[o], segH, segH * 0.5f, White(1.0f));
                 Text(kFontSmall, sx + segPad, segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f), options[o],
@@ -1357,9 +1401,9 @@ void BuildPanel(int screenHeight, const Input& in, double now)
                 sx += segW[o];
             }
             if (focused && in.step)
-                SetFlag(flag, in.step > 0);
+                Pick(Clamp(current + (in.step > 0 ? 1 : -1), 0, count - 1));
             if (focused && in.activate)
-                SetFlag(flag, !flag);
+                Pick((current + 1) % count);
             Text(kFontBody, x, labelY, def.label, labelColor, 0);
         }
         y += rowH;

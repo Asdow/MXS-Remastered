@@ -6,9 +6,10 @@
 //   third of a second.
 //
 //   While a replay is on, the helmet cam is skipped. The replay is shown the way the game films
-//   it, or (Config::replayChaseCam) from a camera locked behind the rider, like the game's
-//   third-person view when riding. The rider is found through its skinned mesh: 'u_bone_t'
-//   carries the bones' world-space positions.
+//   it, or (Config::replayCamera) from a camera locked behind the rider, like the game's
+//   third-person view when riding, or from a camera mounted on top of the rider's helmet, like a
+//   GoPro. The rider is found through its skinned mesh: 'u_bone_t' carries the bones' world-space
+//   positions, and 'u_bone_r' their rotations, which give the head's.
 #pragma once
 
 #include <cstddef>
@@ -20,14 +21,28 @@ enum class Mode {
     Off,    // not a replay: the helmet cam takes the frame
     Game,   // a replay, shown untouched
     Chase,  // a replay, filmed from behind the rider
+    Helmet, // a replay, filmed from the rider's helmet
 };
+
+// The modes that move the camera (and so need the frame corrected).
+inline bool Corrects(Mode mode) { return mode == Mode::Chase || mode == Mode::Helmet; }
 
 // Every 'u_bone_t' upload: count world-space positions (vec3) of one rider's bones.
 void ObserveBones(const float* positions, int count);
 
+// Every skinned draw with its whole skeleton (as uploaded: u_bone_c, u_bone_t and u_bone_r,
+// column-major unless transposed): a rider whose helmet the helmet camera can sit on.
+void ObserveSkeleton(const float* centres, const float* positions, const float* rotations, bool transposed, int bones);
+
+// Every u_modelview upload of a skinned program while a replay is on (the game's View * Model):
+// the first one after a rider's body is its head, a model of its own that turns on its own.
+// For the helmet camera's own rider, out receives the modelview that draws the head where the
+// camera put it, held still under the lens (true: upload out instead).
+bool ObserveModelview(const float* modelview, float out[16]);
+
 // The frame's raw camera view (the terrain's view matrix), before anything is drawn with it.
-// With Chase, correction and rotationOnly receive the eye-space correction to the chase view,
-// like camera::Update() and camera::RotationCorrection().
+// With Chase or Helmet, correction and rotationOnly receive the eye-space correction to that
+// view, like camera::Update() and camera::RotationCorrection().
 Mode Update(const double view[16], double contentTime, double correction[16], double rotationOnly[16]);
 
 // Once the frame is drawn: follows the rider seen in it and prepares the next frame's view.

@@ -73,10 +73,16 @@ struct Config {
     double accelFilterHz    = 12.0;
 
     // [Replay]
-    bool   replayChaseCam   = false;      // film replays from behind the rider instead of the game's replay camera
+    int    replayCamera     = 0;          // 0 = the game's replay camera, 1 = 3rd person, 2 = helmet
     double replayDistance   = 4.5;        // 3rd person camera: m behind the rider
     double replayHeight     = 1.55;       // m above the rider (the middle of its body)
     double replayPitchDeg   = 12.0;       // look-down angle (positive = down)
+    // helmet camera: a camera mounted on top of the rider's helmet, placed from its eyes
+    double helmetHeight     = 0.7;        // above the eyes, along the head's up axis
+    double helmetForward    = 0.0;        // along the head's forward axis (+ = forward)
+    double helmetTiltDeg    = 20.0;       // how far the camera is angled down
+    double helmetSmoothing  = 0.3;        // 0..1 stabilisation of its rotation (0 = every jolt of the head)
+    double helmetLevel      = 0.0;        // 0..1 fraction of the head's roll removed
 };
 
 const Config& GetConfig();

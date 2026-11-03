@@ -121,10 +121,15 @@ bool SaveConfig()
         { L"Neck",      L"MaxExtension",         g_config.maxExtension },
         { L"Neck",      L"NodDegPerMeter",       g_config.nodDegPerMeter },
         { L"Neck",      L"AccelFilterHz",        g_config.accelFilterHz },
-        { L"Replay",    L"ChaseCam",             g_config.replayChaseCam ? 1.0 : 0.0 },
+        { L"Replay",    L"Camera",               static_cast<double>(g_config.replayCamera) },
         { L"Replay",    L"Distance",             g_config.replayDistance },
         { L"Replay",    L"Height",               g_config.replayHeight },
         { L"Replay",    L"PitchDeg",             g_config.replayPitchDeg },
+        { L"Replay",    L"HelmetHeight",         g_config.helmetHeight },
+        { L"Replay",    L"HelmetForward",        g_config.helmetForward },
+        { L"Replay",    L"HelmetTiltDeg",        g_config.helmetTiltDeg },
+        { L"Replay",    L"HelmetSmoothing",      g_config.helmetSmoothing },
+        { L"Replay",    L"HelmetLevel",          g_config.helmetLevel },
     };
 
     bool ok = WritePrivateProfileStringW(L"General", L"Enabled", g_config.enabled ? L"1" : L"0", g_path) != FALSE;
@@ -138,6 +143,7 @@ bool SaveConfig()
     }
     // Renamed to HorizonLock; drop the old key so the file can't disagree with itself.
     WritePrivateProfileStringW(L"Leveling", L"LeanCompensation", nullptr, g_path);
+    WritePrivateProfileStringW(L"Replay", L"ChaseCam", nullptr, g_path);  // now Camera
     Log("config: %s %ls", ok ? "saved" : "FAILED to save", g_path);
     return ok;
 }
@@ -177,10 +183,15 @@ void ResetTunables()
     g_config.maxExtension         = defaults.maxExtension;
     g_config.nodDegPerMeter       = defaults.nodDegPerMeter;
     g_config.accelFilterHz        = defaults.accelFilterHz;
-    g_config.replayChaseCam       = defaults.replayChaseCam;
+    g_config.replayCamera         = defaults.replayCamera;
     g_config.replayDistance       = defaults.replayDistance;
     g_config.replayHeight         = defaults.replayHeight;
     g_config.replayPitchDeg       = defaults.replayPitchDeg;
+    g_config.helmetHeight         = defaults.helmetHeight;
+    g_config.helmetForward        = defaults.helmetForward;
+    g_config.helmetTiltDeg        = defaults.helmetTiltDeg;
+    g_config.helmetSmoothing      = defaults.helmetSmoothing;
+    g_config.helmetLevel          = defaults.helmetLevel;
 }
 
 void LoadConfig(const wchar_t* iniPath)
@@ -256,10 +267,16 @@ void ReloadConfig()
     c.nodDegPerMeter   = ReadDouble(L"Neck", L"NodDegPerMeter", c.nodDegPerMeter);
     c.accelFilterHz    = ReadDouble(L"Neck", L"AccelFilterHz", c.accelFilterHz);
 
-    c.replayChaseCam = ReadInt(L"Replay", L"ChaseCam", c.replayChaseCam) != 0;
+    // Camera replaced ChaseCam (0 / 1), which older files still have.
+    c.replayCamera   = ReadInt(L"Replay", L"Camera", ReadInt(L"Replay", L"ChaseCam", c.replayCamera) != 0 ? 1 : 0);
     c.replayDistance = ReadDouble(L"Replay", L"Distance", c.replayDistance);
     c.replayHeight   = ReadDouble(L"Replay", L"Height", c.replayHeight);
     c.replayPitchDeg = ReadDouble(L"Replay", L"PitchDeg", c.replayPitchDeg);
+    c.helmetHeight    = ReadDouble(L"Replay", L"HelmetHeight", c.helmetHeight);
+    c.helmetForward   = ReadDouble(L"Replay", L"HelmetForward", c.helmetForward);
+    c.helmetTiltDeg   = ReadDouble(L"Replay", L"HelmetTiltDeg", c.helmetTiltDeg);
+    c.helmetSmoothing = ReadDouble(L"Replay", L"HelmetSmoothing", c.helmetSmoothing);
+    c.helmetLevel     = ReadDouble(L"Replay", L"HelmetLevel", c.helmetLevel);
 
     // Keep every value inside a range the physics can't blow up with.
     c.viewMatrixIndex      = Clamp(c.viewMatrixIndex, 0, 10000);
@@ -297,6 +314,12 @@ void ReloadConfig()
     c.replayDistance       = Clamp(c.replayDistance, 0.5, 30.0);
     c.replayHeight         = Clamp(c.replayHeight, -2.0, 15.0);
     c.replayPitchDeg       = Clamp(c.replayPitchDeg, -45.0, 80.0);
+    c.replayCamera         = Clamp(c.replayCamera, 0, 2);
+    c.helmetHeight         = Clamp(c.helmetHeight, -2.0, 5.0);
+    c.helmetForward        = Clamp(c.helmetForward, -3.0, 3.0);
+    c.helmetTiltDeg        = Clamp(c.helmetTiltDeg, -30.0, 80.0);
+    c.helmetSmoothing      = Clamp(c.helmetSmoothing, 0.0, 1.0);
+    c.helmetLevel          = Clamp(c.helmetLevel, 0.0, 1.0);
 
     g_config = c;
     Log("config: loaded %ls (enabled=%d, %s camera, modelview='%s', camera program has '%s', up=%.2f,%.2f,%.2f)",

@@ -8,8 +8,9 @@
 //   Build from a Developer Command Prompt matching the DLL's bitness:
 //     cl /nologo /EHsc /std:c++17 tests\smoke_test.cpp user32.lib gdi32.lib
 //   Run (a .bmp path saves a screenshot of the panel; --custom expects an mxcam.ini next to the
-//   DLL with CustomCamera=1 and HeadHeight=0.1 and checks the custom camera instead):
-//     smoke_test.exe bin\x64\Release\opengl32.dll [--custom] [panel.bmp]
+//   DLL with CustomCamera=1, HeadHeight=0.1 and [Replay] ChaseCam=1 and checks the custom and 3rd
+//   person cameras instead; --helmet expects [Replay] Camera=2 and checks the helmet replay camera):
+//     smoke_test.exe bin\x64\Release\opengl32.dll [--custom | --helmet] [panel.bmp]
 
 #include <windows.h>
 #include <GL/gl.h>
@@ -158,15 +159,18 @@ void Swap(bool resetFilters = false)
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        printf("usage: smoke_test <path to proxy opengl32.dll> [--custom] [panel.bmp]\n");
+        printf("usage: smoke_test <path to proxy opengl32.dll> [--custom | --helmet] [panel.bmp]\n");
         return 2;
     }
     // --custom: the DLL's mxcam.ini sets CustomCamera=1 and HeadHeight=0.1 (otherwise defaults).
-    bool custom = false;
+    // --helmet: it sets [Replay] Camera=2 (otherwise defaults).
+    bool custom = false, helmet = false;
     const char* screenshot = nullptr;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--custom") == 0)
             custom = true;
+        else if (strcmp(argv[i], "--helmet") == 0)
+            helmet = true;
         else
             screenshot = argv[i];
     }
@@ -320,6 +324,8 @@ int main(int argc, char** argv)
         using PFN_UniformMatrix4fv   = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
         using PFN_GetUniformfv       = void(APIENTRY*)(GLuint, GLint, GLfloat*);
         using PFN_Uniform3fv         = void(APIENTRY*)(GLint, GLsizei, const GLfloat*);
+        using PFN_UniformMatrix3fv   = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
+        using PFN_Uniform1i          = void(APIENTRY*)(GLint, GLint);
 #define PROC(type, name) auto name = reinterpret_cast<type>(p_wglGetProcAddress(#name))
         PROC(PFN_CreateShader, glCreateShader);
         PROC(PFN_ShaderSource, glShaderSource);
@@ -333,6 +339,8 @@ int main(int argc, char** argv)
         PROC(PFN_UniformMatrix4fv, glUniformMatrix4fv);
         PROC(PFN_GetUniformfv, glGetUniformfv);
         PROC(PFN_Uniform3fv, glUniform3fv);
+        PROC(PFN_UniformMatrix3fv, glUniformMatrix3fv);
+        PROC(PFN_Uniform1i, glUniform1i);
 #undef PROC
         if (!glCreateShader || !glUseProgram || !glUniformMatrix4fv || !glGetUniformfv) {
             printf("    (driver has no OpenGL 2.0 here; skipped)\n");
@@ -560,15 +568,31 @@ int main(int argc, char** argv)
             // the rider, slowly orbiting round it (20 degrees/s; it is beside the rider, looking
             // across its path, when the ground is checked), while the rider rides along +X at
             // 10 units/s. The rider's skinned mesh is drawn after the terrain with its bones' world
-            // positions in u_bone_t.
-            printf("Replay (%s)\n", custom ? "3rd person camera, ChaseCam=1" : "game camera");
+            // positions in u_bone_t. For the helmet camera it's a whole skeleton like the game's
+            // rider: centres, rotations and a bone count too, and a draw call, followed by the
+            // rider's head, a rigid model of its own (as the game draws it), turned 20 degrees to
+            // the rider's left and 15 down from the torso.
+            printf("Replay (%s)\n", helmet ? "helmet camera, Camera=2" : (custom ? "3rd person camera, ChaseCam=1" : "game camera"));
             {
-                const GLuint skinned = build(
-                    "uniform mat4 u_modelview; uniform mat4 u_projection; uniform vec3 u_bone_t[9];\n"
-                    "void main() { gl_Position = u_projection * u_modelview * gl_Vertex + vec4(u_bone_t[0] + u_bone_t[8], 0.0); }");
+                const GLuint skinned = helmet
+                    ? build("uniform mat4 u_modelview; uniform mat4 u_projection; uniform int u_nbones;\n"
+                            "uniform vec3 u_bone_c[9]; uniform mat3 u_bone_r[9]; uniform vec3 u_bone_t[9];\n"
+                            "void main() {\n"
+                            "    vec3 p = u_bone_r[0] * (gl_Vertex.xyz - u_bone_c[0]) + u_bone_t[0];\n"
+                            "    p += u_bone_r[8] * (gl_Vertex.xyz - u_bone_c[8]) + u_bone_t[8];\n"
+                            "    gl_Position = u_projection * u_modelview * vec4(p * float(u_nbones), 1.0);\n"
+                            "}")
+                    : build("uniform mat4 u_modelview; uniform mat4 u_projection; uniform vec3 u_bone_t[9];\n"
+                            "void main() { gl_Position = u_projection * u_modelview * gl_Vertex + vec4(u_bone_t[0] + u_bone_t[8], 0.0); }");
                 const GLint skinnedMv = glGetUniformLocation(skinned, "u_modelview");
                 const GLint bones = glGetUniformLocation(skinned, "u_bone_t");
+                const GLint boneCentres = glGetUniformLocation(skinned, "u_bone_c");
+                const GLint boneRotations = glGetUniformLocation(skinned, "u_bone_r");
+                const GLint boneCount = glGetUniformLocation(skinned, "u_nbones");
                 Check(skinned && bones >= 0, "skinned test shader compiles and links");
+                if (helmet)
+                    Check(boneCentres >= 0 && boneRotations >= 0 && boneCount >= 0 && glUniformMatrix3fv && glUniform1i,
+                          "the skeleton's uniforms are there");
 
                 // The ground, like MX Simulator's: a flat 2048 x 2048 map drawn as a quadtree of
                 // patches, one unit square mesh placed by u_meshoffset / u_meshscale, skipping the
@@ -734,7 +758,15 @@ int main(int argc, char** argv)
                 LARGE_INTEGER freq, start, now;
                 QueryPerformanceFrequency(&freq);
                 QueryPerformanceCounter(&start);
-                double maxPassThrough = 0, chaseHeading = 0, chasePitch = 0, chaseEyeError = 1e9;
+                double maxPassThrough = 0, chaseHeading = 0, chasePitch = 0, chaseEyeError = 1e9, chaseRoll = 0;
+                double helmetEyeError = 0, headTiltError = 0, headShift = 0;
+                bool haveHeadOrigin = false;
+                V3 headOrigin{};
+                // The head model's turn (yaw -90 faces +X like the torso) and its up axis.
+                constexpr double kHeadYaw = -70, kHeadPitch = -15;
+                float headTurn[16];
+                MakeWorld({ 0, 0, 0 }, kHeadYaw, kHeadPitch, 0, headTurn);
+                const V3 kHeadUp{ headTurn[4], headTurn[5], headTurn[6] };
                 for (;;) {
                     QueryPerformanceCounter(&now);
                     const double t = double(now.QuadPart - start.QuadPart) / freq.QuadPart;
@@ -758,11 +790,18 @@ int main(int argc, char** argv)
                         const V3 back{ readback[2], readback[6], readback[10] };
                         chaseHeading = atan2(-back.z, -back.x) * 180 / 3.14159265358979;  // 0 = looking along +X
                         chasePitch = ViewPitch(readback);
-                        V3 chaseEye; double unusedRoll;
-                        Decompose(readback, chaseEye, unusedRoll);
-                        // The default placement: 4.5 behind and 1.55 above the rider.
-                        const V3 wanted{ rider.x - 4.5, rider.y + 1.55, rider.z };
-                        chaseEyeError = EyeShift(chaseEye, wanted);
+                        V3 chaseEye;
+                        Decompose(readback, chaseEye, chaseRoll);
+                        // The default placement: 4.5 behind and 1.55 above the rider; for the helmet
+                        // camera 0.7 above the rider's eyes along the head's up axis (the eyes: 1.5 and
+                        // 0.56 half-spans up and forward of the torso bone, which is at the rider).
+                        const V3 wanted = helmet ? V3{ rider.x + 0.56 * 1.456 + 0.7 * kHeadUp.x, rider.y + 1.5 * 1.456 + 0.7 * kHeadUp.y,
+                                                       rider.z + 0.7 * kHeadUp.z }
+                                                 : V3{ rider.x - 4.5, rider.y + 1.55, rider.z };
+                        if (helmet)
+                            helmetEyeError = fmax(helmetEyeError, EyeShift(chaseEye, wanted));  // every frame
+                        else
+                            chaseEyeError = EyeShift(chaseEye, wanted);
                     }
 
                     // The ground, once the chase camera has settled: read back what the game's
@@ -808,8 +847,61 @@ int main(int argc, char** argv)
                         }
                         p_glDisable(GL_BLEND);
                     }
+                    if (helmet) {
+                        // The game's rider (centres from a capture), riding along +X: its rest pose
+                        // faces -Z, so every bone is turned -90 degrees about Y (rest -Z to world +X).
+                        // The torso (bone 8) sits at the rider, the rest rigidly round it.
+                        static const float kCentres[27] = { -1.456f, 0.875f, 0.01f, 1.456f, 0.875f, 0.01f,
+                                                            -0.556f, 0.875f, 0.01f, 0.556f, 0.875f, 0.01f,
+                                                            -0.269f, -2.208f, 0.01f, 0.269f, -2.208f, 0.01f,
+                                                            -0.269f, -0.88f, 0.01f, 0.269f, -0.88f, 0.01f,
+                                                            0.0f, -0.88f, 0.01f };
+                        float rotations[81];
+                        for (int b = 0; b < 9; ++b) {
+                            const float turn[9] = { 0, 0, 1, 0, 1, 0, -1, 0, 0 };  // columns: right +Z, up +Y, back -X
+                            memcpy(rotations + b * 9, turn, sizeof turn);
+                            const double cx = kCentres[b * 3] - kCentres[24], cy = kCentres[b * 3 + 1] - kCentres[25],
+                                         cz = kCentres[b * 3 + 2] - kCentres[26];
+                            boneData[b * 3]     = float(rider.x - cz);  // R * (c - c_torso): (x, y, z) -> (-z, y, x)
+                            boneData[b * 3 + 1] = float(rider.y + cy);
+                            boneData[b * 3 + 2] = float(rider.z + cx);
+                        }
+                        glUniform1i(boneCount, 9);
+                        glUniform3fv(boneCentres, 9, kCentres);
+                        glUniformMatrix3fv(boneRotations, 9, GL_FALSE, rotations);
+                    }
                     glUniform3fv(bones, 9, boneData);
                     glUniformMatrix4fv(skinnedMv, 1, GL_FALSE, replayView);
+                    if (helmet) {
+                        if (glBindVertexArray) {
+                            glBindVertexArray(0);
+                            lastArray = 0;
+                        }
+                        static const GLushort kIndices[3] = {};
+                        p_glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, kIndices);
+                        // The head: a rigid model just above and forward of the shoulders, shaking a
+                        // degree every frame (the camera is stabilised, so it can't follow that).
+                        float headWorld[16], headView[16];
+                        MakeWorld({ rider.x + 0.2, rider.y + 1.755 + 0.4, rider.z }, kHeadYaw + sin(t * 97),
+                                  kHeadPitch + cos(t * 83), 0, headWorld);
+                        Mul(replayView, headWorld, headView);
+                        glUniform1i(boneCount, 0);
+                        glUniformMatrix4fv(skinnedMv, 1, GL_FALSE, headView);
+                        p_glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, kIndices);
+                        if (t > 2.2) {
+                            // In the picture the helmet holds still: 20 degrees up from the camera's
+                            // forward (its tilt), always at the same spot.
+                            float drawn[16];
+                            glGetUniformfv(skinned, skinnedMv, drawn);
+                            const double s = sin(20 * 3.14159265358979 / 180), c = cos(20 * 3.14159265358979 / 180);
+                            headTiltError = fmax(headTiltError, EyeShift({ drawn[8], drawn[9], drawn[10] }, { 0, -s, c }));
+                            const V3 origin{ drawn[12], drawn[13], drawn[14] };
+                            if (!haveHeadOrigin)
+                                headOrigin = origin;
+                            haveHeadOrigin = true;
+                            headShift = fmax(headShift, EyeShift(origin, headOrigin));
+                        }
+                    }
                     Swap();
                     Sleep(5);
                 }
@@ -820,7 +912,18 @@ int main(int argc, char** argv)
                     Check(groundChecked && gameOnly[1] < 0.001, "the simulated game's patches never overlap");
                     Check(arrayRestored, "the game's vertex array is bound again after the ground pass");
                 }
-                if (custom) {
+                if (helmet) {
+                    printf("    helmet: heading %.2f deg, pitch %.2f deg, roll %.2f deg, eye at most %.3f from the mount\n",
+                           chaseHeading, chasePitch, chaseRoll, helmetEyeError);
+                    printf("    helmet in the picture: turned %.4f from where it belongs, moved %.4f\n", headTiltError, headShift);
+                    Check(fabs(chaseHeading + 20.0) < 1.5, "the camera looks the way the rider's head faces (20 degrees left of the torso)");
+                    Check(fabs(chasePitch + 35.0) < 1.5 && fabs(chaseRoll) < 1.5, "it's angled 20 degrees down from the head (15 down), level");
+                    Check(helmetEyeError < 0.08, "it sits on top of the helmet, moving with the rider");
+                    Check(haveHeadOrigin && headTiltError < 0.002 && headShift < 0.005,
+                          "the helmet holds still in the picture while the head shakes");
+                    if (ground)
+                        Check(filled[2] < 0.002 && filled[1] < 0.002, "the fill covers the ground the game culled, without overlaps");
+                } else if (custom) {
                     printf("    3rd person: heading %.2f deg, pitch %.2f deg, eye %.3f from where it belongs\n",
                            chaseHeading, chasePitch, chaseEyeError);
                     Check(fabs(chaseHeading) < 1.0, "the camera turns to look along the rider's path");
