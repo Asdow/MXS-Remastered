@@ -48,8 +48,9 @@ struct DrawCall {
 };
 
 // Every draw call, before it is made. The terrain's are recorded so replays can fill in the
-// ground the game culled (proc_hooks.cpp).
-void NoteDraw(const DrawCall& draw);
+// ground the game culled (proc_hooks.cpp). Returns false to leave the draw out (the game's lens
+// flare under a time of day of our own).
+bool NoteDraw(const DrawCall& draw);
 
 // Called once per frame by the swap hook. Returns true if the shader path found the camera
 // this frame.

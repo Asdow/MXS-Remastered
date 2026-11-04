@@ -30,7 +30,10 @@
 #include "config.h"
 #include "hooks.h"
 #include "log.h"
+#include "mathlib.h"
 #include "overlay.h"
+#include "postfx.h"
+#include "texfilter.h"
 
 namespace mxcam {
 namespace {
@@ -63,6 +66,11 @@ decltype(&::glEndList)           real_glEndList           = nullptr;
 decltype(&::glClear)             real_glClear             = nullptr;
 decltype(&::glDrawElements)      real_glDrawElements      = nullptr;
 decltype(&::glDrawArrays)        real_glDrawArrays        = nullptr;
+decltype(&::glTexParameteri)     real_glTexParameteri     = nullptr;
+decltype(&::glTexParameterf)     real_glTexParameterf     = nullptr;
+decltype(&::glTexParameteriv)    real_glTexParameteriv    = nullptr;
+decltype(&::glTexParameterfv)    real_glTexParameterfv    = nullptr;
+decltype(&::glDeleteTextures)    real_glDeleteTextures    = nullptr;
 PFN_wglSwapBuffers               real_wglSwapBuffers      = nullptr;
 decltype(&::wglSwapLayerBuffers) real_wglSwapLayerBuffers = nullptr;
 decltype(&::wglGetProcAddress)   real_wglGetProcAddress   = nullptr;
@@ -111,6 +119,16 @@ template <class T>
 bool IsPerspective(const T* m)
 {
     return std::fabs(double(m[15])) < 1e-6 && std::fabs(double(m[11])) > 1e-6;
+}
+
+// A perspective projection, for the shaders' depth reconstruction (postfx.h).
+template <class T>
+void NoteProjection(const T* m)
+{
+    float f[16];
+    for (int i = 0; i < 16; ++i)
+        f[i] = static_cast<float>(m[i]);
+    postfx::NoteProjection(f, true);
 }
 
 void LoadReal(const GLfloat* m)  { real_glLoadMatrixf(m); }
@@ -212,6 +230,10 @@ void SetModelview(const T* m)
             view[i] = double(m[i]);
         g_frame.captured = true;
         g_frame.haveCorrection = camera::Update(view, g_frame.correction);
+        double rendered[16];
+        if (g_frame.haveCorrection)
+            MatMul(g_frame.correction, view, rendered);
+        postfx::NoteView(view, g_frame.haveCorrection ? rendered : view);
         if (g_frame.haveCorrection) {
             const camera::Telemetry& t = camera::LastTelemetry();
             DumpCall("^ scene load #%d = CAMERA  dt=%.1fms lag=%.2fdeg roll=%.2fdeg rollCorr=%.2fdeg "
@@ -258,13 +280,14 @@ bool Pressed(int vk, bool& wasDown)
 
 void PollHotkeys()
 {
-    static bool toggleDown = false, reloadDown = false, dumpDown = false, traceDown = false;
+    static bool toggleDown = false, reloadDown = false, dumpDown = false, traceDown = false, shadersDown = false;
     const Config& cfg = GetConfig();
     // Always sample all keys so the edge detection stays in sync while unfocused.
     const bool toggle = Pressed(cfg.toggleKey, toggleDown);
     const bool reload = Pressed(cfg.reloadKey, reloadDown);
     const bool dump   = Pressed(cfg.dumpKey, dumpDown);
     const bool trace  = Pressed(cfg.traceKey, traceDown);
+    const bool shaders = Pressed(cfg.shaderToggleKey, shadersDown);
     if (!GameHasFocus())
         return;
 
@@ -281,6 +304,10 @@ void PollHotkeys()
         g_dumpRequested = true;
     if (trace)
         StartTrace(5.0);
+    if (shaders) {
+        EditConfig().shaders = !cfg.shaders;
+        Log("hotkey: shaders %s", cfg.shaders ? "ON" : "OFF");
+    }
 }
 
 void EndFrame()
@@ -339,6 +366,8 @@ void OnLoadMatrix(const T* m, const char* name)
             ProjIsPerspective() = IsPerspective(m);
         else if (g_gl.mode == GL_MODELVIEW)
             MvIsIdentity() = false;
+        if (g_gl.mode == GL_PROJECTION && IsPerspective(m))
+            NoteProjection(m);
     }
     DumpMatrix(name, m);
     if (g_gl.mode == GL_MODELVIEW && g_gl.listMode == 0)
@@ -353,8 +382,10 @@ void OnMultMatrix(const T* m, const char* name)
     bool ontoIdentity = false;
     if (Executes()) {
         if (g_gl.mode == GL_PROJECTION) {
-            if (IsPerspective(m))
+            if (IsPerspective(m)) {
                 ProjIsPerspective() = true;
+                NoteProjection(m);  // gluPerspective: a multiply onto a fresh identity
+            }
         } else if (g_gl.mode == GL_MODELVIEW) {
             ontoIdentity = MvIsIdentity();
             MvIsIdentity() = false;
@@ -402,8 +433,15 @@ void APIENTRY Hook_glPopMatrix()
 
 void APIENTRY Hook_glFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f)
 {
-    if (Executes() && g_gl.mode == GL_PROJECTION)
+    if (Executes() && g_gl.mode == GL_PROJECTION) {
         ProjIsPerspective() = true;
+        if (r != l && t != b && f != n) {  // glFrustum's matrix, for the shaders' depth
+            const double m[16] = { 2 * n / (r - l), 0, 0, 0,  0, 2 * n / (t - b), 0, 0,
+                                   (r + l) / (r - l), (t + b) / (t - b), -(f + n) / (f - n), -1,
+                                   0, 0, -2 * f * n / (f - n), 0 };
+            NoteProjection(m);
+        }
+    }
     DumpCall("glFrustum(%g, %g, %g, %g, %g, %g)", l, r, b, t, n, f);
     real_glFrustum(l, r, b, t, n, f);
 }
@@ -483,8 +521,10 @@ void APIENTRY Hook_glEndList()
 // if no swap has been seen for a second, a colour clear after the camera starts a new frame.
 void APIENTRY Hook_glClear(GLbitfield mask)
 {
-    if ((mask & GL_COLOR_BUFFER_BIT) && g_frame.captured && GetTickCount64() - g_lastSwapTick > 1000)
+    if ((mask & GL_COLOR_BUFFER_BIT) && g_frame.captured && GetTickCount64() - g_lastSwapTick > 1000) {
+        postfx::FrameEnd(false);
         EndFrame();
+    }
     DumpCall("glClear(0x%X)", mask);
     real_glClear(mask);
 }
@@ -497,8 +537,8 @@ void APIENTRY Hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const
     draw.count = count;
     draw.type = type;
     draw.indices = indices;
-    NoteDraw(draw);
-    real_glDrawElements(mode, count, type, indices);
+    if (NoteDraw(draw))
+        real_glDrawElements(mode, count, type, indices);
 }
 
 void APIENTRY Hook_glDrawArrays(GLenum mode, GLint first, GLsizei count)
@@ -508,14 +548,58 @@ void APIENTRY Hook_glDrawArrays(GLenum mode, GLint first, GLsizei count)
     draw.mode = mode;
     draw.first = first;
     draw.count = count;
-    NoteDraw(draw);
-    real_glDrawArrays(mode, first, count);
+    if (NoteDraw(draw))
+        real_glDrawArrays(mode, first, count);
 }
 
-// The settings panel is drawn into the finished frame, right before it is presented.
+// Texture filtering (texfilter.h): the game's filter settings, adjusted on the way to the driver.
+void APIENTRY Hook_glTexParameteri(GLenum target, GLenum pname, GLint param)
+{
+    if (texfilter::Watches(pname))
+        param = static_cast<GLint>(texfilter::TextureParameter(target, pname, static_cast<float>(param)));
+    real_glTexParameteri(target, pname, param);
+}
+
+void APIENTRY Hook_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
+{
+    if (texfilter::Watches(pname))
+        param = texfilter::TextureParameter(target, pname, param);
+    real_glTexParameterf(target, pname, param);
+}
+
+void APIENTRY Hook_glTexParameteriv(GLenum target, GLenum pname, const GLint* params)
+{
+    if (params && texfilter::Watches(pname)) {
+        const GLint value = static_cast<GLint>(texfilter::TextureParameter(target, pname, static_cast<float>(params[0])));
+        real_glTexParameteriv(target, pname, &value);
+        return;
+    }
+    real_glTexParameteriv(target, pname, params);
+}
+
+void APIENTRY Hook_glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params)
+{
+    if (params && texfilter::Watches(pname)) {
+        const GLfloat value = texfilter::TextureParameter(target, pname, params[0]);
+        real_glTexParameterfv(target, pname, &value);
+        return;
+    }
+    real_glTexParameterfv(target, pname, params);
+}
+
+void APIENTRY Hook_glDeleteTextures(GLsizei n, const GLuint* textures)
+{
+    texfilter::TexturesDeleted(n, textures);
+    real_glDeleteTextures(n, textures);
+}
+
+// The shaders run on the finished 3D image (if the HUD start wasn't recognised earlier), then
+// the settings panel is drawn into the frame, right before it is presented.
 BOOL WINAPI Hook_wglSwapBuffers(HDC dc)
 {
+    postfx::FrameEnd();
     OverlayFrame(dc);
+    texfilter::FrameEnd();
     g_lastSwapTick = GetTickCount64();
     EndFrame();
     return real_wglSwapBuffers(dc);
@@ -524,7 +608,9 @@ BOOL WINAPI Hook_wglSwapBuffers(HDC dc)
 BOOL WINAPI Hook_wglSwapLayerBuffers(HDC dc, UINT planes)
 {
     if (planes & WGL_SWAP_MAIN_PLANE) {
+        postfx::FrameEnd();
         OverlayFrame(dc);
+        texfilter::FrameEnd();
         g_lastSwapTick = GetTickCount64();
         EndFrame();
     }
@@ -556,6 +642,9 @@ const HookEntry* GetHookTable(size_t& count)
         MXCAM_HOOK(glNewList),      MXCAM_HOOK(glEndList),
         MXCAM_HOOK(glClear),
         MXCAM_HOOK(glDrawElements), MXCAM_HOOK(glDrawArrays),
+        MXCAM_HOOK(glTexParameteri),  MXCAM_HOOK(glTexParameterf),
+        MXCAM_HOOK(glTexParameteriv), MXCAM_HOOK(glTexParameterfv),
+        MXCAM_HOOK(glDeleteTextures),
         MXCAM_HOOK(wglSwapBuffers), MXCAM_HOOK(wglSwapLayerBuffers),
         MXCAM_HOOK(wglGetProcAddress),
     };

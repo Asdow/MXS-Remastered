@@ -101,10 +101,13 @@
     <ClCompile Include="src\hooks.cpp" />
     <ClCompile Include="src\log.cpp" />
     <ClCompile Include="src\overlay.cpp" />
+    <ClCompile Include="src\postfx.cpp" />
     <ClCompile Include="src\proc_hooks.cpp" />
     <ClCompile Include="src\proxy.cpp" />
     <ClCompile Include="src\replay.cpp" />
     <ClCompile Include="src\terrain.cpp" />
+    <ClCompile Include="src\texfilter.cpp" />
+    <ClCompile Include="src\timeofday.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\bike.h" />
@@ -116,7 +119,11 @@
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\mathlib.h" />
     <ClInclude Include="src\overlay.h" />
+    <ClInclude Include="src\postfx.h" />
+    <ClInclude Include="src\postfx_shaders.h" />
     <ClInclude Include="src\replay.h" />
+    <ClInclude Include="src\texfilter.h" />
+    <ClInclude Include="src\timeofday.h" />
     <ClInclude Include="src\terrain.h" />
   </ItemGroup>
   <ItemGroup>

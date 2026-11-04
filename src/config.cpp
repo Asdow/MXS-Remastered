@@ -138,6 +138,36 @@ bool SaveConfig()
         { L"Replay",    L"ChestTiltDeg",         g_config.chestTiltDeg },
         { L"Replay",    L"HelmetSmoothing",      g_config.helmetSmoothing },
         { L"Replay",    L"HelmetLevel",          g_config.helmetLevel },
+        { L"Graphics",  L"Shaders",              g_config.shaders ? 1.0 : 0.0 },
+        { L"Graphics",  L"TimeOfDay",            g_config.timeOfDay },
+        { L"Graphics",  L"MoveSun",              g_config.moveSun ? 1.0 : 0.0 },
+        { L"Graphics",  L"NightBrightness",      g_config.nightBrightness },
+        { L"Graphics",  L"HideGameFlare",        g_config.hideGameFlare ? 1.0 : 0.0 },
+        { L"Graphics",  L"Shadows",              g_config.shadows },
+        { L"Graphics",  L"ShadowLength",         g_config.shadowLength },
+        { L"Graphics",  L"ShadowMap",            g_config.shadowMap ? 1.0 : 0.0 },
+        { L"Graphics",  L"ShadowDistance",       g_config.shadowDistance },
+        { L"Graphics",  L"Headlight",            g_config.headlight },
+        { L"Graphics",  L"HeadlightBeamDeg",     g_config.headlightBeamDeg },
+        { L"Graphics",  L"AmbientOcclusion",     g_config.ambientOcclusion },
+        { L"Graphics",  L"SunRays",              g_config.sunRays },
+        { L"Graphics",  L"Bloom",                g_config.bloom },
+        { L"Graphics",  L"Exposure",             g_config.exposure },
+        { L"Graphics",  L"Contrast",             g_config.contrast },
+        { L"Graphics",  L"Saturation",           g_config.saturation },
+        { L"Graphics",  L"Vignette",             g_config.vignette },
+        { L"Graphics",  L"AntiAliasing",         static_cast<double>(g_config.antiAliasing) },
+        { L"Graphics",  L"Sharpen",              g_config.sharpen },
+        { L"Graphics",  L"Anisotropy",           g_config.anisotropy },
+        { L"Graphics",  L"Trilinear",            g_config.trilinear ? 1.0 : 0.0 },
+        { L"Graphics",  L"TextureLodBias",       g_config.textureLodBias },
+        { L"Graphics",  L"DirtDetail",           g_config.dirtDetail },
+        { L"Graphics",  L"DirtScale",            g_config.dirtScale },
+        { L"Graphics",  L"TireMarks",            g_config.tireMarks },
+        { L"Graphics",  L"TireDirt",             g_config.tireDirt },
+        { L"Graphics",  L"MotionBlur",           g_config.motionBlur },
+        { L"Graphics",  L"DepthOfField",         g_config.depthOfField },
+        { L"Graphics",  L"DofFocus",             g_config.dofFocus },
     };
 
     bool ok = WritePrivateProfileStringW(L"General", L"Enabled", g_config.enabled ? L"1" : L"0", g_path) != FALSE;
@@ -208,12 +238,79 @@ void ResetTunables()
     g_config.chestTiltDeg         = defaults.chestTiltDeg;
     g_config.helmetSmoothing      = defaults.helmetSmoothing;
     g_config.helmetLevel          = defaults.helmetLevel;
+    g_config.shaders              = defaults.shaders;
+    g_config.timeOfDay            = defaults.timeOfDay;
+    g_config.moveSun              = defaults.moveSun;
+    g_config.nightBrightness      = defaults.nightBrightness;
+    g_config.hideGameFlare        = defaults.hideGameFlare;
+    g_config.shadows              = defaults.shadows;
+    g_config.shadowLength         = defaults.shadowLength;
+    g_config.shadowMap            = defaults.shadowMap;
+    g_config.shadowDistance       = defaults.shadowDistance;
+    g_config.headlight            = defaults.headlight;
+    g_config.headlightBeamDeg     = defaults.headlightBeamDeg;
+    g_config.ambientOcclusion     = defaults.ambientOcclusion;
+    g_config.sunRays              = defaults.sunRays;
+    g_config.bloom                = defaults.bloom;
+    g_config.exposure             = defaults.exposure;
+    g_config.contrast             = defaults.contrast;
+    g_config.saturation           = defaults.saturation;
+    g_config.vignette             = defaults.vignette;
+    g_config.antiAliasing         = defaults.antiAliasing;
+    g_config.sharpen              = defaults.sharpen;
+    g_config.anisotropy           = defaults.anisotropy;
+    g_config.trilinear            = defaults.trilinear;
+    g_config.textureLodBias       = defaults.textureLodBias;
+    g_config.dirtDetail           = defaults.dirtDetail;
+    g_config.dirtScale            = defaults.dirtScale;
+    g_config.tireMarks            = defaults.tireMarks;
+    g_config.tireDirt             = defaults.tireDirt;
+    g_config.motionBlur           = defaults.motionBlur;
+    g_config.depthOfField         = defaults.depthOfField;
+    g_config.dofFocus             = defaults.dofFocus;
 }
 
 void LoadConfig(const wchar_t* iniPath)
 {
     wcscpy_s(g_path, iniPath);
     ReloadConfig();
+}
+
+bool ReadLearned(const char* key, double value[3])
+{
+    if (!g_path[0])
+        return false;
+    wchar_t wkey[64] = L"", buffer[128] = L"";
+    MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, 64);
+    GetPrivateProfileStringW(L"Learned", wkey, L"", buffer, 128, g_path);
+    double v[3];
+    if (swscanf_s(buffer, L"%lf,%lf,%lf", &v[0], &v[1], &v[2]) != 3)
+        return false;
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(v[i]) || std::fabs(v[i]) > 100.0)
+            return false;
+        value[i] = v[i];
+    }
+    return true;
+}
+
+void WriteLearned(const char* key, const double value[3])
+{
+    if (!g_path[0])
+        return;
+    wchar_t wkey[64] = L"", text[128] = L"";
+    MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, 64);
+    swprintf_s(text, L"%.3f,%.3f,%.3f", value[0], value[1], value[2]);
+    WritePrivateProfileStringW(L"Learned", wkey, text, g_path);
+}
+
+void ForgetLearned(const char* key)
+{
+    if (!g_path[0])
+        return;
+    wchar_t wkey[64] = L"";
+    MultiByteToWideChar(CP_UTF8, 0, key, -1, wkey, 64);
+    WritePrivateProfileStringW(L"Learned", wkey, nullptr, g_path);
 }
 
 void ReloadConfig()
@@ -302,6 +399,47 @@ void ReloadConfig()
     c.helmetSmoothing = ReadDouble(L"Replay", L"HelmetSmoothing", c.helmetSmoothing);
     c.helmetLevel     = ReadDouble(L"Replay", L"HelmetLevel", c.helmetLevel);
 
+    c.shaders          = ReadInt(L"Graphics", L"Shaders", c.shaders) != 0;
+    c.shaderToggleKey  = ReadInt(L"Graphics", L"ToggleKey", c.shaderToggleKey);
+    c.applyBeforeHud   = ReadInt(L"Graphics", L"ApplyBeforeHud", c.applyBeforeHud) != 0;
+    c.timeOfDay        = ReadDouble(L"Graphics", L"TimeOfDay", c.timeOfDay);
+    c.moveSun          = ReadInt(L"Graphics", L"MoveSun", c.moveSun) != 0;
+    c.nightBrightness  = ReadDouble(L"Graphics", L"NightBrightness", c.nightBrightness);
+    c.hideGameFlare    = ReadInt(L"Graphics", L"HideGameFlare", c.hideGameFlare) != 0;
+    c.invertLight      = ReadInt(L"Graphics", L"InvertLight", c.invertLight) != 0;
+    c.shadows          = ReadDouble(L"Graphics", L"Shadows", c.shadows);
+    c.shadowLength     = ReadDouble(L"Graphics", L"ShadowLength", c.shadowLength);
+    c.shadowMap        = ReadInt(L"Graphics", L"ShadowMap", c.shadowMap) != 0;
+    c.shadowDistance   = ReadDouble(L"Graphics", L"ShadowDistance", c.shadowDistance);
+    c.shadowMapSize    = ReadInt(L"Graphics", L"ShadowMapSize", c.shadowMapSize);
+    c.headlight        = ReadDouble(L"Graphics", L"Headlight", c.headlight);
+    c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
+    c.headlightForward = ReadDouble(L"Graphics", L"HeadlightForward", c.headlightForward);
+    c.headlightHeight  = ReadDouble(L"Graphics", L"HeadlightHeight", c.headlightHeight);
+    c.headlightPitchDeg = ReadDouble(L"Graphics", L"HeadlightPitchDeg", c.headlightPitchDeg);
+    c.ambientOcclusion = ReadDouble(L"Graphics", L"AmbientOcclusion", c.ambientOcclusion);
+    c.aoRadius         = ReadDouble(L"Graphics", L"AORadius", c.aoRadius);
+    c.sunRays          = ReadDouble(L"Graphics", L"SunRays", c.sunRays);
+    c.bloom            = ReadDouble(L"Graphics", L"Bloom", c.bloom);
+    c.bloomThreshold   = ReadDouble(L"Graphics", L"BloomThreshold", c.bloomThreshold);
+    c.exposure         = ReadDouble(L"Graphics", L"Exposure", c.exposure);
+    c.contrast         = ReadDouble(L"Graphics", L"Contrast", c.contrast);
+    c.saturation       = ReadDouble(L"Graphics", L"Saturation", c.saturation);
+    c.vignette         = ReadDouble(L"Graphics", L"Vignette", c.vignette);
+    c.antiAliasing     = ReadInt(L"Graphics", L"AntiAliasing", c.antiAliasing);
+    c.sharpen          = ReadDouble(L"Graphics", L"Sharpen", c.sharpen);
+    c.anisotropy       = ReadDouble(L"Graphics", L"Anisotropy", c.anisotropy);
+    c.trilinear        = ReadInt(L"Graphics", L"Trilinear", c.trilinear) != 0;
+    c.textureLodBias   = ReadDouble(L"Graphics", L"TextureLodBias", c.textureLodBias);
+    c.dirtDetail       = ReadDouble(L"Graphics", L"DirtDetail", c.dirtDetail);
+    c.dirtScale        = ReadDouble(L"Graphics", L"DirtScale", c.dirtScale);
+    c.tireMarks        = ReadDouble(L"Graphics", L"TireMarks", c.tireMarks);
+    c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
+    c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
+    c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);
+    c.dofFocus         = ReadDouble(L"Graphics", L"DofFocus", c.dofFocus);
+    c.dumpShaders      = ReadInt(L"Graphics", L"DumpShaders", c.dumpShaders) != 0;
+
     // Keep every value inside a range the physics can't blow up with.
     c.viewMatrixIndex      = Clamp(c.viewMatrixIndex, 0, 10000);
     c.snapAngleDeg         = Clamp(c.snapAngleDeg, 1.0, 180.0);
@@ -352,11 +490,48 @@ void ReloadConfig()
     c.chestTiltDeg         = Clamp(c.chestTiltDeg, -30.0, 80.0);
     c.helmetSmoothing      = Clamp(c.helmetSmoothing, 0.0, 1.0);
     c.helmetLevel          = Clamp(c.helmetLevel, 0.0, 1.0);
+    if (c.timeOfDay >= 0.0)
+        c.timeOfDay        = std::fmod(c.timeOfDay, 24.0);
+    else
+        c.timeOfDay        = -1.0;
+    c.nightBrightness      = Clamp(c.nightBrightness, 0.0, 2.0);
+    c.shadows              = Clamp(c.shadows, 0.0, 1.0);
+    c.shadowLength         = Clamp(c.shadowLength, 1.0, 30.0);
+    c.shadowDistance       = Clamp(c.shadowDistance, 5.0, 100.0);
+    c.shadowMapSize        = c.shadowMapSize >= 4096 ? 4096 : c.shadowMapSize >= 2048 ? 2048 : 1024;
+    c.headlight            = Clamp(c.headlight, 0.0, 1.0);
+    c.headlightBeamDeg     = Clamp(c.headlightBeamDeg, 5.0, 90.0);
+    c.headlightForward     = Clamp(c.headlightForward, -3.0, 3.0);
+    c.headlightHeight      = Clamp(c.headlightHeight, -3.0, 3.0);
+    c.headlightPitchDeg    = Clamp(c.headlightPitchDeg, -30.0, 45.0);
+    c.ambientOcclusion     = Clamp(c.ambientOcclusion, 0.0, 1.0);
+    c.aoRadius             = Clamp(c.aoRadius, 0.1, 5.0);
+    c.sunRays              = Clamp(c.sunRays, 0.0, 1.0);
+    c.bloom                = Clamp(c.bloom, 0.0, 1.0);
+    c.bloomThreshold       = Clamp(c.bloomThreshold, 0.0, 1.0);
+    c.exposure             = Clamp(c.exposure, -3.0, 3.0);
+    c.contrast             = Clamp(c.contrast, -0.5, 0.5);
+    c.saturation           = Clamp(c.saturation, -1.0, 1.0);
+    c.vignette             = Clamp(c.vignette, 0.0, 1.0);
+    c.antiAliasing         = Clamp(c.antiAliasing, 0, 2);
+    c.sharpen              = Clamp(c.sharpen, 0.0, 1.0);
+    c.anisotropy           = Clamp(c.anisotropy, 1.0, 16.0);
+    c.textureLodBias       = Clamp(c.textureLodBias, -2.0, 1.0);
+    c.dirtDetail           = Clamp(c.dirtDetail, 0.0, 1.0);
+    c.dirtScale            = Clamp(c.dirtScale, 0.25, 4.0);
+    c.tireMarks            = Clamp(c.tireMarks, 0.0, 1.0);
+    c.tireDirt             = Clamp(c.tireDirt, 0.0, 1.0);
+    c.motionBlur           = Clamp(c.motionBlur, 0.0, 1.0);
+    c.depthOfField         = Clamp(c.depthOfField, 0.0, 1.0);
+    c.dofFocus             = Clamp(c.dofFocus, 0.0, 500.0);
 
     g_config = c;
     Log("config: loaded %ls (enabled=%d, %s camera, modelview='%s', camera program has '%s', up=%.2f,%.2f,%.2f)",
         g_path, c.enabled ? 1 : 0, c.customCamera ? "custom" : "game", c.modelviewUniform, c.cameraProgramUniform,
         c.worldUp[0], c.worldUp[1], c.worldUp[2]);
+    Log("config: shaders %s (time of day %s%.2f, shadows %.2f, AO %.2f, bloom %.2f, AA %d, %gx anisotropic, dirt %.2f, "
+        "motion blur %.2f, DOF %.2f)", c.shaders ? "on" : "off", c.timeOfDay < 0 ? "game " : "", c.timeOfDay < 0 ? 0.0 : c.timeOfDay,
+        c.shadows, c.ambientOcclusion, c.bloom, c.antiAliasing, c.anisotropy, c.dirtDetail, c.motionBlur, c.depthOfField);
 }
 
 }  // namespace mxcam

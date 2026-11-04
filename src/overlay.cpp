@@ -29,7 +29,9 @@
 #include "log.h"
 #include "mathlib.h"
 #include "overlay.h"
+#include "postfx.h"
 #include "replay.h"
+#include "texfilter.h"
 
 namespace mxcam {
 namespace {
@@ -689,6 +691,7 @@ struct RowDef {
     const char*      fourthText = nullptr; // and fourth, if it has one
     double Config::* sideNumber = nullptr; // Slider: what it sets instead with the helmet camera on a side mount
     double Config::* chestNumber = nullptr; // and on the chest mount
+    bool             clock = false;          // Slider: hours, shown as a time of day (HH:MM)
 
     RowDef Side(double Config::* field) const
     {
@@ -713,6 +716,12 @@ struct RowDef {
     {
         RowDef def = *this;
         def.locked = true;
+        return def;
+    }
+    RowDef Clock() const
+    {
+        RowDef def = *this;
+        def.clock = true;
         return def;
     }
 };
@@ -767,12 +776,16 @@ RowDef KeyRow(int tab, const char* section, const char* label, int Config::* key
     return { tab, section, label, RowKind::Key, nullptr, nullptr, 0, 1, 1, 1, 0, "", nullptr, nullptr, nullptr, false, key };
 }
 
-const char* const kTabs[] = { "VIEW", "AIR & LOOK", "NECK FX", "REPLAY" };
+const char* const kTabs[] = { "VIEW", "AIR & LOOK", "NECK FX", "REPLAY", "LIGHT", "IMAGE", "COLOR" };
+constexpr int kFirstGraphicsTab = 4;  // tabs from here on are the shaders'
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
 
 const RowDef kRows[] = {
     // ---- VIEW ----
-    Choice(0, "CAMERA",         "Camera",              &Config::customCamera, "GAME", "CUSTOM")
+    Toggle(0, "CAMERA",         "Camera mod",          &Config::enabled)
+        .Help("The first-person camera mod (also the switch at the top, and F8). Off gives you the "
+              "game's own cameras and replays untouched, and only the shaders stay on."),
+    Choice(0, nullptr,          "Camera",              &Config::customCamera, "GAME", "CUSTOM")
         .Help("GAME adjusts the game's own first-person camera. CUSTOM builds the view from your bike "
               "instead (ride a few metres after loading so it can find the bike)."),
     Toggle(0, nullptr,          "Keep game angle",     &Config::keepGameAngle, true)
@@ -888,6 +901,90 @@ const RowDef kRows[] = {
     Slider(3, nullptr,          "Horizon lock",        &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Helmet replays: how much of the rider's lean is taken out of the view. 0% leans with "
               "the head, 100% keeps the horizon level."),
+    // ---- LIGHT ----
+    Toggle(4, "SHADERS",        "Shaders",             &Config::shaders)
+        .Help("Turns every effect on this tab and the IMAGE tab on or off (F7 in game). Off is the "
+              "game exactly as it looks without the mod."),
+    Slider(4, "TIME OF DAY",    "Time of day",         &Config::timeOfDay,        -1.0,  24.0,  0.25,   1.0,    0, "", "Game")
+        .Clock()
+        .Help("Sets the hour: the sun moves across the sky, sunsets turn the light orange, and at "
+              "night the sky fills with stars and a moon lights the track. Game keeps the game's "
+              "own lighting."),
+    Toggle(4, nullptr,          "Move the sun",        &Config::moveSun)
+        .Help("The time of day also moves the game's sun, so lighting and shading on bikes and "
+              "objects follow it. Off only changes the colours and the sky."),
+    Slider(4, nullptr,          "Night brightness",    &Config::nightBrightness,  0.0,   2.0,   0.05,   100.0,  0, "%")
+        .Help("How much the moon lights the track at night. Lower is darker (the headlight stands "
+              "out more), 0% is pitch black."),
+    Slider(4, "HEADLIGHT",      "Headlight",           &Config::headlight,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("A headlight on your bike's front plate that lights the track ahead when the time of "
+              "day makes it dark. It turns with the bike, not your head."),
+    Slider(4, nullptr,          "Beam width",          &Config::headlightBeamDeg, 10.0,  90.0,  1.0,    2.0,    0, "\xB0")
+        .Help("How far the headlight's beam spreads to the sides. It always lights the ground from "
+              "just in front of the plate out, narrower only makes it skinnier."),
+    Slider(4, "SHADOWS",        "Shadows",             &Config::shadows,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Real-time sun shadows from bikes, riders, trees and track objects. Fades out at night "
+              "(the moon casts faint ones)."),
+    Toggle(4, nullptr,          "Detailed shadows",    &Config::shadowMap)
+        .Help("Draws bikes, riders and objects again from the sun for full, sharp shadows, even from "
+              "things off screen. Off uses cheaper screen-space shadows only."),
+    Slider(4, nullptr,          "Shadow distance",     &Config::shadowDistance,   10.0,  60.0,  1.0,    1.0,    0, " m")
+        .Help("Detailed shadows: how far around you they reach. Shorter is sharper."),
+    Slider(4, nullptr,          "Contact shadows",     &Config::shadowLength,     1.0,   20.0,  0.5,    1.0,    1, " m")
+        .Help("Screen-space shadows: how far they reach from what casts them. They add shadows from "
+              "the ground's own shape (ruts, jumps)."),
+    Slider(4, nullptr,          "Ambient occlusion",   &Config::ambientOcclusion, 0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Soft contact shadows in ruts, corners and under the bikes, where light can't reach."),
+    // ---- COLOR ----
+    Slider(6, "GLOW",           "Sun rays",            &Config::sunRays,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Light shafts from the sun when it's on screen."),
+    Slider(6, nullptr,          "Bloom",               &Config::bloom,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("A soft glow around bright parts of the picture: the sky, the sun, white plastics."),
+    Toggle(6, nullptr,          "Hide game flare",     &Config::hideGameFlare)
+        .Help("With a time of day set, hides the game's own lens flare: it stays where the game's "
+              "sun is, so at night it would glare out of the dark sky."),
+    Slider(6, "COLOR",          "Brightness",          &Config::exposure,         -2.0,  2.0,   0.05,   1.0,    2, " EV")
+        .Help("Overall exposure. +1 EV is twice as bright, -1 EV half."),
+    Slider(6, nullptr,          "Contrast",            &Config::contrast,         -0.5,  0.5,   0.01,   100.0,  0, "%")
+        .Help("More (+) or less (-) difference between dark and bright."),
+    Slider(6, nullptr,          "Saturation",          &Config::saturation,       -1.0,  1.0,   0.01,   100.0,  0, "%")
+        .Help("More (+) or less (-) colourful. -100% is black and white."),
+    Slider(6, nullptr,          "Vignette",            &Config::vignette,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Darkens the corners of the picture, like a camera lens."),
+    // ---- IMAGE ----
+    Choice3(5, "ANTI-ALIASING", "Anti-aliasing",       &Config::antiAliasing, "OFF", "FXAA", "HIGH")
+        .Help("Smooths jagged edges (FXAA). HIGH follows long edges further for cleaner lines at "
+              "a slightly higher cost."),
+    Slider(5, nullptr,          "Sharpen",             &Config::sharpen,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Brings back fine detail, more where the picture is soft. Pairs well with anti-aliasing."),
+    Slider(5, "TEXTURES",       "Anisotropic filter",  &Config::anisotropy,       1.0,   16.0,  1.0,    1.0,    0, "x", "Off")
+        .Help("Keeps textures sharp when you look along them at a low angle: the track ahead, "
+              "the ruts in the distance. 16x is the sharpest."),
+    Toggle(5, nullptr,          "Trilinear filtering", &Config::trilinear)
+        .Help("Blends between texture detail levels, so there are no visible lines where the "
+              "ground's texture changes sharpness."),
+    Slider(5, nullptr,          "Texture LOD bias",    &Config::textureLodBias,   -2.0,  0.0,   0.05,   1.0,    2, "")
+        .Help("Below 0 uses sharper texture detail further away. Too low shimmers in motion; "
+              "-0.5 is a good start with 16x anisotropic."),
+    Slider(5, "GROUND & TIRES", "Dirt detail",         &Config::dirtDetail,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Adds fine high-resolution grain, pebbles and clods to the track surface up close, "
+              "lit by the sun. Only on the ground, never on bikes or riders."),
+    Slider(5, nullptr,          "Detail size",         &Config::dirtScale,        0.5,   2.0,   0.05,   1.0,    2, "x")
+        .Help("How big the dirt detail's grains and pebbles are."),
+    Slider(5, nullptr,          "Tire marks",          &Config::tireMarks,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Your tires dig ruts in the dirt behind you: packed, darker dirt with the knobs' "
+              "imprint and loose clods along the edges. They stay on the track about 80 m around you."),
+    Slider(5, nullptr,          "Tire dirt",           &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Mud caked on your tires, in clumps that turn with the wheels, lit by the sun."),
+    Slider(6, "CAMERA",         "Motion blur",         &Config::motionBlur,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Blurs the picture with the camera's movement for a sense of speed. Your own bike "
+              "stays sharp."),
+    Slider(6, nullptr,          "Depth of field",      &Config::depthOfField,     0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Blurs what's out of focus: the bars and the far distance when focused down the "
+              "track."),
+    Slider(6, nullptr,          "Focus distance",      &Config::dofFocus,         0.0,   100.0, 0.5,    1.0,    1, " m", "Auto")
+        .Help("Where depth of field focuses. Auto focuses on the middle of the screen, easing "
+              "between distances like an eye."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -1114,7 +1211,7 @@ const char* KeyConflict(int vk, const Config& cfg)
     default:
         break;
     }
-    if (vk == cfg.toggleKey || vk == cfg.reloadKey || vk == cfg.dumpKey || vk == cfg.traceKey)
+    if (vk == cfg.toggleKey || vk == cfg.reloadKey || vk == cfg.dumpKey || vk == cfg.traceKey || vk == cfg.shaderToggleKey)
         return "ALREADY AN MXCAM HOTKEY";
     return nullptr;
 }
@@ -1156,9 +1253,12 @@ void ListenForKey(double now)
 // ===========================================================================
 void FormatValue(const RowDef& def, double value, char* out, size_t size)
 {
-    if (def.zeroText && value <= def.min + def.step * 0.5)
+    if (def.zeroText && value <= def.min + def.step * 0.5) {
         snprintf(out, size, "%s", def.zeroText);
-    else if (def.min < 0)
+    } else if (def.clock) {
+        const int minutes = static_cast<int>(std::lround(value * 60.0)) % (24 * 60);
+        snprintf(out, size, "%02d:%02d", minutes / 60, minutes % 60);
+    } else if (def.min < 0)
         snprintf(out, size, "%+.*f%s", def.decimals, value * def.display, def.unit);
     else
         snprintf(out, size, "%.*f%s", def.decimals, value * def.display, def.unit);
@@ -1195,6 +1295,8 @@ bool RowInactive(const RowDef& def, const Config& cfg)
 {
     if (def.locked || (def.customOnly && !cfg.customCamera))
         return true;
+    if (def.tab < kFirstGraphicsTab && !cfg.enabled && def.flag != &Config::enabled && def.kind != RowKind::Key)
+        return true;  // the camera mod is off
     if (def.number == &Config::cameraAngleDeg && cfg.keepGameAngle)
         return true;
     if (def.tab == 3 && def.number) {  // placement for a replay camera that isn't the one chosen
@@ -1206,6 +1308,26 @@ bool RowInactive(const RowDef& def, const Config& cfg)
     }
     if (def.option == &Config::helmetMount)
         return cfg.replayCamera != 2;
+    if (def.tab >= kFirstGraphicsTab) {  // the shaders' rows: off with the master switch, or what they refine
+        if (def.flag == &Config::shaders)
+            return false;
+        if (!cfg.shaders)
+            return true;
+        if (def.flag == &Config::moveSun || def.flag == &Config::hideGameFlare || def.number == &Config::nightBrightness)
+            return cfg.timeOfDay < 0;
+        if (def.number == &Config::shadowLength || def.flag == &Config::shadowMap)
+            return cfg.shadows <= 0;
+        if (def.number == &Config::shadowDistance)
+            return cfg.shadows <= 0 || !cfg.shadowMap;
+        if (def.number == &Config::headlight)
+            return cfg.timeOfDay < 0;
+        if (def.number == &Config::headlightBeamDeg)
+            return cfg.timeOfDay < 0 || cfg.headlight <= 0;
+        if (def.number == &Config::dirtScale)
+            return cfg.dirtDetail <= 0;
+        if (def.number == &Config::dofFocus)
+            return cfg.depthOfField <= 0;
+    }
     return false;
 }
 
@@ -1252,7 +1374,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             selectedHelp = { text, top };
     };
 
-    const float pad = S(24), panelW = S(384), innerW = panelW - 2 * pad;
+    const float pad = S(24), panelW = S(460), innerW = panelW - 2 * pad;
     const float headerH = S(46), tabsH = S(40), sectionH = S(36), rowH = S(46), buttonH = S(36);
     float contentH = 0;
     for (int tab = 0; tab < kTabCount; ++tab)
@@ -1301,19 +1423,26 @@ void BuildPanel(int screenHeight, const Input& in, double now)
          ty + std::round((th - LineHeight(kFontSmall)) * 0.5f), state, cfg.enabled ? White(1.0f) : Gray(130), S(2));
     if (g_panel.selected == kToggleItem)
         Marker(ty - S(2), th + S(4));
-    OfferHelp("Turns the whole mod on or off. Off gives you the game's normal camera.", py, toggleHot,
-              g_panel.selected == kToggleItem);
+    OfferHelp("Turns the camera mod on or off. Off gives you the game's normal camera. The shaders have "
+              "their own switch on the LIGHT tab.", py, toggleHot, g_panel.selected == kToggleItem);
     y += headerH;
 
     // ---- Tabs ----
     {
         if (g_panel.selected == kTabBarItem && in.step)
             g_panel.tab = (g_panel.tab + in.step + kTabCount) % kTabCount;
-        // Each tab is its label plus an equal share of the spare width, so long labels still fit.
-        float labelW[kTabCount], spare = innerW;
-        for (int tab = 0; tab < kTabCount; ++tab) {
-            labelW[tab] = TextWidth(kFontSmall, kTabs[tab], S(2));
-            spare -= labelW[tab];
+        // Each tab is its label plus an equal share of the spare width, so long labels still fit
+        // (with tighter letter spacing if they would only just fit).
+        float labelW[kTabCount], spare = innerW, tracking = S(2);
+        for (int pass = 0; pass < 2; ++pass) {
+            spare = innerW;
+            for (int tab = 0; tab < kTabCount; ++tab) {
+                labelW[tab] = TextWidth(kFontSmall, kTabs[tab], tracking);
+                spare -= labelW[tab];
+            }
+            if (spare >= kTabCount * S(8))
+                break;
+            tracking = S(1) > 0 ? S(1) : 1;
         }
         float tx = x;
         for (int tab = 0; tab < kTabCount; ++tab) {
@@ -1325,7 +1454,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             }
             const bool current = tab == g_panel.tab;
             const float lx = std::round(tx + (tabW - labelW[tab]) * 0.5f);
-            Text(kFontSmall, lx, y + S(6), kTabs[tab], current ? White(1.0f) : Gray(hot ? 190 : 120), S(2));
+            Text(kFontSmall, lx, y + S(6), kTabs[tab], current ? White(1.0f) : Gray(hot ? 190 : 120), tracking);
             Rect(tx + S(6), y + S(26), tabW - S(12), current ? S(2) : 1, current ? White(1.0f) : White(0.10f));
             tx += tabW;
         }
@@ -1382,7 +1511,7 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             const float t = static_cast<float>((value - def.min) / (def.max - def.min));
             const float knobX = std::round(x + t * innerW);
             Rect(x, trackY, innerW, S(2), White(0.16f));
-            if (def.min < 0) {  // signed values fill from the centre
+            if (def.min < 0 && !def.clock) {  // signed values fill from the centre
                 const float zeroX = std::round(x + static_cast<float>(-def.min / (def.max - def.min)) * innerW);
                 Rect(std::fmin(zeroX, knobX), trackY, std::fabs(knobX - zeroX), S(2), White(inactive ? 0.4f : 0.92f));
                 Rect(zeroX, trackY - S(3), 1, S(8), White(0.3f));
@@ -1392,8 +1521,11 @@ void BuildPanel(int screenHeight, const Input& in, double now)
             Disc(knobX, trackY + S(1), active ? S(8) : (hot ? S(7) : S(6)), inactive ? Gray(150) : White(1.0f));
         } else if (def.kind == RowKind::Toggle) {
             bool& flag = cfg.*def.flag;
-            if ((hot && in.pressed) || (focused && (in.step || in.activate)))
+            if ((hot && in.pressed) || (focused && (in.step || in.activate))) {
                 SetFlag(flag, !flag);
+                if (def.flag == &Config::enabled)
+                    camera::Reset();
+            }
             Text(kFontBody, x, labelY, def.label, labelColor, 0);
             const float sw = Switch(x + innerW, y + rowH * 0.5f, S(20), flag, hot);
             const char* onOff = flag ? "ON" : "OFF";
@@ -1464,7 +1596,13 @@ void BuildPanel(int screenHeight, const Input& in, double now)
     y += S(24);
     char readout[128];
     const camera::Telemetry& t = camera::LastTelemetry();
-    if (!cfg.enabled) {
+    if (g_panel.tab == kFirstGraphicsTab) {
+        snprintf(readout, sizeof readout, "%s", postfx::StatusText());
+    } else if (g_panel.tab == kFirstGraphicsTab + 1) {
+        snprintf(readout, sizeof readout, "%s", texfilter::StatusText());
+    } else if (g_panel.tab > kFirstGraphicsTab) {
+        snprintf(readout, sizeof readout, "%s", postfx::StatusText());
+    } else if (!cfg.enabled) {
         snprintf(readout, sizeof readout, "HELMET CAM IS OFF");
     } else if (g_panel.tab == 0) {
         if (cfg.customCamera && !t.bikeTracked)
@@ -1525,7 +1663,8 @@ void BuildPanel(int screenHeight, const Input& in, double now)
         }
     }
     if (Button(defaultsItem, x + bw + gap, bw, "DEFAULTS", false,
-               "Puts every camera setting back to its default (not the menu key). Press SAVE to keep it.")) {
+               "Puts every camera and graphics setting back to its default (not the menu key). Press SAVE "
+               "to keep it.")) {
         ResetTunables();
         camera::Reset();
         g_panel.dirty = true;

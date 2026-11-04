@@ -27,6 +27,12 @@
 //     'u_bone_t', its head through the whole skeleton). The game culls the terrain patches
 //     behind its own replay camera, so with those cameras the missing ones are drawn when the
 //     game is done with the terrain program (terrain.h).
+//   - the shaders (postfx.h) are told this frame's camera, the projection, the game's sun and
+//     when the terrain pass ends, all independently of the helmet cam being on; and where the
+//     HUD starts: the first draw after the 3D scene whose u_modelview is scaled (HUD elements)
+//     or that draws without depth testing (2D), so the effects run on the scene alone;
+//   - the sun can be turned by the time of day, before the eye-space correction above;
+//   - texture filtering (texfilter.h) also covers sampler objects.
 //   TraceKey (F11) records a per-frame trace (mxcam_trace.csv) for diagnosing jerks.
 //   Uniform names are logged as the game looks them up, and every upload goes into the F10 dump.
 
@@ -49,8 +55,10 @@
 #include "gamepad.h"
 #include "hooks.h"
 #include "log.h"
+#include "postfx.h"
 #include "replay.h"
 #include "terrain.h"
+#include "texfilter.h"
 
 namespace mxcam {
 namespace {
@@ -71,6 +79,11 @@ using PFN_BindVertexArray         = void (APIENTRY*)(GLuint array);
 using PFN_BindBuffer              = void (APIENTRY*)(GLenum target, GLuint buffer);
 using PFN_DrawElements            = void (APIENTRY*)(GLenum mode, GLsizei count, GLenum type, const void* indices);
 using PFN_DrawArrays              = void (APIENTRY*)(GLenum mode, GLint first, GLsizei count);
+using PFN_SamplerParameteri       = void (APIENTRY*)(GLuint sampler, GLenum pname, GLint param);
+using PFN_SamplerParameterf       = void (APIENTRY*)(GLuint sampler, GLenum pname, GLfloat param);
+using PFN_DeleteSamplers          = void (APIENTRY*)(GLsizei count, const GLuint* samplers);
+using PFN_ShaderSource            = void (APIENTRY*)(GLuint shader, GLsizei count, const GLchar* const* strings, const GLint* lengths);
+using PFN_IsEnabled               = GLboolean (APIENTRY*)(GLenum capability);
 
 // Real driver functions, filled in by WrapProc() when the game first asks for them.
 // The ARB variants have the same signatures (GLhandleARB is an unsigned int on Windows).
@@ -95,6 +108,33 @@ PFN_BindVertexArray         real_glBindVertexArray         = nullptr;
 PFN_BindBuffer              real_glBindBuffer              = nullptr;
 PFN_DrawElements            real_glDrawElements            = nullptr;  // OpenGL 1.1 exports, for replaying
 PFN_DrawArrays              real_glDrawArrays              = nullptr;  // the terrain's draw calls
+PFN_SamplerParameteri       real_glSamplerParameteri       = nullptr;
+PFN_SamplerParameterf       real_glSamplerParameterf       = nullptr;
+PFN_DeleteSamplers          real_glDeleteSamplers          = nullptr;
+PFN_ShaderSource            real_glShaderSource            = nullptr;
+PFN_IsEnabled               real_glIsEnabled               = nullptr;  // OpenGL 1.1 export, for the HUD check
+using PFN_GetIntegerv           = void (APIENTRY*)(GLenum pname, GLint* data);
+PFN_GetIntegerv             real_glGetIntegerv             = nullptr;  // OpenGL 1.1 export, for the lens flare check
+
+// What each program's u_modelview last held this frame, to tell the 3D scene from the HUD.
+enum class ModelviewKind { Scene, Identity, Scaled };
+struct ProgramModelview {
+    unsigned      frame = 0;
+    ModelviewKind kind  = ModelviewKind::Scene;
+    GLint         location = -1;     // its u_modelview, and what was last sent to the driver for it
+    GLfloat       uploaded[16] = {};
+    bool          transposed = false;
+};
+std::unordered_map<GLuint, ProgramModelview> g_programModelview;  // render thread only
+// Each program's projection uniform (whatever its name: the one perspective matrices go to) and
+// its value, for drawing objects again from the sun (shadow maps) and putting it back.
+struct ProgramProjection {
+    GLint   location = -1;
+    GLfloat value[16] = {};
+};
+std::unordered_map<GLuint, ProgramProjection> g_programProjection;  // render thread only
+unsigned g_frameNumber   = 1;
+bool     g_shaderViewSet = false;  // postfx has this frame's camera
 
 constexpr int kMaxLookupsLogged = 500;
 
@@ -513,6 +553,113 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
     return scratch;
 }
 
+// ---- What the shaders need to know (postfx.h) ----------------------------------------------
+bool IsPerspectiveMatrix(const GLfloat* m)
+{
+    return std::fabs(m[15]) < 1e-6f && std::fabs(m[11]) > 1e-6f && std::fabs(m[3]) < 1e-6f && std::fabs(m[7]) < 1e-6f;
+}
+
+// Every mat4 upload: perspective projections, and per program whether its u_modelview holds a
+// 3D object, an identity (2D screens) or something scaled (HUD elements). The terrain's first
+// upload of the frame is the camera; uploaded is what actually went to the driver for it.
+void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat* value,
+                     const GLfloat* uploaded)
+{
+    if (!value || count != 1 || location < 0)
+        return;
+    GLfloat transposed[16];
+    const GLfloat* m = value;
+    if (transpose) {
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                transposed[c * 4 + r] = value[r * 4 + c];
+        m = transposed;
+    }
+    AcquireSRWLockShared(&g_lock);
+    const bool isModelview = g_modelviewUniforms.count(UniformKey(program, location)) != 0;
+    const bool knownCamera = !g_cameraPrograms.empty();
+    const bool isCamera    = g_cameraPrograms.count(program) != 0;
+    ReleaseSRWLockShared(&g_lock);
+
+    if (IsPerspectiveMatrix(m)) {
+        postfx::NoteProjection(m, isCamera);
+        ProgramProjection& projection = g_programProjection[program];
+        projection.location = location;
+        std::copy(m, m + 16, projection.value);
+        return;
+    }
+    if (!isModelview)
+        return;
+    const bool identity = IsIdentity(m);
+    const bool scene = !identity && IsRigid(m);
+    ProgramModelview& kind = g_programModelview[program];
+    kind.frame = g_frameNumber;
+    kind.kind = scene ? ModelviewKind::Scene : identity ? ModelviewKind::Identity : ModelviewKind::Scaled;
+    kind.location = location;
+    kind.transposed = transpose != GL_FALSE;
+    std::copy(uploaded, uploaded + 16, kind.uploaded);
+    if (scene && g_shaderViewSet && HasTranslation(m))
+        postfx::NoteObject(program, m);  // one of them is your bike (the headlight rides on it)
+    if (!g_shaderViewSet && scene && (knownCamera ? isCamera : HasTranslation(m))) {
+        g_shaderViewSet = true;
+        double raw[16], rendered[16];
+        for (int i = 0; i < 16; ++i) {
+            raw[i] = m[i];
+            rendered[i] = transpose ? m[i] : uploaded[i];  // transposed uploads are never corrected
+        }
+        postfx::NoteView(raw, rendered);
+    }
+}
+
+// Before a draw call, while the shaders wait for the HUD: is this draw the start of it?
+void CheckSceneEnd()
+{
+    const auto found = g_programModelview.find(g_program);
+    const bool fresh = found != g_programModelview.end() && found->second.frame == g_frameNumber;
+    if (fresh && found->second.kind == ModelviewKind::Scene)
+        return;
+    if (fresh && found->second.kind == ModelviewKind::Scaled) {
+        postfx::SceneEnd(g_program, "a scaled u_modelview");
+        return;
+    }
+    if (!real_glIsEnabled)
+        real_glIsEnabled = reinterpret_cast<PFN_IsEnabled>(GetRealGLFunction("glIsEnabled"));
+    if (real_glIsEnabled && !real_glIsEnabled(GL_DEPTH_TEST))
+        postfx::SceneEnd(g_program, fresh ? "an identity u_modelview without depth testing" : "drawn without depth testing");
+}
+
+// The game's lens flare: its sprites are added onto the picture (additive blending) after the
+// 3D scene, as 2D draws (a scaled or identity u_modelview, or none), and its sun is a billboard
+// that turns with the camera but doesn't move with it. With a time of day set they would still
+// sit at the game's own sun (at night: a glare in the dark sky and ghosts on the ground).
+std::unordered_set<GLuint> g_loggedFlare;  // render thread only
+
+bool IsGameFlare()
+{
+    if (!real_glIsEnabled)
+        real_glIsEnabled = reinterpret_cast<PFN_IsEnabled>(GetRealGLFunction("glIsEnabled"));
+    if (!real_glGetIntegerv)
+        real_glGetIntegerv = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+    if (!real_glIsEnabled || !real_glGetIntegerv || !real_glIsEnabled(GL_BLEND))
+        return false;
+    constexpr GLenum kBlendDstRgb = 0x80C8;
+    GLint dst = 0;
+    real_glGetIntegerv(kBlendDstRgb, &dst);
+    if (dst != GL_ONE)
+        return false;  // not added onto the picture
+    const auto found = g_programModelview.find(g_program);
+    const bool fresh = found != g_programModelview.end() && found->second.frame == g_frameNumber;
+    if (!fresh && real_glIsEnabled(GL_DEPTH_TEST))
+        return false;  // no u_modelview of its own this frame, and depth tested: part of the world
+    const bool flat = !fresh || found->second.kind != ModelviewKind::Scene;
+    if (!flat && HasTranslation(found->second.uploaded))
+        return false;  // something in the world (dust, lights): keep it
+    if (g_loggedFlare.insert(g_program).second)
+        Log("postfx: hiding the game's lens flare while a time of day is set (program %u, %s)", g_program,
+            flat ? "added onto the picture in 2D" : "a billboard in the sky");
+    return true;
+}
+
 // ---- Your own torso and head (see SkinnedProgram) -----------------------------------------
 SkinnedProgram* FindSkinned(GLuint program)
 {
@@ -653,10 +800,17 @@ void PrepareSkinnedDraw()
     const int bones = skin->bones;
     const bool complete = bones > 0 && bones <= kMaxBones && skin->centres >= bones &&
                           skin->positions >= bones && skin->rotations >= bones && skin->haveView;
+    if (bones == 0 && skin->haveView) {  // a rigid draw: one bone at its origin (the headlight, tire marks)
+        static const GLfloat zero[3] = { 0, 0, 0 }, identity[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        postfx::NoteSkeleton(g_program, zero, zero, identity, false, 1, skin->rawView);
+    }
     if (!complete && !skin->positionEdited && !skin->rotationEdited)
         return;
     if (complete && replay::Current() != replay::Mode::Off)  // the helmet camera rides on the skeleton
         replay::ObserveSkeleton(skin->centre, skin->position, skin->rotation, skin->transposed, bones);
+    if (complete)  // your rider (the headlight) and your bike's wheels (tire marks, tire dirt)
+        postfx::NoteSkeleton(g_program, skin->centre, skin->position, skin->rotation, skin->transposed, bones,
+                             skin->rawView);
 
     const Config& cfg = GetConfig();
     bool hidden[kMaxBones] = {};
@@ -737,6 +891,7 @@ void APIENTRY Wrap_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean t
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(g_program, location, count, transpose, value, scratch);
     uploaded = NoteSkinnedView(g_program, location, count, transpose, value, uploaded, scratch);
+    NoteSceneMatrix(g_program, location, count, transpose, value, uploaded);
     real_glUniformMatrix4fv(location, count, transpose, uploaded);
 }
 
@@ -746,6 +901,7 @@ void APIENTRY Wrap_glUniformMatrix4fvARB(GLint location, GLsizei count, GLboolea
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(g_program, location, count, transpose, value, scratch);
     uploaded = NoteSkinnedView(g_program, location, count, transpose, value, uploaded, scratch);
+    NoteSceneMatrix(g_program, location, count, transpose, value, uploaded);
     real_glUniformMatrix4fvARB(location, count, transpose, uploaded);
 }
 
@@ -755,6 +911,7 @@ void APIENTRY Wrap_glProgramUniformMatrix4fv(GLuint program, GLint location, GLs
     GLfloat scratch[16];
     const GLfloat* uploaded = CorrectModelview(program, location, count, transpose, value, scratch);
     uploaded = NoteSkinnedView(program, location, count, transpose, value, uploaded, scratch);
+    NoteSceneMatrix(program, location, count, transpose, value, uploaded);
     real_glProgramUniformMatrix4fv(program, location, count, transpose, uploaded);
 }
 
@@ -762,15 +919,28 @@ void APIENTRY Wrap_glProgramUniformMatrix4fv(GLuint program, GLint location, GLs
 // ours, in scratch, or value itself if this isn't a light uniform. Directions (vec3, or vec4 with
 // w = 0) get the rotation only; a vec4 position with w != 0 gets the full correction.
 constexpr GLsizei kMaxLights = 16;
+// The time of day (postfx.h) can turn the sun first: the game's value is replaced, in the game's
+// eye space, before the correction.
 const GLfloat* CorrectLight(GLint location, GLsizei count, const GLfloat* value, int components, GLfloat* scratch)
 {
-    if (!GetConfig().enabled || !value || count <= 0 || count > kMaxLights || !g_camera.haveCorrection)
+    if (!value || count <= 0 || count > kMaxLights)
         return value;
     AcquireSRWLockShared(&g_lock);
     const bool isLight = g_lightUniforms.count(UniformKey(g_program, location)) != 0;
     ReleaseSRWLockShared(&g_lock);
     if (!isLight)
         return value;
+
+    postfx::NoteGameLight(value, components);
+    GLfloat timed[kMaxLights * 4];
+    if (postfx::OverrideLight(value, count, components, timed))
+        value = timed;
+    if (!GetConfig().enabled || !g_camera.haveCorrection) {
+        if (value != timed)
+            return value;
+        std::copy(timed, timed + count * components, scratch);
+        return scratch;
+    }
 
     for (GLsizei i = 0; i < count; ++i) {
         const GLfloat* v = value + i * components;
@@ -833,15 +1003,16 @@ void APIENTRY Wrap_glUniform4fvARB(GLint location, GLsizei count, const GLfloat*
     real_glUniform4fvARB(location, count, CorrectLight(location, count, value, 4, scratch));
 }
 
-// Bone positions, for the chase camera in replays (only looked at during one).
+// Bone positions: for the headlight (your own rider, in any camera) and the chase camera in
+// replays (only looked at during one).
 void ObserveBones(GLint location, GLsizei count, const GLfloat* value)
 {
-    if (!value || replay::Current() == replay::Mode::Off)
+    if (!value)
         return;
     AcquireSRWLockShared(&g_lock);
     const bool isBones = g_boneUniforms.count(UniformKey(g_program, location)) != 0;
     ReleaseSRWLockShared(&g_lock);
-    if (isBones)
+    if (isBones && replay::Current() != replay::Mode::Off)
         replay::ObserveBones(value, count);
 }
 
@@ -1058,6 +1229,7 @@ void FinishTerrainPass()
         FillTerrain();
     }
     g_terrain.patches.clear();
+    postfx::TerrainPassDone();  // the depth buffer holds the ground (and the sky) only
 }
 
 // Patch uploads are logged in the F10 dump.
@@ -1096,8 +1268,8 @@ void APIENTRY Wrap_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GL
     draw.count = count;
     draw.type = type;
     draw.indices = indices;
-    NoteDraw(draw);
-    real_glDrawRangeElements(mode, start, end, count, type, indices);
+    if (NoteDraw(draw))
+        real_glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
 void APIENTRY Wrap_glBindVertexArray(GLuint array)
@@ -1113,6 +1285,49 @@ void APIENTRY Wrap_glBindBuffer(GLenum target, GLuint buffer)
     if (target == kElementArrayBuffer)
         g_elementBuffers[g_vao] = buffer;
     real_glBindBuffer(target, buffer);
+}
+
+// Sampler objects override their textures' filtering: texture filtering covers them too.
+void APIENTRY Wrap_glSamplerParameteri(GLuint sampler, GLenum pname, GLint param)
+{
+    if (texfilter::Watches(pname))
+        param = static_cast<GLint>(texfilter::SamplerParameter(sampler, pname, static_cast<float>(param)));
+    real_glSamplerParameteri(sampler, pname, param);
+}
+
+void APIENTRY Wrap_glSamplerParameterf(GLuint sampler, GLenum pname, GLfloat param)
+{
+    if (texfilter::Watches(pname))
+        param = texfilter::SamplerParameter(sampler, pname, param);
+    real_glSamplerParameterf(sampler, pname, param);
+}
+
+void APIENTRY Wrap_glDeleteSamplers(GLsizei count, const GLuint* samplers)
+{
+    texfilter::SamplersDeleted(count, samplers);
+    real_glDeleteSamplers(count, samplers);
+}
+
+// DumpShaders=1: every shader source the game compiles goes to mxcam_shaders\shader_<id>.glsl.
+void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* const* strings, const GLint* lengths)
+{
+    if (GetConfig().dumpShaders && strings && count > 0) {
+        wchar_t path[1024];
+        swprintf_s(path, L"%smxcam_shaders", LogDirectory());
+        CreateDirectoryW(path, nullptr);
+        swprintf_s(path, L"%smxcam_shaders\\shader_%u.glsl", LogDirectory(), shader);
+        if (FILE* file = _wfsopen(path, L"wb", _SH_DENYWR)) {
+            for (GLsizei i = 0; i < count; ++i) {
+                if (!strings[i])
+                    continue;
+                const size_t length = lengths && lengths[i] >= 0 ? static_cast<size_t>(lengths[i]) : strlen(strings[i]);
+                fwrite(strings[i], 1, length, file);
+            }
+            fclose(file);
+            Log("shaders: wrote shader %u's source to mxcam_shaders", shader);
+        }
+    }
+    real_glShaderSource(shader, count, strings, lengths);
 }
 
 struct ProcWrapper {
@@ -1135,6 +1350,8 @@ const ProcWrapper kWrappers[] = {
     MXCAM_WRAP(glUniform1i),
     MXCAM_WRAP(glDrawRangeElements),
     MXCAM_WRAP(glBindVertexArray),         MXCAM_WRAP(glBindBuffer),
+    MXCAM_WRAP(glSamplerParameteri),       MXCAM_WRAP(glSamplerParameterf),
+    MXCAM_WRAP(glDeleteSamplers),          MXCAM_WRAP(glShaderSource),
 };
 
 }  // namespace
@@ -1251,11 +1468,68 @@ void TraceFrame(bool captured)
 
 }  // namespace
 
-void NoteDraw(const DrawCall& draw)
+namespace {
+
+// Shadow maps (postfx.h): an object's draw call, repeated from the sun right before the game's
+// own, with only u_modelview and the projection swapped (and put back after). Everything else
+// the draw needs - its vertex arrays, textures, bones - is already set up by the game.
+void CastShadow(const DrawCall& draw)
 {
-    if (!g_terrain.isTerrain) {
-        PrepareSkinnedDraw();
+    const auto mv = g_programModelview.find(g_program);
+    if (mv == g_programModelview.end() || mv->second.frame != g_frameNumber || mv->second.kind != ModelviewKind::Scene ||
+        mv->second.transposed || mv->second.location < 0 || !HasTranslation(mv->second.uploaded))
+        return;  // not a 3D object this frame (or the sky, which has no position)
+    const auto projection = g_programProjection.find(g_program);
+    if (projection == g_programProjection.end() || projection->second.location < 0)
         return;
+    const PFN_UniformMatrix4fv upload = real_glUniformMatrix4fv ? real_glUniformMatrix4fv : real_glUniformMatrix4fvARB;
+    if (!upload)
+        return;
+
+    // Riders are skinned: their bones are placed in the world, and the modelview is the bare view.
+    float anchor[3];
+    const float* anchorEye = nullptr;
+    if (const SkinnedProgram* skin = FindSkinned(g_program)) {
+        if (skin->bones > 0 && skin->positions > 0) {
+            const GLfloat* m = mv->second.uploaded;
+            const GLfloat* b = skin->position;
+            for (int r = 0; r < 3; ++r)
+                anchor[r] = m[r] * b[0] + m[4 + r] * b[1] + m[8 + r] * b[2] + m[12 + r];
+            anchorEye = anchor;
+        }
+    }
+    float lightModelview[16], lightProjection[16];
+    if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, lightProjection))
+        return;
+    if (!real_glDrawElements)
+        real_glDrawElements = reinterpret_cast<PFN_DrawElements>(GetRealGLFunction("glDrawElements"));
+    if (!real_glDrawArrays)
+        real_glDrawArrays = reinterpret_cast<PFN_DrawArrays>(GetRealGLFunction("glDrawArrays"));
+    if (!postfx::BeginShadowDraw())
+        return;
+    upload(mv->second.location, 1, GL_FALSE, lightModelview);
+    upload(projection->second.location, 1, GL_FALSE, lightProjection);
+    Replay(draw);
+    upload(mv->second.location, 1, GL_FALSE, mv->second.uploaded);
+    upload(projection->second.location, 1, GL_FALSE, projection->second.value);
+    postfx::EndShadowDraw();
+}
+
+}  // namespace
+
+bool NoteDraw(const DrawCall& draw)
+{
+    if (!g_terrain.isTerrain && postfx::WantsSceneEnd())
+        CheckSceneEnd();
+    if (!g_terrain.isTerrain) {
+        if (postfx::HidesGameFlare() && IsGameFlare()) {
+            DumpCall("^ SKIPPED  the game's lens flare (a time of day is set)");
+            return false;
+        }
+        PrepareSkinnedDraw();
+        if (postfx::WantsShadowCasters())
+            CastShadow(draw);
+        return true;
     }
     const auto found = g_elementBuffers.find(g_vao);
     const GLuint elementBuffer = found != g_elementBuffers.end() ? found->second : 0;
@@ -1279,6 +1553,7 @@ void NoteDraw(const DrawCall& draw)
         patch.replayable = false;
     if (draw.kind != DrawCall::Arrays && elementBuffer == 0)
         patch.replayable = false;
+    return true;
 }
 
 bool EndShaderFrame()
@@ -1323,6 +1598,8 @@ bool EndShaderFrame()
     if (!captured)
         g_camera.haveCorrection = false;
     g_camera.capturedThisFrame = false;
+    ++g_frameNumber;
+    g_shaderViewSet = false;
     g_camera.havePreview = false;
     g_camera.skyAngle = 0;
     g_camera.previews = 0;

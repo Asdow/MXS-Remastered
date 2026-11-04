@@ -91,6 +91,49 @@ struct Config {
     double chestTiltDeg     = 10.0;       // chest mount: how far the camera is angled down from the torso
     double helmetSmoothing  = 0.3;        // 0..1 stabilisation of its rotation (0 = every jolt of the head)
     double helmetLevel      = 0.0;        // 0..1 fraction of the head's roll removed
+
+    // [Graphics] shaders (postfx.cpp) and texture filtering (texfilter.cpp). Pure OpenGL: the
+    // finished 3D image (colour + depth) is reworked before the HUD is drawn over it.
+    bool   shaders          = true;       // master switch for every effect below
+    int    shaderToggleKey  = 0x76;       // VK_F7: flips the master switch
+    bool   applyBeforeHud   = true;       // run the effects before the HUD (else at the end of the frame)
+    double timeOfDay        = -1.0;       // hours 0..24; -1 = the game's own lighting
+    bool   moveSun          = true;       // the time of day also turns the game's sun (its lighting)
+    double nightBrightness  = 1.0;        // 0..2 how much moonlight the night keeps (1 = default)
+    bool   hideGameFlare    = true;       // with a time of day set: hide the game's lens flare (it stays at the game's sun)
+    bool   invertLight      = false;      // the light uniform points away from the sun, not toward it
+    double shadows          = 0.6;        // 0..1 sun shadows
+    bool   shadowMap        = true;       // shadow maps: objects drawn again from the sun (off: screen-space only)
+    double shadowDistance   = 25.0;       // m: shadow maps cover this far around the camera
+    int    shadowMapSize    = 2048;       // texels per side
+    double shadowLength     = 6.0;        // m: how far a screen-space shadow can reach
+    double headlight        = 0.8;        // 0..1 the bike's headlight (when the time of day makes it dark)
+    double headlightBeamDeg = 22.0;       // the beam's half-angle
+    double headlightForward = 0.55;       // m: the front plate, from the rider's eyes along the bike
+    double headlightHeight  = -0.45;      // m: the same, up the bike (negative = below the eyes)
+    double headlightPitchDeg = 6.0;       // how far the beam is aimed down
+    double ambientOcclusion = 0.5;        // 0..1
+    double aoRadius         = 0.8;        // m
+    double sunRays          = 0.35;       // 0..1
+    double bloom            = 0.3;        // 0..1
+    double bloomThreshold   = 0.7;        // linear brightness where bloom starts
+    double exposure         = 0.0;        // EV
+    double contrast         = 0.0;        // -0.5..0.5
+    double saturation       = 0.0;        // -1..1
+    double vignette         = 0.2;        // 0..1
+    int    antiAliasing     = 1;          // 0 = off, 1 = FXAA, 2 = FXAA high quality
+    double sharpen          = 0.25;       // 0..1
+    double anisotropy       = 16.0;       // 1 = off
+    bool   trilinear        = true;       // bilinear mipmapped textures blend between mip levels
+    double textureLodBias   = 0.0;        // negative = sharper (can shimmer)
+    double dirtDetail       = 0.6;        // 0..1 extra fine detail on the ground
+    double dirtScale        = 1.0;        // size of the detail (2 = twice as big)
+    double tireMarks        = 0.7;        // 0..1 grooves your tires leave in the dirt
+    double tireDirt         = 0.6;        // 0..1 mud caked on your tires
+    double motionBlur       = 0.0;        // 0..1 camera motion blur
+    double depthOfField     = 0.0;        // 0..1
+    double dofFocus         = 0.0;        // m; 0 = auto-focus on the middle of the screen
+    bool   dumpShaders      = false;      // writes the game's shader sources to mxcam_shaders\ (diagnostics)
 };
 
 const Config& GetConfig();
@@ -103,7 +146,13 @@ void SetEnabled(bool enabled);
 
 // Writes Enabled, MenuKey and the camera tunables back to mxcam.ini (comments and other keys are kept).
 bool SaveConfig();
-// Puts the camera tunables back to their defaults; keys and detection settings are untouched.
+
+// What the mod learnt about your bike, kept in the ini's [Learned] section between sessions
+// (three numbers). Read returns false when the key isn't there.
+bool ReadLearned(const char* key, double value[3]);
+void WriteLearned(const char* key, const double value[3]);
+void ForgetLearned(const char* key);
+// Puts the camera and graphics tunables back to their defaults; keys and detection settings are untouched.
 void ResetTunables();
 
 }  // namespace mxcam

@@ -352,6 +352,7 @@ void EndFrame(double gameTime, double frameDt)
         for (int i = 0; i < 16; ++i)
             g_pose.cameraSpace[i] = locked->viewModel[i];
         g_pose.tracked = true;
+        g_pose.program = locked->program;
     }
     if (locked && locked->missTime == 0) {
         // World transform of the bike this frame: camera -> world times View * Model.

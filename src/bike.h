@@ -31,6 +31,7 @@ void Reset();
 struct Pose {
     bool   tracked = false;
     bool   fresh   = false;  // the bike was matched in the latest frame (world values are current)
+    unsigned program = 0;    // the shader program the bike is drawn with
     // The bike's transform in the latest matched frame's camera space (View * Model as uploaded).
     double cameraSpace[16] = {};
     // The bike model's own axes for "forward" and "up", in model space (unit, axis-aligned).
