@@ -1,4 +1,4 @@
-# MXCam: MX Simulator Dynamic First Person Camera Mod
+# MXS Remastered: MX Simulator Dynamic First Person Camera Mod and Shaders upgrade for MX Simulator
 
 Open source and purely OpenGL based.
 
@@ -12,18 +12,15 @@ Open source and purely OpenGL based.
 > [!IMPORTANT]
 > **Watch this before installing.** It shows every step.
 >
-> ### [CLICK HERE FOR THE VIDEO TUTORIAL](https://www.youtube.com/watch?v=wJv2dMv2B9Y)
+> ### [CLICK HERE FOR THE VIDEO TUTORIAL]()
 
-[![Video tutorial: how to install the MX Simulator camera mod](https://img.youtube.com/vi/wJv2dMv2B9Y/hqdefault.jpg)](https://www.youtube.com/watch?v=wJv2dMv2B9Y)
+[![Video tutorial: how to install the MX Simulator camera mod]()]()
 
 ---
 
 ## Updating
 
-If you already have the mod and want to update it:
 
-1. **Save your settings first.** Take a screenshot or write down your mod settings, just in case.
-2. Replace **both files** shown in the [tutorial video](https://www.youtube.com/watch?v=wJv2dMv2B9Y) (`opengl32.dll` and `mxcam.ini`) with the new ones.
 
 ---
 
