@@ -43,6 +43,7 @@ struct Config {
     double horizonLock          = 0.6;    // 0..1 fraction of roll removed
     double pitchLock            = 0.5;    // 0..1 fraction of the bike's pitch removed (wheelies, jump faces)
     double maxRollCorrectionDeg = 90.0;
+    double steadiness           = 0.6;    // 0..1 how much of the bike's quick jolts (bumps, landings, suspension) the view ignores
 
     // [Air]
     double airLooseness     = 0.6;        // 0..1 how much of the nose's left / right swing in the air the view lets pass
@@ -106,6 +107,7 @@ struct Config {
     bool   shadowMap        = true;       // shadow maps: objects drawn again from the sun (off: screen-space only)
     double shadowDistance   = 25.0;       // m: shadow maps cover this far around the camera
     int    shadowMapSize    = 2048;       // texels per side
+    bool   shadowBatch      = true;       // static objects' shadows drawn together (0: one at a time)
     double shadowLength     = 6.0;        // m: how far a screen-space shadow can reach
     double headlight        = 0.8;        // 0..1 the bike's headlight (when the time of day makes it dark)
     double headlightBeamDeg = 22.0;       // the beam's half-angle

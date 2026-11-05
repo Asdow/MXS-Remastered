@@ -71,6 +71,10 @@ decltype(&::glTexParameterf)     real_glTexParameterf     = nullptr;
 decltype(&::glTexParameteriv)    real_glTexParameteriv    = nullptr;
 decltype(&::glTexParameterfv)    real_glTexParameterfv    = nullptr;
 decltype(&::glDeleteTextures)    real_glDeleteTextures    = nullptr;
+decltype(&::glBindTexture)       real_glBindTexture       = nullptr;
+decltype(&::glDepthMask)         real_glDepthMask         = nullptr;
+decltype(&::glEnable)            real_glEnable            = nullptr;
+decltype(&::glDisable)           real_glDisable           = nullptr;
 PFN_wglSwapBuffers               real_wglSwapBuffers      = nullptr;
 decltype(&::wglSwapLayerBuffers) real_wglSwapLayerBuffers = nullptr;
 decltype(&::wglGetProcAddress)   real_wglGetProcAddress   = nullptr;
@@ -270,25 +274,32 @@ void SetModelview(const T* m)
 // ===========================================================================
 // Frame boundary & hotkeys
 // ===========================================================================
-bool Pressed(int vk, bool& wasDown)
+struct HotkeyState {
+    int  vk = 0;
+    bool down = false;
+};
+
+bool Pressed(int vk, HotkeyState& key)
 {
     const bool down = vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0;
-    const bool pressed = down && !wasDown;
-    wasDown = down;
+    // Just rebound in the panel: the press that picked the key doesn't count.
+    const bool pressed = down && !key.down && vk == key.vk;
+    key.vk = vk;
+    key.down = down;
     return pressed;
 }
 
 void PollHotkeys()
 {
-    static bool toggleDown = false, reloadDown = false, dumpDown = false, traceDown = false, shadersDown = false;
+    static HotkeyState toggleKey, reloadKey, dumpKey, traceKey, shadersKey;
     const Config& cfg = GetConfig();
     // Always sample all keys so the edge detection stays in sync while unfocused.
-    const bool toggle = Pressed(cfg.toggleKey, toggleDown);
-    const bool reload = Pressed(cfg.reloadKey, reloadDown);
-    const bool dump   = Pressed(cfg.dumpKey, dumpDown);
-    const bool trace  = Pressed(cfg.traceKey, traceDown);
-    const bool shaders = Pressed(cfg.shaderToggleKey, shadersDown);
-    if (!GameHasFocus())
+    const bool toggle = Pressed(cfg.toggleKey, toggleKey);
+    const bool reload = Pressed(cfg.reloadKey, reloadKey);
+    const bool dump   = Pressed(cfg.dumpKey, dumpKey);
+    const bool trace  = Pressed(cfg.traceKey, traceKey);
+    const bool shaders = Pressed(cfg.shaderToggleKey, shadersKey);
+    if (!GameHasFocus() || OverlayListeningForKey())  // a keybind is being picked: that press is its answer
         return;
 
     if (toggle) {
@@ -587,6 +598,30 @@ void APIENTRY Hook_glTexParameterfv(GLenum target, GLenum pname, const GLfloat* 
     real_glTexParameterfv(target, pname, params);
 }
 
+void APIENTRY Hook_glDepthMask(GLboolean flag)
+{
+    NoteDepthMask(flag != GL_FALSE);
+    real_glDepthMask(flag);
+}
+
+void APIENTRY Hook_glEnable(GLenum capability)
+{
+    NoteCapability(capability, true);
+    real_glEnable(capability);
+}
+
+void APIENTRY Hook_glDisable(GLenum capability)
+{
+    NoteCapability(capability, false);
+    real_glDisable(capability);
+}
+
+void APIENTRY Hook_glBindTexture(GLenum target, GLuint texture)
+{
+    NoteBindTexture(target, texture);
+    real_glBindTexture(target, texture);
+}
+
 void APIENTRY Hook_glDeleteTextures(GLsizei n, const GLuint* textures)
 {
     texfilter::TexturesDeleted(n, textures);
@@ -644,7 +679,8 @@ const HookEntry* GetHookTable(size_t& count)
         MXCAM_HOOK(glDrawElements), MXCAM_HOOK(glDrawArrays),
         MXCAM_HOOK(glTexParameteri),  MXCAM_HOOK(glTexParameterf),
         MXCAM_HOOK(glTexParameteriv), MXCAM_HOOK(glTexParameterfv),
-        MXCAM_HOOK(glDeleteTextures),
+        MXCAM_HOOK(glDeleteTextures), MXCAM_HOOK(glBindTexture),
+        MXCAM_HOOK(glDepthMask),    MXCAM_HOOK(glEnable),      MXCAM_HOOK(glDisable),
         MXCAM_HOOK(wglSwapBuffers), MXCAM_HOOK(wglSwapLayerBuffers),
         MXCAM_HOOK(wglGetProcAddress),
     };

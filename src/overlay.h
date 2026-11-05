@@ -10,4 +10,7 @@ namespace mxcam {
 // current back buffer. Called by the swap hook right before the real buffer swap.
 void OverlayFrame(HDC dc);
 
+// True while a KEYBINDS row waits for its new key (the hotkeys stay quiet meanwhile).
+bool OverlayListeningForKey();
+
 }  // namespace mxcam

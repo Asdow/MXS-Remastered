@@ -52,6 +52,22 @@ struct DrawCall {
 // flare under a time of day of our own).
 bool NoteDraw(const DrawCall& draw);
 
+// glBindTexture, as the game calls it (tracked so the shadow casters' textures can be put back
+// without asking the driver).
+void NoteBindTexture(unsigned int target, unsigned int texture);  // GLenum, GLuint
+
+// glDepthMask and glEnable / glDisable, as the game calls them: see-through draws (dust, roost,
+// smoke: blended, or not writing depth) cast no shadow-map shadows.
+void NoteDepthMask(bool on);
+void NoteCapability(unsigned int capability, bool on);  // GLenum
+
+// The shadow casters held back this frame (static scenery: its geometry, program and textures
+// don't change during the frame) are drawn into the shadow map in one go, right before the
+// shadows are applied: one switch of framebuffer and state instead of one per object. Called by
+// postfx; Discard drops them (a frame that wasn't applied).
+void FlushShadowCasters();
+void DiscardShadowCasters();
+
 // Called once per frame by the swap hook. Returns true if the shader path found the camera
 // this frame.
 bool EndShaderFrame();

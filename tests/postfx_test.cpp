@@ -14,6 +14,9 @@
 //     shadows   screen-space sun shadows only: the object shades the ground beside it
 //     offscreen shadow maps: a tower behind the camera shades the ground in view
 //     headlight TimeOfDay=0 and the headlight: a lit pool ahead, the rest night
+//     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
+//     tireshidden  the same at 5 m/s for ~3.5 s, its wheels no longer drawn after 1.4 s (as the game
+//               doesn't draw them out of view in first person): they must not be lost (mxcam.log)
 //     defaults  the shipped defaults (no ini): no GL errors, GL state left alone
 //   Every mode checks that the HUD is drawn after the effects (untouched) and that the GL state
 //   the scene had is restored. A .bmp of the frame is saved next to the DLL copy.
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <share.h>
 #include <string>
 #include <vector>
 
@@ -37,6 +41,7 @@ namespace {
     X(wglCreateContext) X(wglMakeCurrent) X(wglDeleteContext) X(wglGetProcAddress) X(glGetError) \
     X(glGetIntegerv) X(glIsEnabled) X(glEnable) X(glDisable) X(glViewport) X(glClearColor)       \
     X(glClear) X(glReadPixels) X(glPixelStorei) X(glFinish) X(glDrawElements) X(glBlendFunc)     \
+    X(glDepthMask)                                                                                \
     X(glGenTextures) X(glBindTexture) X(glTexImage2D) X(glTexParameteri) X(glGetTexParameterfv)  \
     X(glReadBuffer)
 
@@ -210,7 +215,10 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("Headlight=0"), 11,
                                 mode == "narrowbeam" ? "Headlight=1\nHeadlightBeamDeg=8" : "Headlight=1\nHeadlightBeamDeg=22");
     }
-    else if (mode == "tires")  // your bike rides across the view on spinning wheels
+    else if (mode == "shadowperf" || mode == "shadowperf0")  // timing: 800 objects cast shadow-map shadows
+        settings = base.replace(base.find("Shadows=0"), 9, mode == "shadowperf" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
+                                                                                : "Shadows=1\nShadowMap=1\nShadowBatch=0");
+    else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1");
     else if (mode == "dof")
         settings = base.replace(base.find("DepthOfField=0"), 14, "DepthOfField=1\nDofFocus=60");
@@ -322,8 +330,8 @@ int main(int argc, char** argv)
     const GLint oColor = gl.GetUniformLocation(object, "u_color");
 
     // Meshes: the unit patch (indices in a buffer, like the game's) and a 1 m cube, and a quad.
-    GLuint arrays[4] = {};
-    gl.GenVertexArrays(4, arrays);
+    GLuint arrays[6] = {};
+    gl.GenVertexArrays(6, arrays);
     const auto mesh = [&](GLuint array, const float* vertices, size_t vertexBytes, int components,
                           const unsigned short* indices, size_t indexBytes) {
         GLuint buffers[2] = {};
@@ -349,6 +357,14 @@ int main(int argc, char** argv)
     // A wheel: a 2 m square across its axle (its own x), standing in for the rim and tire.
     const float wheelQuad[12] = { 0, -1, -1,  0, 1, -1,  0, -1, 1,  0, 1, 1 };
     mesh(arrays[3], wheelQuad, sizeof wheelQuad, 3, patchIndices, sizeof patchIndices);
+    // The same square, 1.5 m off its model's origin (MX Simulator's wheel models have their origin
+    // far from the axle: it circles the axle as the wheel turns).
+    const float wheelQuadOff[12] = { 0, 0.5f, -1,  0, 2.5f, -1,  0, 0.5f, 1,  0, 2.5f, 1 };
+    mesh(arrays[4], wheelQuadOff, sizeof wheelQuadOff, 3, patchIndices, sizeof patchIndices);
+    // The same in feet (MX Simulator's unit): 3.28 times as big.
+    const float ft = 3.2808f;
+    const float wheelQuadFeet[12] = { 0, 0.5f * ft, -ft,  0, 2.5f * ft, -ft,  0, 0.5f * ft, ft,  0, 2.5f * ft, ft };
+    mesh(arrays[5], wheelQuadFeet, sizeof wheelQuadFeet, 3, patchIndices, sizeof patchIndices);
     gl.BindVertexArray(0);
 
     // A texture the game would filter smoothly (for texture filtering), bound on unit 2 as
@@ -396,7 +412,7 @@ int main(int argc, char** argv)
     // A rider with 10 bones (torso and hips on the midline, arms and legs out to the sides),
     // facing along rotation's -Z, the middle of its bones at (x, y, z). Drawn with the bare view:
     // its bones are world positions.
-    const auto Rider = [&](const float rotation[9], float x, float y, float z) {
+    const auto Rider = [&](const float rotation[9], float x, float y, float z, float scale = 1.0f) {
         const float centres[30] = { 0, 1.3f, 0,  0, 0.95f, 0,  0.25f, 1.2f, -0.1f,  -0.25f, 1.2f, -0.1f,
                                     0.3f, 1.0f, -0.35f,  -0.3f, 1.0f, -0.35f,  0.15f, 0.8f, -0.25f,  -0.15f, 0.8f, -0.25f,
                                     0.18f, 0.45f, -0.3f,  -0.18f, 0.45f, -0.3f };
@@ -406,7 +422,8 @@ int main(int argc, char** argv)
                 mean[k] += centres[b * 3 + k] / 10.0f;
         float positions[30], rotations[90];
         for (int b = 0; b < 10; ++b) {
-            const float c[3] = { centres[b * 3] - mean[0], centres[b * 3 + 1] - mean[1], centres[b * 3 + 2] - mean[2] };
+            const float c[3] = { (centres[b * 3] - mean[0]) * scale, (centres[b * 3 + 1] - mean[1]) * scale,
+                                 (centres[b * 3 + 2] - mean[2]) * scale };
             for (int k = 0; k < 3; ++k)  // rotation (column-major) * c + the middle
                 positions[b * 3 + k] = rotation[k] * c[0] + rotation[3 + k] * c[1] + rotation[6 + k] * c[2] +
                                        (k == 0 ? x : k == 1 ? y : z);
@@ -416,7 +433,16 @@ int main(int argc, char** argv)
         Skinned(view, 10, centres, positions, rotations);
     };
 
-    for (int frameIndex = 0; frameIndex < 12; ++frameIndex) {
+    const bool timing = mode == "shadowperf" || mode == "shadowperf0";
+    const bool hiddenWheels = mode == "tireshidden";
+    const int frames = timing ? 160 : hiddenWheels ? 200 : 12;
+    LARGE_INTEGER frequency, frameStart, frameEnd, runStart;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&runStart);
+    double timedMs = 0;
+    int timedFrames = 0;
+    for (int frameIndex = 0; frameIndex < frames; ++frameIndex) {
+        QueryPerformanceCounter(&frameStart);
         if (mode == "motion")  // the head turning quickly from side to side
             MakeView(0, 1.6f, 0, 12.0f, frameIndex % 2 ? 1.0f : -1.0f, view);
         p_glViewport(0, 0, W, H);
@@ -465,56 +491,93 @@ int main(int argc, char** argv)
         // Tires: your bike crossing the view from left to right, 4.5 m ahead, on spinning wheels,
         // with your rider on it. The bike model faces its own -Z (here: world +X), its origin
         // sits below the ground and its wheels are models of their own, like MX Simulator's.
-        if (mode == "tires" && rider) {
+        if ((mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || hiddenWheels) && rider) {
+            const float u = mode == "tiresfeet" ? 3.2808f : 1.0f;  // game units per metre
+            const float lift = mode == "tiresair" ? 1.2f : 0.0f;    // in the air: no ruts
+            // tireshidden: on the clock at 5 m/s; after 1.4 s the wheels aren't drawn any more (the
+            // frame and your rider still are).
+            LARGE_INTEGER nowCount;
+            QueryPerformanceCounter(&nowCount);
+            const float elapsed = static_cast<float>(double(nowCount.QuadPart - runStart.QuadPart) / double(frequency.QuadPart));
+            const bool wheelsDrawn = !hiddenWheels || elapsed < 1.4f;
+            const float travelled = hiddenWheels ? 5.0f * elapsed : frameIndex * 0.45f;
             // First, like a real track: lots of other skinned objects drawn further away (more than
             // the mod used to keep track of in a frame).
             for (int k = 0; k < 100; ++k) {
-                const float place[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  -15.0f + k * 0.3f, 0, -30.0f, 1 };
+                const float place[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  -15.0f + k * 0.3f, 0, -30.0f * u, 1 };
                 float placed[16];
                 Mul(view, place, placed);
                 const float none[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
                 Skinned(placed, 0, none, none, none);
             }
-            const float x0 = -5.5f + frameIndex * 0.45f;
+            const float x0 = (-5.5f + travelled) * u;
             const float facingX[9] = { 0, 0, 1,  0, 1, 0,  -1, 0, 0 };  // its -Z along world +X
-            Rider(facingX, x0 + 0.85f, 0.9f, -4.5f);
+            Rider(facingX, x0 + 0.85f * u, 0.9f * u + lift, -4.5f * u, u);
+            const float angle = -travelled / 0.35f;
+            const float c = std::cos(angle), sn = std::sin(angle);
+            const float bikeModel[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  x0, -1.5f * u + lift, -4.5f * u, 1 };
             // The bike: a skinned mesh in a model of its own, its bones in it: the frame and the
             // two wheels (at the axles), which turn as it rolls.
             {
-                const float bikeModelSkin[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  x0, -1.5f, -4.5f, 1 };
                 float bikeView[16];
-                Mul(view, bikeModelSkin, bikeView);
-                const float angle = -(frameIndex * 0.45f) / 0.35f;
-                const float c = std::cos(angle), sn = std::sin(angle);
-                const float bikeBones[9] = { 0, 1.9f, -1.0f,  0, 1.86f, -0.25f,  0, 1.86f, -1.73f };
+                Mul(view, bikeModel, bikeView);
+                // The wheel bones' own centres sit 1.5 m below their axles and circle them.
+                const float bikeCentres[9] = { 0, 1.9f * u, -1.0f * u,  0, 0.36f * u, -0.25f * u,  0, 0.36f * u, -1.73f * u };
+                const float bikeBones[9] = { 0, 1.9f * u, -1.0f * u,  0, (1.86f - 1.5f * c) * u, (-0.25f - 1.5f * sn) * u,
+                                             0, (1.86f - 1.5f * c) * u, (-1.73f - 1.5f * sn) * u };
                 const float bikeRotations[27] = { 1, 0, 0, 0, 1, 0, 0, 0, 1,
                                                   1, 0, 0, 0, c, sn, 0, -sn, c,
                                                   1, 0, 0, 0, c, sn, 0, -sn, c };
-                Skinned(bikeView, 3, bikeBones, bikeBones, bikeRotations);
+                Skinned(bikeView, wheelsDrawn ? 3 : 1, bikeCentres, bikeBones, bikeRotations);
             }
             gl.UseProgram(object);
             gl.UniformMatrix4fv(oProj, 1, GL_FALSE, projection);
-            const float bikeModel[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  x0, -1.5f, -4.5f, 1 };
             float viewModel[16];
             Mul(view, bikeModel, viewModel);
             gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
             gl.BindVertexArray(arrays[1]);
             p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            // Something that creeps round now and then, off the centreline between the wheels (like
+            // the chain or a brake disc): it must not be taken for a wheel. (Feet only: in metres
+            // the test cube would be the size of the bike.)
+            if (u > 1.5f) {
+                const float creep = frameIndex * 0.03f, cc = std::cos(creep), cs = std::sin(creep);
+                const float onBike[16] = { 1, 0, 0, 0,  0, cc, cs, 0,  0, -cs, cc, 0,  0.25f * u, 1.9f * u, -1.0f * u, 1 };
+                float partModel[16];
+                Mul(bikeModel, onBike, partModel);
+                Mul(view, partModel, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
             const float grey[3] = { 0.3f, 0.3f, 0.3f };
             gl.Uniform3fv(oColor, 1, grey);
-            for (int w = 0; w < 2; ++w) {
+            for (int w = 0; w < 2 && wheelsDrawn; ++w) {
                 // In the bike's space, like MX Simulator's: the rider between the wheels.
-                const float axleZ = w == 0 ? -0.25f : -1.73f;
-                const float angle = -(frameIndex * 0.45f) / 0.35f;
-                const float c = std::cos(angle), sn = std::sin(angle);
-                // bike * translate(axle) * rotateX(angle)
-                const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, 1.86f, axleZ, 1 };
+                const float axleZ = (w == 0 ? -0.25f : -1.73f) * u;
+                // bike * translate(axle) * rotateX(angle) * translate(0, -1.5 m, 0): its origin circles the axle
+                const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, (1.86f - 1.5f * c) * u, axleZ - 1.5f * sn * u, 1 };
                 float wheelModel[16];
                 Mul(bikeModel, onBike, wheelModel);
                 Mul(view, wheelModel, viewModel);
                 gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
-                gl.BindVertexArray(arrays[3]);
+                gl.BindVertexArray(arrays[u > 1.5f ? 5 : 4]);
                 p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            }
+        }
+
+        // Timing: a field of 800 small boxes around the camera, every one a shadow caster.
+        if (timing) {
+            gl.UseProgram(object);
+            gl.UniformMatrix4fv(oProj, 1, GL_FALSE, projection);
+            gl.Uniform3fv(oLight, 1, sunEye);
+            gl.BindVertexArray(arrays[1]);
+            for (int k = 0; k < 800; ++k) {
+                const float bx = -30.0f + (k % 40) * 1.5f, bz = -3.0f - (k / 40) * 1.5f;
+                const float box[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  bx, 0, bz, 1 };
+                float boxView[16];
+                Mul(view, box, boxView);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, boxView);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             }
         }
 
@@ -531,12 +594,28 @@ int main(int argc, char** argv)
         gl.BindVertexArray(arrays[1]);
         p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
         if (mode == "offscreen") {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
+            // Drawn with blending on, as MX Simulator draws its solid objects: it must still cast.
+            p_glEnable(GL_BLEND);
+            p_glBlendFunc(GL_ONE, GL_ZERO);
             for (int level = 0; level < 2; ++level) {
                 const float behind[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1.0f, static_cast<float>(level), 0.8f, 1 };
                 Mul(view, behind, viewModel);
                 gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
                 p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             }
+            // Kicked-up dirt: a see-through cloud (blended, not writing depth) just as tall, on the
+            // other side. It must not cast a solid shadow onto the sunny ground.
+            p_glEnable(GL_BLEND);
+            p_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            p_glDepthMask(GL_FALSE);
+            for (int level = 0; level < 2; ++level) {
+                const float dust[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1.0f, static_cast<float>(level), 0.8f, 1 };
+                Mul(view, dust, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+            p_glDepthMask(GL_TRUE);
+            p_glDisable(GL_BLEND);
         }
 
         // Game state the effects must not disturb.
@@ -581,7 +660,16 @@ int main(int argc, char** argv)
         gl.ActiveTexture(0x84C0);
         p_glDisable(GL_BLEND);
         p_wglSwapBuffers(dc);
-        Sleep(15);
+        if (timing) {
+            p_glFinish();
+            QueryPerformanceCounter(&frameEnd);
+            if (frameIndex >= 40) {  // after warming up
+                timedMs += 1000.0 * double(frameEnd.QuadPart - frameStart.QuadPart) / double(frequency.QuadPart);
+                ++timedFrames;
+            }
+        } else {
+            Sleep(15);
+        }
     }
 
     const auto At = [&](int x, int y) {  // y from the top
@@ -668,7 +756,7 @@ int main(int argc, char** argv)
         const Pixel shaded = At(604, 374), sunny = At(356, 374);
         printf("    ground right %d %d %d (tower's shadow), left %d %d %d\n", shaded.r, shaded.g, shaded.b, sunny.r, sunny.g, sunny.b);
         Check(shaded.r + 25 < sunny.r, "something off screen casts a shadow (shadow map)");
-        Check(Near(sunny, drawnGround, 3), "ground in the sun stays as it was");
+        Check(Near(sunny, drawnGround, 3), "ground in the sun stays as it was (see-through dust casts no block)");
         Check(Near(box, drawnBox, 3), "the object in front isn't shadowed by itself");
     } else if (mode == "headlight") {
         const Pixel pool = At(W / 2, 330), side = At(30, 330), corner = At(W - 20, H - 20);
@@ -686,7 +774,11 @@ int main(int argc, char** argv)
         printf("    right in front of the plate %d\n", underPlate.r);
         Check(underPlate.r > 60, "the light starts right in front of the plate");
         Check(aside.r < 45, "a narrow beam is skinnier");
-    } else if (mode == "tires") {
+    } else if (timing) {
+        printf("    %s: %.3f ms per frame with 800 shadow casters (%d frames)\n",
+               mode == "shadowperf" ? "drawn together" : "one at a time", timedMs / timedFrames, timedFrames);
+    } else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair") {
+        const float u = mode == "tiresfeet" ? 3.2808f : 1.0f;
         // Where world points land on the screen (y from the top).
         const auto ToPixel = [&](float x, float y, float z, int& px, int& py) {
             const float world[4] = { x, y, z, 1 };
@@ -701,18 +793,43 @@ int main(int argc, char** argv)
             py = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
         };
         int mx = 0, my = 0, bx = 0, by = 0, tx = 0, ty = 0, ox = 0, oy = 0;
-        ToPixel(-1.5f, 0.0f, -4.5f, mx, my);   // on the rear wheel's track, behind the bike
-        ToPixel(-1.5f, 0.0f, -3.9f, bx, by);   // the same, 60 cm closer: untouched ground
-        const float rearX = -5.5f + 11 * 0.45f + 0.25f;
-        ToPixel(rearX - 0.27f, 0.26f, -4.5f, tx, ty);  // the lower back of the rear tire
-        ToPixel(rearX, 0.36f + 0.62f, -4.5f, ox, oy);  // the wheel's square, well above the tire
+        ToPixel(-1.5f * u, 0.0f, -4.5f * u, mx, my);   // on the rear wheel's track, behind the bike
+        ToPixel(-1.5f * u, 0.0f, -3.9f * u, bx, by);   // the same, 60 cm closer: untouched ground
+        const float rearX = (-5.5f + 11 * 0.45f + 0.25f) * u;
+        ToPixel(rearX - 0.27f * u, 0.26f * u, -4.5f * u, tx, ty);  // the lower back of the rear tire
+        ToPixel(rearX, (0.36f + 0.62f) * u, -4.5f * u, ox, oy);   // the wheel's square, well above the tire
         const Pixel mark = At(mx, my), beside = At(bx, by), tire = At(tx, ty), above = At(ox, oy);
         printf("    tire track %d %d %d, beside it %d %d %d; tire %d %d %d, above it %d %d %d\n", mark.r, mark.g, mark.b,
                beside.r, beside.g, beside.b, tire.r, tire.g, tire.b, above.r, above.g, above.b);
-        Check(mark.r + 20 < beside.r, "the rear tire leaves a groove behind it");
-        Check(Near(beside, drawnGround, 3), "the ground beside the track is untouched");
-        Check(tire.r > tire.b + 25, "the tire is caked with mud");
-        Check(std::abs(above.r - above.b) < 8, "higher up the bike stays clean");
+        if (mode == "tiresair") {  // the same ride 1.2 m up: the wheels turn, nothing presses into the ground
+            Check(Near(mark, drawnGround, 3), "no ruts while the bike is in the air");
+        } else {
+            Check(mark.r + 20 < beside.r, "the rear tire leaves a groove behind it");
+            Check(Near(beside, drawnGround, 3), "the ground beside the track is untouched");
+            Check(tire.r > tire.b + 25, "the tire is caked with mud");
+            Check(std::abs(above.r - above.b) < 8, "higher up the bike stays clean");
+        }
+    } else if (hiddenWheels) {
+        // What the log says about the wheels: found while drawn, and never lost after.
+        std::string log;
+        // The DLL still has it open for writing: share it.
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        size_t at = 0;
+        while ((at = log.find("tire marks:", at)) != std::string::npos) {
+            const size_t end = log.find('\n', at);
+            printf("    log: %s\n", log.substr(at, end == std::string::npos ? std::string::npos : end - at).c_str());
+            at = end;
+        }
+        Check(log.find("tire marks: your wheels found") != std::string::npos, "the wheels are found while they're drawn");
+        Check(log.find("tire marks: your wheels lost") == std::string::npos,
+              "wheels the game stops drawing stay on your bike (not lost)");
     } else if (mode == "thirdperson") {
         // The light starts at the rider's bike, not at the camera behind it.
         // (The bike is turned 30 degrees to the right, so its beam is right of the middle.)

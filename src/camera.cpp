@@ -161,6 +161,12 @@ constexpr double kApexOtherWayMin = 15.0, kApexOtherWayFull = 40.0;  // deg/s
 constexpr double kApexQuickResponse = 40.0;               // 1/s
 constexpr double kApexTrendSlow = 3.0, kApexTrendFast = 8.0;   // 1/s
 constexpr double kApexLeadResponse = 4.0;                 // 1/s
+// Steadiness: the spring that follows the bike's lean and pitch runs at kSteadyFastest (1/s) just
+// above 0% down to kSteadySlowest at 100%, evenly on a log scale. At the default 60% that's ~7.6/s:
+// it trails a lean by about a quarter of a second, while a 5 Hz jolt reaches the view at about a
+// twentieth of its size (the view's own smoothing then halves that again).
+constexpr double kSteadyFastest = 40.0, kSteadySlowest = 2.5;
+
 struct TravelSample {
     Vec3   direction;  // the direction of travel on that frame
     double rise = 0;  // upward speed (units/s)
@@ -205,6 +211,11 @@ struct State {
     double apexRate     = 0;      // how fast it is turning (rad/s)
     double apexLead     = 0;      // anticipation: the forecast's change in turn rate (rad/s, eased)
     double smoothHeight = 0;      // low-passed eye height along WorldUp
+    // Steadiness: the lean (roll) and the pitch away from rest, followed through a slow spring,
+    // [0] of the game camera, [1] of the bike.
+    double steadyRoll[2]  = {}, steadyRollRate[2]  = {};
+    double steadyPitch[2] = {}, steadyPitchRate[2] = {};
+    bool   steadyBike     = false;  // [1] is following the bike (false: start it where the bike is)
     double neckOffset   = 0;      // spring displacement along WorldUp (negative = compressed)
     double neckVelocity = 0;
 };
@@ -318,6 +329,9 @@ void CriticalSpring(double& x, double& v, double target, double omega, double dt
     x = target + (e + k * dt) * decay;
     v = (v - omega * k * dt) * decay;
 }
+
+// An angle in radians brought into -pi..pi.
+double WrapAngle(double radians) { return std::remainder(radians, 2.0 * kPi); }
 
 double SmoothStep(double edge0, double edge1, double x)
 {
@@ -614,6 +628,36 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     const double cameraPitchExcess = cameraAtt.pitch - m.cameraPitchRest.Degrees() * kDegToRad;
     const double bikePitchExcess   = haveBike ? bikeAtt.pitch - m.bikePitchRest.Degrees() * kDegToRad : 0.0;
 
+    // Steadiness: like a gimbal, the view follows the lean and pitch through a critically damped
+    // spring, so it eases into a corner's lean, a wheelie or a jump face, but the quick jolts of
+    // bumps, landings and the suspension diving under braking don't reach it. The locks then take
+    // their share of what's left. (Without it a lock let its remainder through at full speed: at
+    // 50% pitch lock, half of every jolt.) The head offsets work from the same steadied axes, so
+    // a jolt doesn't swing the eye on their lever either.
+    const double steadyOmega = cfg.steadiness > 0
+        ? kSteadyFastest * std::pow(kSteadySlowest / kSteadyFastest, cfg.steadiness) : 0.0;
+    const auto Steady = [&](double& x, double& v, double target, bool seed) {
+        if (seed || snap || steadyOmega <= 0) {
+            x = target;
+            v = 0;
+        } else if (dt > 1e-6) {
+            CriticalSpring(x, v, x + WrapAngle(target - x), steadyOmega, dt);  // the short way round
+            x = WrapAngle(x);
+        }
+        return x;
+    };
+    const double cameraRestPitch = cameraAtt.pitch - cameraPitchExcess;
+    Attitude gameSteady = cameraAtt;
+    gameSteady.roll = Steady(s.steadyRoll[0], s.steadyRollRate[0], cameraAtt.roll, false);
+    const double gameExcess = Steady(s.steadyPitch[0], s.steadyPitchRate[0], cameraPitchExcess, false);
+    Attitude bikeSteady = bikeAtt;
+    double bikeExcess = bikePitchExcess;
+    if (haveBike) {
+        bikeSteady.roll = Steady(s.steadyRoll[1], s.steadyRollRate[1], bikeAtt.roll, !s.steadyBike);
+        bikeExcess = Steady(s.steadyPitch[1], s.steadyPitchRate[1], bikePitchExcess, !s.steadyBike);
+    }
+    s.steadyBike = haveBike;
+
     // ---- 4. Target view -------------------------------------------------------------------
     // Air looseness: in the air the view follows the nose's left / right swing only through a
     // slow filter, so most of a scrub or whip passes under the camera and the view keeps
@@ -642,15 +686,15 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     // Game camera: the game's view with the locks applied. (It is fixed to the bike, so its
     // own pitch away from rest is the bike's.) A look-left / right / back isn't a swing.
     double airYaw = AirYaw(cameraAtt.heading, s.airNoseCamera) * (1.0 - SmoothStep(50.0, 75.0, absYawDeg));
-    const double gamePitch = cameraAtt.pitch - cfg.pitchLock * cameraPitchExcess;
-    const double gameRoll  = LockedRoll(cameraAtt, cfg.horizonLock, cfg);
+    const double gamePitch = cameraRestPitch + (1.0 - cfg.pitchLock) * gameExcess;
+    const double gameRoll  = LockedRoll(gameSteady, cfg.horizonLock, cfg);
     Quat target = Build(Turn(cameraAtt.heading, airYaw, worldUp), gamePitch, gameRoll, worldUp);
 
     // Custom camera: built from the bike only.
     if (m.customWeight > 1e-3) {
         const double angleDown = cfg.keepGameAngle ? -m.gameAngleRest.Degrees() : cfg.cameraAngleDeg;
-        const double pitch = (1.0 - cfg.pitchLock) * bikePitchExcess - angleDown * kDegToRad;
-        const double roll  = LockedRoll(bikeAtt, cfg.horizonLock, cfg);
+        const double pitch = (1.0 - cfg.pitchLock) * bikeExcess - angleDown * kDegToRad;
+        const double roll  = LockedRoll(bikeSteady, cfg.horizonLock, cfg);
         // The game's look keys turn the camera 90 / 180 degrees; smaller offsets (the game
         // camera's own wobble, whip or gimbal) are ignored.
         const double look = lookYaw * SmoothStep(50.0, 75.0, absYawDeg);
@@ -746,9 +790,21 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     f.heightOffset  = cfg.headHeight + side * cfg.lookSideHeight + rear * cfg.lookBackHeight;
     f.offsetFwd = rawFwd;
     f.offsetUp  = up;
+    Vec3 offsetBikeFwd = bikeFwd, offsetBikeUp = bikeUp;
+    if (steadyOmega > 0) {  // steadied (see Steadiness above)
+        const Quat game = Build(cameraAtt.heading, cameraRestPitch + gameExcess, gameSteady.roll, worldUp);
+        f.offsetFwd = Rotate(game, { 0, 0, -1 });
+        f.offsetUp  = Rotate(game, { 0, 1, 0 });
+        if (haveBike) {
+            const double bikeRest = bikeAtt.pitch - bikePitchExcess;
+            const Quat bikeFrame = Build(bikeAtt.heading, bikeRest + bikeExcess, bikeSteady.roll, worldUp);
+            offsetBikeFwd = Rotate(bikeFrame, { 0, 0, -1 });
+            offsetBikeUp  = Rotate(bikeFrame, { 0, 1, 0 });
+        }
+    }
     if (haveBike) {
-        f.offsetFwd = f.offsetFwd + (bikeFwd - f.offsetFwd) * m.customWeight;
-        f.offsetUp  = f.offsetUp + (bikeUp - f.offsetUp) * m.customWeight;
+        f.offsetFwd = f.offsetFwd + (offsetBikeFwd - f.offsetFwd) * m.customWeight;
+        f.offsetUp  = f.offsetUp + (offsetBikeUp - f.offsetUp) * m.customWeight;
     }
 
     // ---- 5. Inertial smoothing (pitch / yaw / roll) ---------------------------------------

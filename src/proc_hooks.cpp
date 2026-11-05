@@ -113,6 +113,17 @@ PFN_SamplerParameterf       real_glSamplerParameterf       = nullptr;
 PFN_DeleteSamplers          real_glDeleteSamplers          = nullptr;
 PFN_ShaderSource            real_glShaderSource            = nullptr;
 PFN_IsEnabled               real_glIsEnabled               = nullptr;  // OpenGL 1.1 export, for the HUD check
+using PFN_ActiveTexture         = void (APIENTRY*)(GLenum texture);
+using PFN_BufferData            = void (APIENTRY*)(GLenum target, ptrdiff_t size, const void* data, GLenum usage);
+using PFN_BufferSubData         = void (APIENTRY*)(GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data);
+using PFN_VertexAttribPointer   = void (APIENTRY*)(GLuint index, GLint size, GLenum type, GLboolean normalized,
+                                                   GLsizei stride, const void* pointer);
+using PFN_EnableDisable         = void (APIENTRY*)(GLenum capability);
+using PFN_BindTexture           = void (APIENTRY*)(GLenum target, GLuint texture);
+PFN_ActiveTexture           real_glActiveTexture           = nullptr;
+PFN_BufferData              real_glBufferData              = nullptr;
+PFN_BufferSubData           real_glBufferSubData           = nullptr;
+PFN_VertexAttribPointer     real_glVertexAttribPointer     = nullptr;
 using PFN_GetIntegerv           = void (APIENTRY*)(GLenum pname, GLint* data);
 PFN_GetIntegerv             real_glGetIntegerv             = nullptr;  // OpenGL 1.1 export, for the lens flare check
 
@@ -180,7 +191,32 @@ struct SkinnedProgram {
     bool    haveView = false;
     bool    positionEdited = false, rotationEdited = false;  // the program holds our arrays, not the game's
 };
-std::unordered_map<GLuint, SkinnedProgram> g_skinned;  // by program; nodes stay put, so pointers last
+std::unordered_map<GLuint, SkinnedProgram> g_skinned;
+
+// ---- What the shadow casters' batch needs to know without asking the driver -----------------
+constexpr GLenum kArrayBufferTarget = 0x8892;
+constexpr GLenum kTexture0Unit      = 0x84C0;
+constexpr int    kTrackedUnits      = 4;     // texture units a caster's textures are kept for
+GLuint g_arrayBuffer = 0;                    // GL_ARRAY_BUFFER binding
+int    g_activeUnit = 0;                     // glActiveTexture - GL_TEXTURE0
+GLuint g_boundTextures[16] = {};             // GL_TEXTURE_2D binding per unit
+bool   g_depthWrites = true;                 // glDepthMask, as the game left it
+bool   g_blending = false;                   // GL_BLEND, as the game left it
+std::unordered_map<GLuint, std::vector<GLuint>> g_vaoArrayBuffers;  // vertex arrays -> their buffers
+struct BufferUpdates { unsigned lastFrame = 0; int frames = 0; };
+std::unordered_map<GLuint, BufferUpdates> g_bufferUpdates;          // buffers rewritten while running
+
+struct DeferredCaster {
+    GLuint   program = 0, vao = 0, elementBuffer = 0;
+    DrawCall draw;
+    GLuint   textures[kTrackedUnits] = {};
+    GLint    modelviewLoc = -1, projectionLoc = -1;
+    GLint    boneCountLoc = -1;  // a skinned program's u_nbones, set to 0 for this rigid draw
+    float    lightModelview[16] = {}, lightProjection[16] = {};
+};
+std::vector<DeferredCaster> g_deferredCasters;
+int  g_castAtOnce = 0;          // this frame's shadow casters drawn straight away (skinned, streamed)
+bool g_loggedShadowBatch = false;  // by program; nodes stay put, so pointers last
 bool g_hidingLogged = false;
 
 struct ShaderCamera {
@@ -598,8 +634,8 @@ void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean tr
     kind.location = location;
     kind.transposed = transpose != GL_FALSE;
     std::copy(uploaded, uploaded + 16, kind.uploaded);
-    if (scene && g_shaderViewSet && HasTranslation(m))
-        postfx::NoteObject(program, m);  // one of them is your bike (the headlight rides on it)
+    if (!identity && g_shaderViewSet && HasTranslation(m))
+        postfx::NoteObject(program, m);  // one of them is your bike, others its wheels  // one of them is your bike (the headlight rides on it)
     if (!g_shaderViewSet && scene && (knownCamera ? isCamera : HasTranslation(m))) {
         g_shaderViewSet = true;
         double raw[16], rendered[16];
@@ -1284,6 +1320,8 @@ void APIENTRY Wrap_glBindBuffer(GLenum target, GLuint buffer)
 {
     if (target == kElementArrayBuffer)
         g_elementBuffers[g_vao] = buffer;
+    else if (target == kArrayBufferTarget)
+        g_arrayBuffer = buffer;
     real_glBindBuffer(target, buffer);
 }
 
@@ -1330,6 +1368,56 @@ void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* co
     real_glShaderSource(shader, count, strings, lengths);
 }
 
+// ---- Tracking for the shadow casters' batch ---------------------------------------------------
+void APIENTRY Wrap_glActiveTexture(GLenum texture)
+{
+    g_activeUnit = static_cast<int>(texture - kTexture0Unit);
+    real_glActiveTexture(texture);
+}
+
+// A buffer rewritten in two or more frames holds streamed geometry: what it held at a draw call may
+// be gone by the end of the frame, so its draws are cast at once, not held back.
+void NoteBufferUpdate(GLenum target)
+{
+    GLuint buffer = 0;
+    if (target == kArrayBufferTarget) {
+        buffer = g_arrayBuffer;
+    } else if (target == kElementArrayBuffer) {
+        const auto found = g_elementBuffers.find(g_vao);
+        buffer = found != g_elementBuffers.end() ? found->second : 0;
+    }
+    if (!buffer)
+        return;
+    BufferUpdates& u = g_bufferUpdates[buffer];
+    if (u.lastFrame != g_frameNumber) {
+        u.lastFrame = g_frameNumber;
+        ++u.frames;
+    }
+}
+
+void APIENTRY Wrap_glBufferData(GLenum target, ptrdiff_t size, const void* data, GLenum usage)
+{
+    NoteBufferUpdate(target);
+    real_glBufferData(target, size, data, usage);
+}
+
+void APIENTRY Wrap_glBufferSubData(GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data)
+{
+    NoteBufferUpdate(target);
+    real_glBufferSubData(target, offset, size, data);
+}
+
+void APIENTRY Wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride,
+                                         const void* pointer)
+{
+    if (g_vao) {
+        std::vector<GLuint>& buffers = g_vaoArrayBuffers[g_vao];
+        if (std::find(buffers.begin(), buffers.end(), g_arrayBuffer) == buffers.end())
+            buffers.push_back(g_arrayBuffer);
+    }
+    real_glVertexAttribPointer(index, size, type, normalized, stride, pointer);
+}
+
 struct ProcWrapper {
     const char* name;
     void*       wrapper;
@@ -1352,6 +1440,8 @@ const ProcWrapper kWrappers[] = {
     MXCAM_WRAP(glBindVertexArray),         MXCAM_WRAP(glBindBuffer),
     MXCAM_WRAP(glSamplerParameteri),       MXCAM_WRAP(glSamplerParameterf),
     MXCAM_WRAP(glDeleteSamplers),          MXCAM_WRAP(glShaderSource),
+    MXCAM_WRAP(glActiveTexture),           MXCAM_WRAP(glBufferData),
+    MXCAM_WRAP(glBufferSubData),           MXCAM_WRAP(glVertexAttribPointer),
 };
 
 }  // namespace
@@ -1473,8 +1563,42 @@ namespace {
 // Shadow maps (postfx.h): an object's draw call, repeated from the sun right before the game's
 // own, with only u_modelview and the projection swapped (and put back after). Everything else
 // the draw needs - its vertex arrays, textures, bones - is already set up by the game.
+bool Streamed(GLuint buffer)
+{
+    const auto found = g_bufferUpdates.find(buffer);
+    return found != g_bufferUpdates.end() && found->second.frames >= 2;
+}
+
+// Whether this draw can be repeated at the end of the frame exactly as it is now.
+bool CanHoldBack(const DrawCall& draw)
+{
+    if (!GetConfig().shadowBatch || g_vao == 0 || g_activeUnit < 0 || g_activeUnit >= 16)
+        return false;
+    // A skinned mesh's bones change from draw to draw; the same programs' rigid draws (no bones)
+    // are fine: they're repeated with no bones again.
+    const SkinnedProgram* skin = FindSkinned(g_program);
+    if (skin && skin->positionLoc >= 0 && skin->bones != 0)
+        return false;
+    const auto buffers = g_vaoArrayBuffers.find(g_vao);
+    if (buffers == g_vaoArrayBuffers.end() || buffers->second.empty())
+        return false;
+    for (GLuint buffer : buffers->second)
+        if (buffer == 0 || Streamed(buffer))
+            return false;
+    if (draw.kind != DrawCall::Arrays) {
+        const auto element = g_elementBuffers.find(g_vao);
+        if (element == g_elementBuffers.end() || element->second == 0 || Streamed(element->second))
+            return false;  // indices from memory, or from a streamed buffer
+    }
+    return true;
+}
+
 void CastShadow(const DrawCall& draw)
 {
+    // See-through draws (kicked-up dirt, dust, smoke) don't write depth: they would cast solid
+    // squares. (Blending alone says nothing: the game leaves it on for solid objects too.)
+    if (!g_depthWrites)
+        return;
     const auto mv = g_programModelview.find(g_program);
     if (mv == g_programModelview.end() || mv->second.frame != g_frameNumber || mv->second.kind != ModelviewKind::Scene ||
         mv->second.transposed || mv->second.location < 0 || !HasTranslation(mv->second.uploaded))
@@ -1501,12 +1625,36 @@ void CastShadow(const DrawCall& draw)
     float lightModelview[16], lightProjection[16];
     if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, lightProjection))
         return;
+
+    // Static scenery (not skinned, its geometry in buffers nothing rewrites while running): held
+    // back and drawn with the others in one go before the shadows are applied (FlushShadowCasters).
+    if (CanHoldBack(draw)) {
+        DeferredCaster c;
+        c.program = g_program;
+        c.vao = g_vao;
+        const auto element = g_elementBuffers.find(g_vao);
+        c.elementBuffer = element != g_elementBuffers.end() ? element->second : 0;
+        c.draw = draw;
+        for (int u = 0; u < kTrackedUnits; ++u)
+            c.textures[u] = g_boundTextures[u];
+        c.modelviewLoc = mv->second.location;
+        c.projectionLoc = projection->second.location;
+        if (const SkinnedProgram* skin = FindSkinned(g_program))
+            c.boneCountLoc = skin->positionLoc >= 0 ? skin->countLoc : -1;
+        std::copy(lightModelview, lightModelview + 16, c.lightModelview);
+        std::copy(lightProjection, lightProjection + 16, c.lightProjection);
+        if (g_deferredCasters.size() < 8192) {
+            g_deferredCasters.push_back(c);
+            return;
+        }
+    }
     if (!real_glDrawElements)
         real_glDrawElements = reinterpret_cast<PFN_DrawElements>(GetRealGLFunction("glDrawElements"));
     if (!real_glDrawArrays)
         real_glDrawArrays = reinterpret_cast<PFN_DrawArrays>(GetRealGLFunction("glDrawArrays"));
     if (!postfx::BeginShadowDraw())
         return;
+    ++g_castAtOnce;
     upload(mv->second.location, 1, GL_FALSE, lightModelview);
     upload(projection->second.location, 1, GL_FALSE, lightProjection);
     Replay(draw);
@@ -1516,6 +1664,119 @@ void CastShadow(const DrawCall& draw)
 }
 
 }  // namespace
+
+void NoteDepthMask(bool on)
+{
+    g_depthWrites = on;
+}
+
+void NoteCapability(unsigned int capability, bool on)
+{
+    if (capability == GL_BLEND)
+        g_blending = on;
+}
+
+void NoteBindTexture(unsigned int target, unsigned int texture)
+{
+    if (target == GL_TEXTURE_2D && g_activeUnit >= 0 && g_activeUnit < 16)
+        g_boundTextures[g_activeUnit] = texture;
+}
+
+void DiscardShadowCasters()
+{
+    g_deferredCasters.clear();
+}
+
+void FlushShadowCasters()
+{
+    if (g_deferredCasters.empty())
+        return;
+    const PFN_UniformMatrix4fv upload = real_glUniformMatrix4fv ? real_glUniformMatrix4fv : real_glUniformMatrix4fvARB;
+    static PFN_EnableDisable enable = nullptr, disable = nullptr;
+    static PFN_BindTexture bindTexture = nullptr;
+    if (!enable) {
+        enable = reinterpret_cast<PFN_EnableDisable>(GetRealGLFunction("glEnable"));
+        disable = reinterpret_cast<PFN_EnableDisable>(GetRealGLFunction("glDisable"));
+        bindTexture = reinterpret_cast<PFN_BindTexture>(GetRealGLFunction("glBindTexture"));
+    }
+    if (!real_glIsEnabled)
+        real_glIsEnabled = reinterpret_cast<PFN_IsEnabled>(GetRealGLFunction("glIsEnabled"));
+    if (!real_glDrawElements)
+        real_glDrawElements = reinterpret_cast<PFN_DrawElements>(GetRealGLFunction("glDrawElements"));
+    if (!real_glDrawArrays)
+        real_glDrawArrays = reinterpret_cast<PFN_DrawArrays>(GetRealGLFunction("glDrawArrays"));
+    if (!upload || !real_glUseProgram || !real_glBindVertexArray || !real_glActiveTexture || !enable || !disable ||
+        !bindTexture || !real_glIsEnabled || !postfx::BeginShadowDraw()) {
+        g_deferredCasters.clear();
+        return;
+    }
+    // Both faces: the nearest surface to the sun is the same either way, and two-sided leaves cast.
+    const bool cull = real_glIsEnabled(GL_CULL_FACE) != GL_FALSE;
+    disable(GL_CULL_FACE);
+    GLuint program = 0, vao = 0;
+    GLuint bound[kTrackedUnits];
+    for (int u = 0; u < kTrackedUnits; ++u)
+        bound[u] = g_boundTextures[u];
+    std::vector<GLuint> touched;
+    for (const DeferredCaster& c : g_deferredCasters) {
+        const auto element = g_elementBuffers.find(c.vao);
+        if (c.draw.kind != DrawCall::Arrays && (element == g_elementBuffers.end() || element->second != c.elementBuffer))
+            continue;  // its vertex array was given other indices since: skip it
+        if (c.program != program) {
+            real_glUseProgram(c.program);
+            program = c.program;
+            if (std::find(touched.begin(), touched.end(), program) == touched.end())
+                touched.push_back(program);
+        }
+        if (c.vao != vao) {
+            real_glBindVertexArray(c.vao);
+            vao = c.vao;
+        }
+        for (int u = 0; u < kTrackedUnits; ++u) {
+            if (bound[u] != c.textures[u]) {
+                real_glActiveTexture(kTexture0Unit + u);
+                bindTexture(GL_TEXTURE_2D, c.textures[u]);
+                bound[u] = c.textures[u];
+            }
+        }
+        upload(c.modelviewLoc, 1, GL_FALSE, c.lightModelview);
+        upload(c.projectionLoc, 1, GL_FALSE, c.lightProjection);
+        if (c.boneCountLoc >= 0 && real_glUniform1i)
+            real_glUniform1i(c.boneCountLoc, 0);
+        Replay(c.draw);
+    }
+    // Back as the game left it: each program's own matrices, its program, arrays and textures.
+    for (GLuint p : touched) {
+        real_glUseProgram(p);
+        const auto mv = g_programModelview.find(p);
+        if (mv != g_programModelview.end() && mv->second.location >= 0)
+            upload(mv->second.location, 1, GL_FALSE, mv->second.uploaded);
+        const auto projection = g_programProjection.find(p);
+        if (projection != g_programProjection.end() && projection->second.location >= 0)
+            upload(projection->second.location, 1, GL_FALSE, projection->second.value);
+        const SkinnedProgram* skin = FindSkinned(p);
+        if (skin && skin->positionLoc >= 0 && skin->countLoc >= 0 && real_glUniform1i)
+            real_glUniform1i(skin->countLoc, skin->bones);  // the game's bone count again
+    }
+    real_glUseProgram(g_program);
+    real_glBindVertexArray(g_vao);
+    for (int u = 0; u < kTrackedUnits; ++u) {
+        if (bound[u] != g_boundTextures[u]) {
+            real_glActiveTexture(kTexture0Unit + u);
+            bindTexture(GL_TEXTURE_2D, g_boundTextures[u]);
+        }
+    }
+    real_glActiveTexture(kTexture0Unit + static_cast<GLenum>(g_activeUnit));
+    if (cull)
+        enable(GL_CULL_FACE);
+    postfx::EndShadowDraw();
+    if (!g_loggedShadowBatch) {
+        g_loggedShadowBatch = true;
+        Log("postfx: shadow map: %d objects drawn together, %d one at a time (riders, bikes, streamed geometry)",
+            static_cast<int>(g_deferredCasters.size()), g_castAtOnce);
+    }
+    g_deferredCasters.clear();
+}
 
 bool NoteDraw(const DrawCall& draw)
 {
@@ -1558,6 +1819,8 @@ bool NoteDraw(const DrawCall& draw)
 
 bool EndShaderFrame()
 {
+    g_deferredCasters.clear();  // a frame whose shadows weren't applied
+    g_castAtOnce = 0;
     // A terrain pass still open at the end of the frame isn't filled in, only forgotten.
     g_ground.open = static_cast<int>(g_terrain.patches.size());
     g_terrain.patches.clear();

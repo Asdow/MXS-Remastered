@@ -180,6 +180,7 @@ uniform vec3  u_markUW, u_markVW; // and world space
 uniform float u_markTexel;      // m
 uniform float u_markSize;       // texels
 uniform float u_tireDirt;       // 0..1
+uniform float u_metre;          // game units per metre (MX Simulator: feet)
 uniform float u_wheelOn[2];     // 0 rear, 1 front
 uniform mat4  u_wheelLocal[2];  // view space -> the wheel's own (axle along x, turning with it)
 uniform float u_wheelRadius[2]; // m, to the outside of the tire
@@ -337,13 +338,13 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     float gy = MarkAt(t + vec2(0.0, 1.0)) - MarkAt(t - vec2(0.0, 1.0));
     float k = u_marks;
     // 7 cm deep in the middle: the normal tips with the groove's sides.
-    vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * k / (2.0 * u_markTexel));
+    vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * u_metre * k / (2.0 * u_markTexel));
     vec3 nd = normalize(n + slope);
     float before = max(dot(n, u_lightWorld), 0.0) * 0.75 + 0.35;
     float after = max(dot(nd, u_lightWorld), 0.0) * 0.75 + 0.35;
     float shade = clamp(after / before, 0.45, 1.6);
     // The knobs: blocks about 4 cm, pressed deeper, in rows.
-    vec3 cell = floor(wp * 25.0);
+    vec3 cell = floor(wp * (25.0 / u_metre));
     float knob = step(0.45, Hash13(cell)) * smoothstep(0.25, 0.6, m);
     // Packed, damp dirt in the groove: darker and a little warmer.
     float depth = m * k;
@@ -351,7 +352,7 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     vec3 col = c * floorTint * (1.0 - 0.28 * knob * k) * shade;
     // Loose clods thrown up along the edges: lighter, broken up.
     float edge = clamp(around - m, 0.0, 1.0) * k;
-    float clods = smoothstep(0.35, 0.75, ValueNoise(wp * 30.0) * 0.6 + Hash13(floor(wp * 40.0)) * 0.4);
+    float clods = smoothstep(0.35, 0.75, ValueNoise(wp * (30.0 / u_metre)) * 0.6 + Hash13(floor(wp * (40.0 / u_metre))) * 0.4);
     col *= 1.0 + edge * (0.12 + 0.35 * clods);
     return col;
 }
@@ -360,20 +361,21 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
 // little dust on the rim and hub. Lit by the sun from the surface's own normal.
 vec3 TireDirt(vec3 c, vec3 p, vec3 nView)
 {
+    float m = u_metre;
     for (int i = 0; i < 2; ++i) {
         if (u_wheelOn[i] < 0.5)
             continue;
         vec3 q = (u_wheelLocal[i] * vec4(p, 1.0)).xyz;
         float r = length(q.yz), a = abs(q.x), R = u_wheelRadius[i];
-        if (r > R + 0.06 || a > 0.14)
+        if (r > R + 0.06 * m || a > 0.09 * m)
             continue;
-        float rim = R - 0.11;
-        float tire = smoothstep(rim - 0.02, rim + 0.01, r) * (1.0 - smoothstep(R + 0.01, R + 0.05, r)) *
-                     (1.0 - smoothstep(0.07, 0.11, a));
-        float hub = (1.0 - smoothstep(rim - 0.02, rim + 0.01, r)) * (1.0 - smoothstep(0.06, 0.1, a));
-        vec3 cp = vec3(atan(q.z, q.y) * R, q.x, r) * 26.0;
+        float rim = R - 0.11 * m;
+        float tire = smoothstep(rim - 0.02 * m, rim + 0.01 * m, r) * (1.0 - smoothstep(R + 0.01 * m, R + 0.05 * m, r)) *
+                     (1.0 - smoothstep(0.055 * m, 0.075 * m, a));
+        float hub = (1.0 - smoothstep(rim - 0.02 * m, rim + 0.01 * m, r)) * (1.0 - smoothstep(0.05 * m, 0.07 * m, a));
+        vec3 cp = vec3(atan(q.z, q.y) * R, q.x, r) * (26.0 / m);
         float n = ValueNoise(cp) * 0.6 + ValueNoise(cp * 2.4 + 7.0) * 0.4;
-        float tread = smoothstep(R - 0.06, R, r);
+        float tread = smoothstep(R - 0.06 * m, R, r);
         float edge0 = 0.7 - 0.7 * u_tireDirt - 0.2 * tread;
         float cover = tire * smoothstep(edge0, edge0 + 0.1, n);
         cover = max(cover, hub * 0.45 * u_tireDirt * smoothstep(0.45, 0.7, n));
@@ -583,6 +585,26 @@ constexpr const char* kStamp = R"GLSL(
 uniform vec2  u_a, u_b;
 uniform float u_half;
 uniform float u_strength;
+uniform vec3  u_eyeA, u_eyeB;   // the two contacts (view space): pressed only where the tire is down
+uniform sampler2D u_ground;     // the terrain's depth, before anything stood on it
+uniform float u_check;          // 1: check against it on screen
+uniform float u_fallback;       // off screen: 1 on the ground, 0 in the air
+uniform float u_groundTol;      // how far above the ground still counts as down
+uniform vec3  u_upView;
+
+float OnGround(float t)
+{
+    vec3 c = mix(u_eyeA, u_eyeB, t);
+    if (u_check > 0.5 && c.z < -0.05) {
+        vec2 uv = Project(c);
+        if (OnScreen(uv)) {
+            float d = textureLod(u_ground, uv, 0.0).r;
+            if (!IsSky(d))
+                return dot(c - ViewPos(uv, d), u_upView) < u_groundTol ? 1.0 : 0.0;
+        }
+    }
+    return u_fallback;
+}
 
 void main()
 {
@@ -592,7 +614,8 @@ void main()
     float d = length(p - (u_a + ab * t));
     float cover = 1.0 - smoothstep(u_half - 0.75, u_half + 0.75, d);
     float x = clamp(d / max(u_half, 1e-3), 0.0, 1.0);
-    o_color = vec4(cover * (0.55 + 0.45 * (1.0 - x * x)) * u_strength);
+    float down = u_strength > 0.0 ? OnGround(t) : 0.0;
+    o_color = vec4(cover * (0.55 + 0.45 * (1.0 - x * x)) * u_strength * down);
 }
 )GLSL";
 

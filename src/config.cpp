@@ -100,6 +100,7 @@ bool SaveConfig()
         { L"Leveling",  L"HorizonLock",          g_config.horizonLock },
         { L"Leveling",  L"PitchLock",            g_config.pitchLock },
         { L"Leveling",  L"MaxRollCorrectionDeg", g_config.maxRollCorrectionDeg },
+        { L"Leveling",  L"Steadiness",           g_config.steadiness },
         { L"Air",       L"AirLooseness",         g_config.airLooseness },
         { L"Air",       L"WhipLock",             g_config.whipLock },
         { L"Look",      L"ControllerLook",       g_config.controllerLook ? 1.0 : 0.0 },
@@ -171,9 +172,17 @@ bool SaveConfig()
     };
 
     bool ok = WritePrivateProfileStringW(L"General", L"Enabled", g_config.enabled ? L"1" : L"0", g_path) != FALSE;
-    wchar_t menuKey[16];
-    swprintf_s(menuKey, L"0x%02X", g_config.menuKey);
-    ok = WritePrivateProfileStringW(L"General", L"MenuKey", menuKey, g_path) != FALSE && ok;
+    // The keybinds (the KEYBINDS tab).
+    const struct { const wchar_t* section; const wchar_t* key; int vk; } keys[] = {
+        { L"General",  L"MenuKey",   g_config.menuKey },
+        { L"General",  L"ToggleKey", g_config.toggleKey },
+        { L"Graphics", L"ToggleKey", g_config.shaderToggleKey },
+    };
+    for (const auto& k : keys) {
+        wchar_t text[16];
+        swprintf_s(text, L"0x%02X", k.vk);
+        ok = WritePrivateProfileStringW(k.section, k.key, text, g_path) != FALSE && ok;
+    }
     for (const Value& v : values) {
         wchar_t text[32];
         swprintf_s(text, L"%.6g", v.value);
@@ -200,6 +209,7 @@ void ResetTunables()
     g_config.horizonLock          = defaults.horizonLock;
     g_config.pitchLock            = defaults.pitchLock;
     g_config.maxRollCorrectionDeg = defaults.maxRollCorrectionDeg;
+    g_config.steadiness           = defaults.steadiness;
     g_config.airLooseness         = defaults.airLooseness;
     g_config.whipLock             = defaults.whipLock;
     g_config.controllerLook       = defaults.controllerLook;
@@ -355,6 +365,7 @@ void ReloadConfig()
     c.horizonLock          = ReadDouble(L"Leveling", L"HorizonLock", c.horizonLock);
     c.pitchLock            = ReadDouble(L"Leveling", L"PitchLock", c.pitchLock);
     c.maxRollCorrectionDeg = ReadDouble(L"Leveling", L"MaxRollCorrectionDeg", c.maxRollCorrectionDeg);
+    c.steadiness           = ReadDouble(L"Leveling", L"Steadiness", c.steadiness);
 
     c.airLooseness     = ReadDouble(L"Air", L"AirLooseness", c.airLooseness);
     c.whipLock         = ReadDouble(L"Air", L"WhipLock", c.whipLock);
@@ -412,6 +423,7 @@ void ReloadConfig()
     c.shadowMap        = ReadInt(L"Graphics", L"ShadowMap", c.shadowMap) != 0;
     c.shadowDistance   = ReadDouble(L"Graphics", L"ShadowDistance", c.shadowDistance);
     c.shadowMapSize    = ReadInt(L"Graphics", L"ShadowMapSize", c.shadowMapSize);
+    c.shadowBatch      = ReadInt(L"Graphics", L"ShadowBatch", c.shadowBatch) != 0;
     c.headlight        = ReadDouble(L"Graphics", L"Headlight", c.headlight);
     c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
     c.headlightForward = ReadDouble(L"Graphics", L"HeadlightForward", c.headlightForward);
@@ -453,6 +465,7 @@ void ReloadConfig()
     c.horizonLock          = Clamp(c.horizonLock, 0.0, 1.0);
     c.pitchLock            = Clamp(c.pitchLock, 0.0, 1.0);
     c.maxRollCorrectionDeg = Clamp(c.maxRollCorrectionDeg, 0.0, 180.0);
+    c.steadiness           = Clamp(c.steadiness, 0.0, 1.0);
     c.airLooseness         = Clamp(c.airLooseness, 0.0, 1.0);
     c.whipLock             = Clamp(c.whipLock, 0.0, 1.0);
     c.lookSideDeg          = Clamp(c.lookSideDeg, 10.0, 90.0);

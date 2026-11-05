@@ -26,7 +26,7 @@ Open source and purely OpenGL based.
 
 ## Shaders (free)
 
-MXCam also includes a free shader pack, built the same way as the camera: pure OpenGL, nothing in the game's files or memory is changed. Open the panel (**E**) and look at the **LIGHT** and **IMAGE** tabs. **F7** turns all of it on and off, for before / after comparisons.
+MXCam also includes a free shader pack, built the same way as the camera: pure OpenGL, nothing in the game's files or memory is changed. Open the panel (**E**) and look at the **GRAPHICS** tab. **F7** turns all of it on and off, for before / after comparisons.
 
 - **Time of day**: a slider from midnight to midnight. The sun moves across the sky and lights the bikes from where it is, sunsets turn the light and the sky orange, and at night the sky fills with stars and a moon lights the track (**Night brightness** sets how dark). The game's own lens flare is hidden while a time of day is set, since it would stay at the game's sun. **Game** keeps the game's own lighting.
 - **Headlight**: a light on your bike's front plate for night riding. It turns with the bike and lights the track from the front wheel out, in first or third person.
@@ -38,7 +38,9 @@ MXCam also includes a free shader pack, built the same way as the camera: pure O
 - **Anti-aliasing** (FXAA), **sharpening**, **anisotropic and trilinear texture filtering**.
 - **Brightness**, **contrast**, **saturation**, **vignette**.
 
-Only want the shaders? Turn off **Camera mod** (VIEW tab, the switch at the top of the panel, or F8): the game's own cameras come back and the shaders keep working.
+Only want the shaders? Turn off **First person mod** (FIRST PERSON tab, or F8): the game's own cameras come back and the shaders keep working.
+
+The menu (**E**), the first person mod (**F8**) and the shaders (**F7**) keys can all be changed on the **KEYBINDS** tab: click a key, press the new one, then **SAVE**.
 
 The HUD and menus are drawn after the effects, so they stay sharp and readable at night. If something looks wrong, set the effect to Off in the panel and send `mxcam.log` along with the bug report.
 

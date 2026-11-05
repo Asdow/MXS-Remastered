@@ -67,6 +67,10 @@ void EndShadowDraw();
 // set, so the game's sun is in the wrong place, and at night there's no sun to flare at all.
 bool HidesGameFlare();
 
+// "TIRES: ..." for the settings panel: whether your bike's wheels were found (empty: tire marks and
+// tire dirt are off).
+const char* TireStatusText();
+
 // Cheap: whether draw calls should be checked for the start of the HUD.
 bool WantsSceneEnd();
 
