@@ -63,6 +63,17 @@ bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float ligh
 bool BeginShadowDraw();
 void EndShadowDraw();
 
+// Your bike's wheels in the shadow map. The game doesn't draw a wheel that's out of view (in first
+// person the rear one is under you), so it would cast no shadow. For wheel i (0 rear, 1 front),
+// asked right before the held-back casters are drawn:
+//   Drawn:   the game drew it this frame; viewModel is its u_modelview as the game sent it (to
+//            recognise its draw call and keep it) and program the program that drew it;
+//   Missing: not drawn, but known on your bike; viewModel is the modelview to cast the kept draw
+//            call with (in the eye space the frame is drawn from, like an uploaded u_modelview);
+//   None:    neither.
+enum class WheelCast { None, Drawn, Missing };
+WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16]);
+
 // Cheap: whether the game's lens flare (and its sun sprite) should be hidden: a time of day is
 // set, so the game's sun is in the wrong place, and at night there's no sun to flare at all.
 bool HidesGameFlare();

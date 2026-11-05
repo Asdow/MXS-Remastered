@@ -829,7 +829,8 @@ const RowDef kRows[] = {
         .Help("Moves your eyes up (+) or down (-)."),
     Toggle(0, nullptr,           "Hide torso & head",    &Config::hideOwnBody)
         .Help("Hides your own rider's torso and head (helmet included), so a high FOV doesn't show "
-              "them from the inside. Arms and legs stay. Only yours: other riders keep theirs."),
+              "them from the inside. Arms and legs stay, and your shadow keeps them all. Only yours: "
+              "other riders keep theirs."),
     Slider(0, "CORNERS",         "Look to apex",         &Config::apexLook,         0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("In corners the head turns toward the apex, the way the bike is turning: more the "
               "tighter the corner. Higher looks further into the turn (100% looks about a second "

@@ -124,6 +124,9 @@ PFN_ActiveTexture           real_glActiveTexture           = nullptr;
 PFN_BufferData              real_glBufferData              = nullptr;
 PFN_BufferSubData           real_glBufferSubData           = nullptr;
 PFN_VertexAttribPointer     real_glVertexAttribPointer     = nullptr;
+using PFN_DeleteObjects         = void (APIENTRY*)(GLsizei count, const GLuint* names);
+PFN_DeleteObjects           real_glDeleteBuffers           = nullptr;
+PFN_DeleteObjects           real_glDeleteVertexArrays      = nullptr;
 using PFN_GetIntegerv           = void (APIENTRY*)(GLenum pname, GLint* data);
 PFN_GetIntegerv             real_glGetIntegerv             = nullptr;  // OpenGL 1.1 export, for the lens flare check
 
@@ -134,6 +137,7 @@ struct ProgramModelview {
     ModelviewKind kind  = ModelviewKind::Scene;
     GLint         location = -1;     // its u_modelview, and what was last sent to the driver for it
     GLfloat       uploaded[16] = {};
+    GLfloat       raw[16] = {};      // what the game sent (before any correction of ours)
     bool          transposed = false;
 };
 std::unordered_map<GLuint, ProgramModelview> g_programModelview;  // render thread only
@@ -190,6 +194,8 @@ struct SkinnedProgram {
     GLfloat usedView[16] = {};                      // what was uploaded for it (ours, corrected)
     bool    haveView = false;
     bool    positionEdited = false, rotationEdited = false;  // the program holds our arrays, not the game's
+    GLfloat hiddenPosition[kMaxBones * 3] = {};     // our arrays (the torso and head hidden), while edited
+    GLfloat hiddenRotation[kMaxBones * 9] = {};
 };
 std::unordered_map<GLuint, SkinnedProgram> g_skinned;
 
@@ -215,6 +221,23 @@ struct DeferredCaster {
     float    lightModelview[16] = {}, lightProjection[16] = {};
 };
 std::vector<DeferredCaster> g_deferredCasters;
+// Your bike's wheels in the shadow map (postfx::OwnWheelCast): this frame's rigid draws near the
+// camera (with the game's own u_modelview, to find a wheel's among them), and each wheel's draw call
+// kept from when the game last drew it, cast in its place on your bike when the game doesn't.
+struct NearDraw {
+    DeferredCaster caster;
+    GLfloat        raw[16];
+};
+std::vector<NearDraw> g_nearDraws;
+constexpr size_t kMaxNearDraws = 256;
+constexpr float  kNearDrawRange = 40.0f;  // game units from the camera (~12 m in feet)
+struct KeptWheel {
+    bool                valid = false;
+    DeferredCaster      caster;
+    std::vector<GLuint> buffers;            // its vertex array's buffers (dropped if one is deleted)
+    bool                loggedKept = false, loggedCast = false;
+};
+KeptWheel g_keptWheels[2];  // 0 rear, 1 front
 int  g_castAtOnce = 0;          // this frame's shadow casters drawn straight away (skinned, streamed)
 bool g_loggedShadowBatch = false;  // by program; nodes stay put, so pointers last
 bool g_hidingLogged = false;
@@ -634,6 +657,7 @@ void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean tr
     kind.location = location;
     kind.transposed = transpose != GL_FALSE;
     std::copy(uploaded, uploaded + 16, kind.uploaded);
+    std::copy(m, m + 16, kind.raw);
     if (!identity && g_shaderViewSet && HasTranslation(m))
         postfx::NoteObject(program, m);  // one of them is your bike, others its wheels  // one of them is your bike (the headlight rides on it)
     if (!g_shaderViewSet && scene && (knownCamera ? isCamera : HasTranslation(m))) {
@@ -874,6 +898,8 @@ void PrepareSkinnedDraw()
         }
         UploadSkinnedVectors(skin->positionLoc, skin->positions, position, skin->positionArb);
         UploadSkinnedRotations(skin->rotationLoc, skin->rotations, skin->transposed, rotation, skin->rotationArb);
+        std::copy(position, position + skin->positions * 3, skin->hiddenPosition);
+        std::copy(rotation, rotation + skin->rotations * 9, skin->hiddenRotation);
         skin->positionEdited = skin->rotationEdited = true;
         if (!g_hidingLogged) {
             g_hidingLogged = true;
@@ -1418,6 +1444,36 @@ void APIENTRY Wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, 
     real_glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
+// A kept wheel's draw call (KeepOrCastWheels) can't outlive its vertex array or buffers.
+void DropKeptWheels(GLsizei count, const GLuint* names, bool vertexArrays)
+{
+    if (count <= 0 || !names)
+        return;
+    for (KeptWheel& kept : g_keptWheels) {
+        if (!kept.valid)
+            continue;
+        for (GLsizei n = 0; n < count && kept.valid; ++n) {
+            if (names[n] == 0)
+                continue;
+            if (vertexArrays ? names[n] == kept.caster.vao
+                             : std::find(kept.buffers.begin(), kept.buffers.end(), names[n]) != kept.buffers.end())
+                kept.valid = false;
+        }
+    }
+}
+
+void APIENTRY Wrap_glDeleteBuffers(GLsizei count, const GLuint* names)
+{
+    DropKeptWheels(count, names, false);
+    real_glDeleteBuffers(count, names);
+}
+
+void APIENTRY Wrap_glDeleteVertexArrays(GLsizei count, const GLuint* names)
+{
+    DropKeptWheels(count, names, true);
+    real_glDeleteVertexArrays(count, names);
+}
+
 struct ProcWrapper {
     const char* name;
     void*       wrapper;
@@ -1442,6 +1498,7 @@ const ProcWrapper kWrappers[] = {
     MXCAM_WRAP(glDeleteSamplers),          MXCAM_WRAP(glShaderSource),
     MXCAM_WRAP(glActiveTexture),           MXCAM_WRAP(glBufferData),
     MXCAM_WRAP(glBufferSubData),           MXCAM_WRAP(glVertexAttribPointer),
+    MXCAM_WRAP(glDeleteBuffers),           MXCAM_WRAP(glDeleteVertexArrays),
 };
 
 }  // namespace
@@ -1569,10 +1626,11 @@ bool Streamed(GLuint buffer)
     return found != g_bufferUpdates.end() && found->second.frames >= 2;
 }
 
-// Whether this draw can be repeated at the end of the frame exactly as it is now.
-bool CanHoldBack(const DrawCall& draw)
+// Whether this draw can be repeated later in the frame (or a later frame) exactly as it is now:
+// rigid, its geometry in buffers nothing rewrites while running.
+bool StaticDraw(const DrawCall& draw)
 {
-    if (!GetConfig().shadowBatch || g_vao == 0 || g_activeUnit < 0 || g_activeUnit >= 16)
+    if (g_vao == 0 || g_activeUnit < 0 || g_activeUnit >= 16)
         return false;
     // A skinned mesh's bones change from draw to draw; the same programs' rigid draws (no bones)
     // are fine: they're repeated with no bones again.
@@ -1593,6 +1651,29 @@ bool CanHoldBack(const DrawCall& draw)
     return true;
 }
 
+bool CanHoldBack(const DrawCall& draw)
+{
+    return GetConfig().shadowBatch && StaticDraw(draw);
+}
+
+// The draw as it stands, to repeat later (light matrices filled in by the caller).
+DeferredCaster MakeCaster(const DrawCall& draw, GLint modelviewLoc, GLint projectionLoc)
+{
+    DeferredCaster c;
+    c.program = g_program;
+    c.vao = g_vao;
+    const auto element = g_elementBuffers.find(g_vao);
+    c.elementBuffer = element != g_elementBuffers.end() ? element->second : 0;
+    c.draw = draw;
+    for (int u = 0; u < kTrackedUnits; ++u)
+        c.textures[u] = g_boundTextures[u];
+    c.modelviewLoc = modelviewLoc;
+    c.projectionLoc = projectionLoc;
+    if (const SkinnedProgram* skin = FindSkinned(g_program))
+        c.boneCountLoc = skin->positionLoc >= 0 ? skin->countLoc : -1;
+    return c;
+}
+
 void CastShadow(const DrawCall& draw)
 {
     // See-through draws (kicked-up dirt, dust, smoke) don't write depth: they would cast solid
@@ -1609,6 +1690,16 @@ void CastShadow(const DrawCall& draw)
     const PFN_UniformMatrix4fv upload = real_glUniformMatrix4fv ? real_glUniformMatrix4fv : real_glUniformMatrix4fvARB;
     if (!upload)
         return;
+
+    // Rigid parts near the camera (your bike's wheels among them, see KeepOrCastWheels).
+    const GLfloat* raw = mv->second.raw;
+    if (g_nearDraws.size() < kMaxNearDraws && raw[12] * raw[12] + raw[13] * raw[13] + raw[14] * raw[14] <
+        kNearDrawRange * kNearDrawRange && StaticDraw(draw)) {
+        NearDraw candidate;
+        candidate.caster = MakeCaster(draw, mv->second.location, projection->second.location);
+        std::copy(raw, raw + 16, candidate.raw);
+        g_nearDraws.push_back(candidate);
+    }
 
     // Riders are skinned: their bones are placed in the world, and the modelview is the bare view.
     float anchor[3];
@@ -1629,18 +1720,7 @@ void CastShadow(const DrawCall& draw)
     // Static scenery (not skinned, its geometry in buffers nothing rewrites while running): held
     // back and drawn with the others in one go before the shadows are applied (FlushShadowCasters).
     if (CanHoldBack(draw)) {
-        DeferredCaster c;
-        c.program = g_program;
-        c.vao = g_vao;
-        const auto element = g_elementBuffers.find(g_vao);
-        c.elementBuffer = element != g_elementBuffers.end() ? element->second : 0;
-        c.draw = draw;
-        for (int u = 0; u < kTrackedUnits; ++u)
-            c.textures[u] = g_boundTextures[u];
-        c.modelviewLoc = mv->second.location;
-        c.projectionLoc = projection->second.location;
-        if (const SkinnedProgram* skin = FindSkinned(g_program))
-            c.boneCountLoc = skin->positionLoc >= 0 ? skin->countLoc : -1;
+        DeferredCaster c = MakeCaster(draw, mv->second.location, projection->second.location);
         std::copy(lightModelview, lightModelview + 16, c.lightModelview);
         std::copy(lightProjection, lightProjection + 16, c.lightProjection);
         if (g_deferredCasters.size() < 8192) {
@@ -1655,12 +1735,70 @@ void CastShadow(const DrawCall& draw)
     if (!postfx::BeginShadowDraw())
         return;
     ++g_castAtOnce;
+    // Your torso and head hidden on screen (Config::hideOwnBody) still cast their shadow: the
+    // game's own bones for the shadow, ours again after.
+    SkinnedProgram* hiddenBody = FindSkinned(g_program);
+    if (hiddenBody && !(hiddenBody->positionEdited || hiddenBody->rotationEdited))
+        hiddenBody = nullptr;
+    if (hiddenBody) {
+        UploadSkinnedVectors(hiddenBody->positionLoc, hiddenBody->positions, hiddenBody->position, hiddenBody->positionArb);
+        UploadSkinnedRotations(hiddenBody->rotationLoc, hiddenBody->rotations, hiddenBody->transposed,
+                               hiddenBody->rotation, hiddenBody->rotationArb);
+    }
     upload(mv->second.location, 1, GL_FALSE, lightModelview);
     upload(projection->second.location, 1, GL_FALSE, lightProjection);
     Replay(draw);
     upload(mv->second.location, 1, GL_FALSE, mv->second.uploaded);
     upload(projection->second.location, 1, GL_FALSE, projection->second.value);
+    if (hiddenBody) {
+        UploadSkinnedVectors(hiddenBody->positionLoc, hiddenBody->positions, hiddenBody->hiddenPosition,
+                             hiddenBody->positionArb);
+        UploadSkinnedRotations(hiddenBody->rotationLoc, hiddenBody->rotations, hiddenBody->transposed,
+                               hiddenBody->hiddenRotation, hiddenBody->rotationArb);
+    }
     postfx::EndShadowDraw();
+}
+
+// Your wheels: a wheel the game drew this frame has its draw call kept (found among the rigid draws
+// near the camera by its u_modelview); one it didn't draw is cast from the kept call, in its place
+// on your bike, with the held-back casters.
+void KeepOrCastWheels()
+{
+    static const char* const kWheelName[2] = { "rear", "front" };
+    for (int i = 0; i < 2; ++i) {
+        unsigned program = 0;
+        float viewModel[16];
+        const postfx::WheelCast cast = postfx::OwnWheelCast(i, &program, viewModel);
+        KeptWheel& kept = g_keptWheels[i];
+        if (cast == postfx::WheelCast::Drawn) {
+            for (const NearDraw& candidate : g_nearDraws) {
+                if (candidate.caster.program != program || !std::equal(candidate.raw, candidate.raw + 16, viewModel))
+                    continue;
+                kept.caster = candidate.caster;
+                const auto buffers = g_vaoArrayBuffers.find(candidate.caster.vao);
+                kept.buffers = buffers != g_vaoArrayBuffers.end() ? buffers->second : std::vector<GLuint>{};
+                if (candidate.caster.elementBuffer)
+                    kept.buffers.push_back(candidate.caster.elementBuffer);
+                kept.valid = true;
+                if (!kept.loggedKept) {
+                    kept.loggedKept = true;
+                    Log("postfx: shadow map: kept your %s wheel's draw call (program %u), for when the game doesn't draw it",
+                        kWheelName[i], program);
+                }
+                break;
+            }
+        } else if (cast == postfx::WheelCast::Missing && kept.valid && g_deferredCasters.size() < 8192) {
+            DeferredCaster c = kept.caster;
+            if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, c.lightProjection))
+                continue;
+            g_deferredCasters.push_back(c);
+            if (!kept.loggedCast) {
+                kept.loggedCast = true;
+                Log("postfx: shadow map: your %s wheel isn't drawn by the game here; its shadow is cast from your bike",
+                    kWheelName[i]);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -1685,10 +1823,13 @@ void NoteBindTexture(unsigned int target, unsigned int texture)
 void DiscardShadowCasters()
 {
     g_deferredCasters.clear();
+    g_nearDraws.clear();
 }
 
 void FlushShadowCasters()
 {
+    KeepOrCastWheels();  // (the frame already counts as applied here: ShadowMatrices says if the map is on)
+    g_nearDraws.clear();
     if (g_deferredCasters.empty())
         return;
     const PFN_UniformMatrix4fv upload = real_glUniformMatrix4fv ? real_glUniformMatrix4fv : real_glUniformMatrix4fvARB;
@@ -1820,6 +1961,7 @@ bool NoteDraw(const DrawCall& draw)
 bool EndShaderFrame()
 {
     g_deferredCasters.clear();  // a frame whose shadows weren't applied
+    g_nearDraws.clear();
     g_castAtOnce = 0;
     // A terrain pass still open at the end of the frame isn't filled in, only forgotten.
     g_ground.open = static_cast<int>(g_terrain.patches.size());

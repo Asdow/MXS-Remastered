@@ -1207,6 +1207,10 @@ struct PartTrack {
     Vec3     axes[3];             // its own axes (world) this frame: they turn with it
     Vec3     origin;              // its origin (world) this frame
     double   world[16] = {};      // its whole transform (world) this frame
+    // A rigid draw (one bone at its origin): its u_modelview as the game sent it is all of its
+    // transform, so the shadow map can recognise its draw call by it (see OwnWheelCast).
+    bool     drawnAsIs = false;
+    float    viewModel[16] = {};
 };
 PartTrack g_partTracks[192];
 
@@ -1241,6 +1245,13 @@ struct Wheel {
     bool   fromBike = false;  // placed from your bike this frame (its part wasn't seen)
     double roll = 0;          // placed from your bike: how far it has rolled (rad), so its dirt keeps turning
     double savedWeight = -1;  // onBikeWeight when it was last written to the ini
+    // For the shadow map (OwnWheelCast): its part as the game draws it, this frame, and where that
+    // part sat on your bike when it was last seen (for when the game doesn't draw it).
+    bool     drawnNow = false;
+    unsigned partProgram = 0;
+    float    drawnViewModel[16] = {};
+    double   partOnBike[16] = {};
+    bool     havePart = false;
 };
 Wheel  g_wheels[2];            // 0 rear, 1 front
 // A wheel read from the ini counts as this many seconds learnt: enough to place it from your bike,
@@ -1707,7 +1718,7 @@ void UpdateWheels(double now, double dt)
 {
     const Vec3 worldUp = WorldUp();
     for (Wheel& w : g_wheels)
-        w.on = false;
+        w.on = w.drawnNow = false;
     for (PartTrack& t : g_partTracks) {
         t.seenNow = false;
         if (t.used && now - t.lastSeen > 3.0)
@@ -1904,6 +1915,13 @@ void UpdateWheels(double now, double dt)
                     t.axes[k] = Normalize(Vec3{ part[k * 4], part[k * 4 + 1], part[k * 4 + 2] });
                 t.origin = origin;
                 std::copy(part, part + 16, t.world);
+                const float* r = rec.rotation + b * 9;
+                const float* bonePos = rec.position + b * 3;
+                t.drawnAsIs = rec.bones == 1 && bonePos[0] == 0.0f && bonePos[1] == 0.0f && bonePos[2] == 0.0f && r[0] == 1.0f &&
+                              r[4] == 1.0f && r[8] == 1.0f && r[1] == 0.0f && r[2] == 0.0f && r[3] == 0.0f &&
+                              r[5] == 0.0f && r[6] == 0.0f && r[7] == 0.0f;
+                if (t.drawnAsIs)
+                    std::copy(rec.viewModel, rec.viewModel + 16, t.viewModel);
                 t.lastSeen = now;
                 t.seenNow = true;
                 if (g_report.capturing && g_report.lines.size() < 600) {
@@ -2037,6 +2055,16 @@ void UpdateWheels(double now, double dt)
             w.up = wheelUp;
             LearnWheelOnBike(w, axis, dt);
             w.fromBike = false;
+            // Its draw call, for the shadow map: kept while the game draws it, cast from your bike
+            // when it doesn't.
+            double inv[16];
+            if (t.drawnAsIs && g_bikeNow.found && AffineInverse(g_bikeNow.model, inv)) {
+                w.drawnNow = true;
+                w.partProgram = t.program;
+                std::copy(t.viewModel, t.viewModel + 16, w.drawnViewModel);
+                MatMul(inv, t.world, w.partOnBike);
+                w.havePart = true;
+            }
         } else if (g_bikeNow.found && w.onBikeWeight >= kWheelOnBikeMin) {
             PlaceWheelFromBike(w, i, dt);
             w.fromBike = true;
@@ -2372,19 +2400,30 @@ bool HeadlightPose(Vec3& position, Vec3& forward, Vec3& up)
 // ===========================================================================
 // The passes
 // ===========================================================================
-void Render(int w, int h)
+// What's in this frame's scene: your rider, your bike, its wheels, whether you're in the air. Before
+// the held-back shadow casters are drawn: your wheels the game didn't draw are cast with them.
+double g_applyNow = 0;
+
+void UnderstandScene()
 {
-    const Config& cfg = GetConfig();
     const double now = Seconds();
     const double dt = g_lastApplyTime > 0 ? Clamp(now - g_lastApplyTime, 1.0 / 1000.0, 0.25) : 1.0 / 60.0;
     g_lastApplyTime = now;
     g_lastDt = dt;
-
-    g_gl.BindVertexArray(g_res.vao);  // the fullscreen triangle (the game's arrays are restored after)
+    g_applyNow = now;
     FindOwnRider(dt);
     UpdateBike(dt);
     UpdateWheels(now, dt);
     UpdateAir(dt);
+}
+
+void Render(int w, int h)
+{
+    const Config& cfg = GetConfig();
+    const double now = g_applyNow;
+    const double dt = g_lastDt;
+
+    g_gl.BindVertexArray(g_res.vao);  // the fullscreen triangle (the game's arrays are restored after)
     if (!CaptureColor())
         return;
 
@@ -2745,10 +2784,13 @@ void Apply()
 {
     if (!LoadGL())
         return;
-    FlushShadowCasters();  // the held-back shadow casters, all at once, before the shadows are used
     int w = 0, h = 0;
-    if (!WindowSize(w, h))
+    if (!WindowSize(w, h)) {
+        FlushShadowCasters();
         return;
+    }
+    UnderstandScene();
+    FlushShadowCasters();  // the held-back shadow casters, all at once, before the shadows are used
     SavedState saved;
     Save(saved);
     PrepareState();
@@ -3079,6 +3121,28 @@ void NoteObject(unsigned program, const float viewModel[16])
     g_objects.push_back(o);
 }
 
+
+WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16])
+{
+    if (i < 0 || i > 1 || !g_frame.haveView)
+        return WheelCast::None;
+    const Wheel& w = g_wheels[i];
+    if (w.drawnNow) {
+        *program = w.partProgram;
+        std::copy(w.drawnViewModel, w.drawnViewModel + 16, viewModel);
+        return WheelCast::Drawn;
+    }
+    if (!w.on || !w.havePart || !g_bikeNow.found)
+        return WheelCast::None;
+    // Where the game would draw it: on your bike as it was last seen, in the eye space the frame
+    // is drawn from (like an uploaded u_modelview).
+    double model[16], eyeModel[16];
+    MatMul(g_bikeNow.model, w.partOnBike, model);
+    MatMul(g_frame.rendered, model, eyeModel);
+    *program = w.partProgram;
+    ToFloat(eyeModel, viewModel, 16);
+    return WheelCast::Missing;
+}
 
 const char* TireStatusText()
 {

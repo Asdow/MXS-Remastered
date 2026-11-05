@@ -59,7 +59,7 @@ A dynamic first person view that rides with your bike: it leans, dips and turns 
   - **Horizon lock**: how much of the bike's lean is taken out of the view, from leaning with the bike to a perfectly level horizon.
   - **Pitch lock**: how much of the nose up / down tilt (wheelies, jump faces) is taken out. Riding on flat ground looks the same at any setting.
   - **Steadiness**: keeps the view calm. The quick jolts of bumps, landings and the suspension diving under braking don't reach it, while it still eases into a corner's lean or a wheelie.
-- **Head position**: move your eyes forward / back and up / down. **Hide torso & head** hides your own rider's body (arms and legs stay), so a high FOV doesn't show it from the inside.
+- **Head position**: move your eyes forward / back and up / down. **Hide torso & head** hides your own rider's body (arms and legs stay), so a high FOV doesn't show it from the inside. Your shadow still has them.
 - **Look to apex**: in corners your head turns toward the apex, more the tighter the corner, and eases back to straight ahead on the exit.
 - **D-pad look**: on a controller, look left / right with the d-pad and behind with down. The look angle and turn speed are adjustable (CUSTOM camera: with its own eye position for each).
 - **In the air**:
@@ -91,7 +91,7 @@ The mod also includes a free shader pack, built the same way as the camera: pure
 
 - **Time of day**: a slider from midnight to midnight. The sun moves across the sky and lights the bikes from where it is, sunsets turn the light and the sky orange, and at night the sky fills with stars and a moon lights the track (**Night brightness** sets how dark). The game's own lens flare is hidden while a time of day is set, since it would stay at the game's sun. **Game** keeps the game's own lighting.
 - **Headlight**: a light on your bike's front plate for night riding. It turns with the bike and lights the track from the front wheel out, in first or third person.
-- **Shadows**: real-time sun shadows from bikes, riders, trees and track objects (drawn from the sun, so even things off screen cast them), plus contact shadows from the track's own shape.
+- **Shadows**: real-time sun shadows from bikes, riders, trees and track objects (drawn from the sun, so even things off screen cast them), plus contact shadows from the track's own shape. In first person your own shadow is complete, wheels and all, even though the game doesn't draw your rear wheel there.
 - **Ambient occlusion**: soft contact shadows in ruts, corners and under the bikes.
 - **Dirt detail**: fine, high-resolution grain, pebbles and clods on the track surface up close, only on the ground.
 - **Tire marks** and **tire dirt**: your tires dig ruts into the track behind you, and your tires get caked with mud.

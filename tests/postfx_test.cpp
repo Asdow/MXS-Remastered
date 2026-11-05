@@ -228,6 +228,8 @@ int main(int argc, char** argv)
         printf("unknown mode %s\n", mode.c_str());
         return 2;
     }
+    if (mode == "tireshidden")  // and shadow maps: the wheels the game stops drawing still cast
+        settings = settings.replace(settings.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
     if (!settings.empty()) {
         FILE* out = nullptr;
         if (_wfopen_s(&out, ini.c_str(), L"wb") == 0 && out) {
@@ -528,7 +530,8 @@ int main(int argc, char** argv)
                 const float bikeRotations[27] = { 1, 0, 0, 0, 1, 0, 0, 0, 1,
                                                   1, 0, 0, 0, c, sn, 0, -sn, c,
                                                   1, 0, 0, 0, c, sn, 0, -sn, c };
-                Skinned(bikeView, wheelsDrawn ? 3 : 1, bikeCentres, bikeBones, bikeRotations);
+                // tireshidden: only the frame is skinned; the wheels are rigid draws of their own, like the game's.
+                Skinned(bikeView, wheelsDrawn && !hiddenWheels ? 3 : 1, bikeCentres, bikeBones, bikeRotations);
             }
             gl.UseProgram(object);
             gl.UniformMatrix4fv(oProj, 1, GL_FALSE, projection);
@@ -827,9 +830,20 @@ int main(int argc, char** argv)
             printf("    log: %s\n", log.substr(at, end == std::string::npos ? std::string::npos : end - at).c_str());
             at = end;
         }
+        for (size_t from = 0; (from = log.find("shadow map:", from)) != std::string::npos;) {
+            const size_t end = log.find('\n', from);
+            printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
+            from = end;
+        }
         Check(log.find("tire marks: your wheels found") != std::string::npos, "the wheels are found while they're drawn");
         Check(log.find("tire marks: your wheels lost") == std::string::npos,
               "wheels the game stops drawing stay on your bike (not lost)");
+        for (const char* wheel : { "rear", "front" }) {
+            const std::string kept = std::string("shadow map: kept your ") + wheel + " wheel's draw call";
+            const std::string cast = std::string("shadow map: your ") + wheel + " wheel isn't drawn by the game here";
+            Check(log.find(kept) != std::string::npos, (std::string("the ") + wheel + " wheel's draw call is kept while it's drawn").c_str());
+            Check(log.find(cast) != std::string::npos, (std::string("the ") + wheel + " wheel still casts a shadow once it isn't drawn").c_str());
+        }
     } else if (mode == "thirdperson") {
         // The light starts at the rider's bike, not at the camera behind it.
         // (The bike is turned 30 degrees to the right, so its beam is right of the middle.)
