@@ -38,7 +38,13 @@ Download the new `opengl32.dll` and replace the old one in your MX Simulator fol
 
 ## The menu
 
-Press **E** in game to open the menu. It has four tabs: **FIRST PERSON**, **GRAPHICS**, **REPLAY** and **KEYBINDS**. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back.
+Press **E** in game to open the menu. It has five tabs: **FIRST PERSON**, **GRAPHICS**, **REPLAY**, **KEYBINDS** and **OTHER**. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back.
+
+While you drag a **GRAPHICS** slider (or step it with the arrow keys), the menu fades out except for that slider, so you can see the whole picture change. You can turn this off on the **OTHER** tab.
+
+### Presets
+
+At the bottom left of the menu, **PRESET 1 / 2 / 3** switches between three setting profiles, for example one for racing, one for replays and one for night riding. Each preset has its own copy of every setting on the FIRST PERSON, GRAPHICS, REPLAY and OTHER tabs (keybinds are shared). Changes you make stay with the preset you made them in, and **DEFAULTS** only resets the preset in use. Press **SAVE** to keep all three, and the game starts on whichever preset was in use when you saved. A preset you haven't set up yet starts as a copy of your current settings.
 
 | Key | What it does |
 |---|---|
@@ -82,6 +88,17 @@ New cameras for watching your replays, on the **REPLAY** tab. They work while th
   - **Mounts**: **TOP** of the helmet, its **LEFT** or **RIGHT** side, or the **CHEST** (it turns with the body instead of the head). Each mount keeps its own height, forward position and tilt.
   - **Stabilization**: smooths the camera's rotation like a GoPro, from every jolt of the head to silky smooth.
   - **Horizon lock**: takes the rider's lean out of the view, up to a perfectly level horizon.
+
+---
+
+## Other
+
+Quality of life options, on the **OTHER** tab:
+
+- **Hide HUD**: hides the game's HUD (timing, positions, chat) while you ride or watch a replay, for a clean view or clean videos. Move or click the mouse (or press Esc) and it comes back for a few seconds, so the game's menus still work. The game's menus are never hidden.
+- **Hide cursor**: hides the game's mouse cursor while you ride or watch a replay. It comes back as soon as you move the mouse.
+- **Fullscreen window**: with the game in windowed mode, its window covers the whole screen with no border (borderless fullscreen), so Alt+Tab stays instant. Turn it off and the window goes back to how it was. It's shared by all three presets.
+- **Fade while adjusting**: the menu fade described above (on by default).
 
 ---
 

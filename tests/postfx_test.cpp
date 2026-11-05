@@ -220,6 +220,8 @@ int main(int argc, char** argv)
                                                                                 : "Shadows=1\nShadowMap=1\nShadowBatch=0");
     else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1");
+    else if (mode == "hidehud")  // the HUD hidden while riding, once the mouse has been left alone
+        settings = base + "[Other]\nHideHud=1\n";
     else if (mode == "dof")
         settings = base.replace(base.find("DepthOfField=0"), 14, "DepthOfField=1\nDofFocus=60");
     else if (mode == "motion")  // the helmet cam off: its smoothing would take most of the turning out
@@ -228,8 +230,11 @@ int main(int argc, char** argv)
         printf("unknown mode %s\n", mode.c_str());
         return 2;
     }
-    if (mode == "tireshidden")  // and shadow maps: the wheels the game stops drawing still cast
+    if (mode == "tireshidden") {  // and shadow maps: the wheels the game stops drawing still cast
         settings = settings.replace(settings.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
+        // A rear wheel learnt at a bad moment (a real one: a metre off to the side): thrown away.
+        settings += "[Learned]\nRearWheelOnBike=4.200,-1.950,-6.730\n";
+    }
     if (!settings.empty()) {
         FILE* out = nullptr;
         if (_wfopen_s(&out, ini.c_str(), L"wb") == 0 && out) {
@@ -238,6 +243,8 @@ int main(int argc, char** argv)
         }
     }
 
+    // Whoever is at the desk moving the mouse mustn't count as using the game's menus.
+    SetEnvironmentVariableA("MXCAM_TEST_MOUSE_IDLE", "1");
     HMODULE proxy = LoadLibraryW(dll.c_str());
     if (!proxy) {
         printf("could not load the DLL (error %lu)\n", GetLastError());
@@ -437,7 +444,8 @@ int main(int argc, char** argv)
 
     const bool timing = mode == "shadowperf" || mode == "shadowperf0";
     const bool hiddenWheels = mode == "tireshidden";
-    const int frames = timing ? 160 : hiddenWheels ? 200 : 12;
+    const bool hideHud = mode == "hidehud";
+    const int frames = timing ? 160 : hiddenWheels ? 200 : hideHud ? 260 : 12;  // hidehud: ~4 s, past the mouse's 3
     LARGE_INTEGER frequency, frameStart, frameEnd, runStart;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&runStart);
@@ -654,7 +662,7 @@ int main(int argc, char** argv)
         if (errorAfter != GL_NO_ERROR)
             printf("    GL error 0x%X on frame %d\n", errorAfter, frameIndex);
 
-        if (frameIndex == 11) {
+        if (frameIndex == (hideHud ? frames - 1 : 11)) {
             p_glFinish();
             p_glReadBuffer(GL_BACK);
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -698,7 +706,21 @@ int main(int argc, char** argv)
            sky.b, ground.r, ground.g, ground.b, box.r, box.g, box.b, hudPixel.r, hudPixel.g, hudPixel.b, mean, spread);
 
     const Pixel drawnSky{ 102, 153, 217 }, drawnGround{ 115, 92, 69 }, drawnBox{ 204, 26, 26 };
-    Check(hudPixel.r == 255 && hudPixel.g == 255 && hudPixel.b == 255, "the HUD is drawn after the effects, untouched");
+    if (hideHud) {
+        Check(Near(hudPixel, drawnSky, 12), "the HUD is hidden while riding (the sky shows where it was)");
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        Check(log.find("hud: hiding the game's HUD while riding") != std::string::npos, "the log says the HUD is hidden");
+    } else {
+        Check(hudPixel.r == 255 && hudPixel.g == 255 && hudPixel.b == 255, "the HUD is drawn after the effects, untouched");
+    }
     Check(static_cast<GLuint>(programAfter) == object, "the current program is the game's again");
     Check(activeAfter == 0x84C0 + 2 && static_cast<GLuint>(unit2After) == gameTexture, "texture unit and its texture restored");
     Check(drawFbAfter == 0 && viewportAfter[2] == W && viewportAfter[3] == H, "framebuffer and viewport restored");
@@ -835,6 +857,8 @@ int main(int argc, char** argv)
             printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
             from = end;
         }
+        Check(log.find("can't be right; learning it again") != std::string::npos,
+              "a wheel learnt off the bike's centreline is thrown away, not used");
         Check(log.find("tire marks: your wheels found") != std::string::npos, "the wheels are found while they're drawn");
         Check(log.find("tire marks: your wheels lost") == std::string::npos,
               "wheels the game stops drawing stay on your bike (not lost)");

@@ -136,6 +136,13 @@ struct Config {
     double depthOfField     = 0.0;        // 0..1
     double dofFocus         = 0.0;        // m; 0 = auto-focus on the middle of the screen
     bool   dumpShaders      = false;      // writes the game's shader sources to mxcam_shaders\ (diagnostics)
+
+    // [Other] quality of life
+    bool   hideHud          = false;      // hide the game's HUD while riding (it shows again while you use the mouse)
+    bool   hideCursor       = false;      // hide the game's mouse cursor while riding (same)
+    bool   fadeMenu         = true;       // fade this menu while a graphics setting is being adjusted
+    bool   fullscreenWindow = false;      // windowed mode: the window made borderless, covering its monitor
+                                          // (a display choice: not part of the presets or DEFAULTS)
 };
 
 const Config& GetConfig();
@@ -156,5 +163,17 @@ void WriteLearned(const char* key, const double value[3]);
 void ForgetLearned(const char* key);
 // Puts the camera and graphics tunables back to their defaults; keys and detection settings are untouched.
 void ResetTunables();
+
+// Copies every setting the presets and DEFAULTS cover (the FIRST PERSON, GRAPHICS, REPLAY and OTHER
+// tabs; not the keybinds or the detection settings).
+void CopyTunables(const Config& from, Config& to);
+
+// Presets: three whole sets of those settings to switch between. The live settings are always the
+// active preset's. Switching keeps them with the preset they belong to and loads the other's (not
+// written to the ini until SaveConfig, which writes all three). A preset never saved starts as a
+// copy of the settings in use.
+constexpr int kPresetCount = 3;
+int  ActivePreset();
+void SwitchPreset(int index);
 
 }  // namespace mxcam

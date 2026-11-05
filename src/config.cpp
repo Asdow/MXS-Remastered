@@ -15,10 +15,29 @@ namespace {
 Config  g_config;
 wchar_t g_path[1024] = L"";
 
+// Presets: three whole sets of the settings (CopyTunables). The live settings (g_config, kept in
+// the ini's usual sections) are the active preset's; the others are kept here, and in the ini in
+// sections of their own ([Preset1] .. [Preset3]) with their keys as "Section.Key".
+Config  g_presets[kPresetCount];
+int     g_activePreset = 0;
+const wchar_t* g_presetSection = nullptr;  // while reading / writing a preset's section
+
 bool ReadRaw(const wchar_t* section, const wchar_t* key, wchar_t* buffer, DWORD size)
 {
-    GetPrivateProfileStringW(section, key, L"", buffer, size, g_path);
+    if (g_presetSection) {
+        wchar_t full[128];
+        swprintf_s(full, L"%s.%s", section, key);
+        GetPrivateProfileStringW(g_presetSection, full, L"", buffer, size, g_path);
+    } else {
+        GetPrivateProfileStringW(section, key, L"", buffer, size, g_path);
+    }
     return buffer[0] != L'\0';
+}
+
+const wchar_t* PresetSection(int index)
+{
+    static const wchar_t* const kSections[kPresetCount] = { L"Preset1", L"Preset2", L"Preset3" };
+    return kSections[index];
 }
 
 double ReadDouble(const wchar_t* section, const wchar_t* key, double fallback)
@@ -70,6 +89,116 @@ void ReadVector(const wchar_t* section, const wchar_t* key, double (&value)[3])
     value[2] = z / length;
 }
 
+// Every setting the presets and DEFAULTS cover (CopyTunables), written into the usual sections,
+// or into a preset's own (keys "Section.Key").
+bool WriteTunables(const Config& c, const wchar_t* presetSection)
+{
+    struct Value {
+        const wchar_t* section;
+        const wchar_t* key;
+        double         value;
+    };
+    const Value values[] = {
+        { L"Camera",    L"CustomCamera",         c.customCamera ? 1.0 : 0.0 },
+        { L"Camera",    L"KeepGameAngle",        c.keepGameAngle ? 1.0 : 0.0 },
+        { L"Camera",    L"CameraAngleDeg",       c.cameraAngleDeg },
+        { L"Camera",    L"HeadForward",          c.headForward },
+        { L"Camera",    L"HeadHeight",           c.headHeight },
+        { L"Camera",    L"HideOwnBody",          c.hideOwnBody ? 1.0 : 0.0 },
+        { L"Smoothing", L"RotationResponse",     c.rotationResponse },
+        { L"Smoothing", L"MaxLagDeg",            c.maxLagDeg },
+        { L"Leveling",  L"HorizonLock",          c.horizonLock },
+        { L"Leveling",  L"PitchLock",            c.pitchLock },
+        { L"Leveling",  L"MaxRollCorrectionDeg", c.maxRollCorrectionDeg },
+        { L"Leveling",  L"Steadiness",           c.steadiness },
+        { L"Air",       L"AirLooseness",         c.airLooseness },
+        { L"Air",       L"WhipLock",             c.whipLock },
+        { L"Look",      L"ControllerLook",       c.controllerLook ? 1.0 : 0.0 },
+        { L"Look",      L"LookSideDeg",          c.lookSideDeg },
+        { L"Look",      L"LookTurnSpeed",        c.lookTurnSpeed },
+        { L"Look",      L"ApexLook",             c.apexLook },
+        { L"Look",      L"ApexSpeed",            c.apexSpeed },
+        { L"Look",      L"ApexAnticipation",     c.apexAnticipation },
+        { L"Look",      L"LookSideForward",      c.lookSideForward },
+        { L"Look",      L"LookSideHeight",       c.lookSideHeight },
+        { L"Look",      L"LookBackForward",      c.lookBackForward },
+        { L"Look",      L"LookBackHeight",       c.lookBackHeight },
+        { L"Neck",      L"VerticalResponse",     c.verticalResponse },
+        { L"Neck",      L"MaxVerticalLag",       c.maxVerticalLag },
+        { L"Neck",      L"CompressionPerG",      c.compressionPerG },
+        { L"Neck",      L"SpringHz",             c.springHz },
+        { L"Neck",      L"DampingRatio",         c.dampingRatio },
+        { L"Neck",      L"MaxCompression",       c.maxCompression },
+        { L"Neck",      L"MaxExtension",         c.maxExtension },
+        { L"Neck",      L"NodDegPerMeter",       c.nodDegPerMeter },
+        { L"Neck",      L"AccelFilterHz",        c.accelFilterHz },
+        { L"Replay",    L"Camera",               static_cast<double>(c.replayCamera) },
+        { L"Replay",    L"Distance",             c.replayDistance },
+        { L"Replay",    L"Height",               c.replayHeight },
+        { L"Replay",    L"PitchDeg",             c.replayPitchDeg },
+        { L"Replay",    L"HelmetHeight",         c.helmetHeight },
+        { L"Replay",    L"HelmetForward",        c.helmetForward },
+        { L"Replay",    L"HelmetTiltDeg",        c.helmetTiltDeg },
+        { L"Replay",    L"HelmetMount",          static_cast<double>(c.helmetMount) },
+        { L"Replay",    L"SideHeight",           c.sideHeight },
+        { L"Replay",    L"SideForward",          c.sideForward },
+        { L"Replay",    L"SideTiltDeg",          c.sideTiltDeg },
+        { L"Replay",    L"SideOut",              c.sideOut },
+        { L"Replay",    L"ChestHeight",          c.chestHeight },
+        { L"Replay",    L"ChestForward",         c.chestForward },
+        { L"Replay",    L"ChestTiltDeg",         c.chestTiltDeg },
+        { L"Replay",    L"HelmetSmoothing",      c.helmetSmoothing },
+        { L"Replay",    L"HelmetLevel",          c.helmetLevel },
+        { L"Graphics",  L"Shaders",              c.shaders ? 1.0 : 0.0 },
+        { L"Graphics",  L"TimeOfDay",            c.timeOfDay },
+        { L"Graphics",  L"MoveSun",              c.moveSun ? 1.0 : 0.0 },
+        { L"Graphics",  L"NightBrightness",      c.nightBrightness },
+        { L"Graphics",  L"HideGameFlare",        c.hideGameFlare ? 1.0 : 0.0 },
+        { L"Graphics",  L"Shadows",              c.shadows },
+        { L"Graphics",  L"ShadowLength",         c.shadowLength },
+        { L"Graphics",  L"ShadowMap",            c.shadowMap ? 1.0 : 0.0 },
+        { L"Graphics",  L"ShadowDistance",       c.shadowDistance },
+        { L"Graphics",  L"Headlight",            c.headlight },
+        { L"Graphics",  L"HeadlightBeamDeg",     c.headlightBeamDeg },
+        { L"Graphics",  L"AmbientOcclusion",     c.ambientOcclusion },
+        { L"Graphics",  L"SunRays",              c.sunRays },
+        { L"Graphics",  L"Bloom",                c.bloom },
+        { L"Graphics",  L"Exposure",             c.exposure },
+        { L"Graphics",  L"Contrast",             c.contrast },
+        { L"Graphics",  L"Saturation",           c.saturation },
+        { L"Graphics",  L"Vignette",             c.vignette },
+        { L"Graphics",  L"AntiAliasing",         static_cast<double>(c.antiAliasing) },
+        { L"Graphics",  L"Sharpen",              c.sharpen },
+        { L"Graphics",  L"Anisotropy",           c.anisotropy },
+        { L"Graphics",  L"Trilinear",            c.trilinear ? 1.0 : 0.0 },
+        { L"Graphics",  L"TextureLodBias",       c.textureLodBias },
+        { L"Graphics",  L"DirtDetail",           c.dirtDetail },
+        { L"Graphics",  L"DirtScale",            c.dirtScale },
+        { L"Graphics",  L"TireMarks",            c.tireMarks },
+        { L"Graphics",  L"TireDirt",             c.tireDirt },
+        { L"Graphics",  L"MotionBlur",           c.motionBlur },
+        { L"Graphics",  L"DepthOfField",         c.depthOfField },
+        { L"Graphics",  L"DofFocus",             c.dofFocus },
+        { L"Other",     L"HideHud",              c.hideHud ? 1.0 : 0.0 },
+        { L"Other",     L"HideCursor",           c.hideCursor ? 1.0 : 0.0 },
+        { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
+    };
+
+    bool ok = true;
+    for (const Value& v : values) {
+        wchar_t text[32];
+        swprintf_s(text, L"%.6g", v.value);
+        if (presetSection) {
+            wchar_t full[128];
+            swprintf_s(full, L"%s.%s", v.section, v.key);
+            ok = WritePrivateProfileStringW(presetSection, full, text, g_path) != FALSE && ok;
+        } else {
+            ok = WritePrivateProfileStringW(v.section, v.key, text, g_path) != FALSE && ok;
+        }
+    }
+    return ok;
+}
+
 }  // namespace
 
 const Config& GetConfig() { return g_config; }
@@ -83,94 +212,6 @@ bool SaveConfig()
     if (!g_path[0])
         return false;
 
-    struct Value {
-        const wchar_t* section;
-        const wchar_t* key;
-        double         value;
-    };
-    const Value values[] = {
-        { L"Camera",    L"CustomCamera",         g_config.customCamera ? 1.0 : 0.0 },
-        { L"Camera",    L"KeepGameAngle",        g_config.keepGameAngle ? 1.0 : 0.0 },
-        { L"Camera",    L"CameraAngleDeg",       g_config.cameraAngleDeg },
-        { L"Camera",    L"HeadForward",          g_config.headForward },
-        { L"Camera",    L"HeadHeight",           g_config.headHeight },
-        { L"Camera",    L"HideOwnBody",          g_config.hideOwnBody ? 1.0 : 0.0 },
-        { L"Smoothing", L"RotationResponse",     g_config.rotationResponse },
-        { L"Smoothing", L"MaxLagDeg",            g_config.maxLagDeg },
-        { L"Leveling",  L"HorizonLock",          g_config.horizonLock },
-        { L"Leveling",  L"PitchLock",            g_config.pitchLock },
-        { L"Leveling",  L"MaxRollCorrectionDeg", g_config.maxRollCorrectionDeg },
-        { L"Leveling",  L"Steadiness",           g_config.steadiness },
-        { L"Air",       L"AirLooseness",         g_config.airLooseness },
-        { L"Air",       L"WhipLock",             g_config.whipLock },
-        { L"Look",      L"ControllerLook",       g_config.controllerLook ? 1.0 : 0.0 },
-        { L"Look",      L"LookSideDeg",          g_config.lookSideDeg },
-        { L"Look",      L"LookTurnSpeed",        g_config.lookTurnSpeed },
-        { L"Look",      L"ApexLook",             g_config.apexLook },
-        { L"Look",      L"ApexSpeed",            g_config.apexSpeed },
-        { L"Look",      L"ApexAnticipation",     g_config.apexAnticipation },
-        { L"Look",      L"LookSideForward",      g_config.lookSideForward },
-        { L"Look",      L"LookSideHeight",       g_config.lookSideHeight },
-        { L"Look",      L"LookBackForward",      g_config.lookBackForward },
-        { L"Look",      L"LookBackHeight",       g_config.lookBackHeight },
-        { L"Neck",      L"VerticalResponse",     g_config.verticalResponse },
-        { L"Neck",      L"MaxVerticalLag",       g_config.maxVerticalLag },
-        { L"Neck",      L"CompressionPerG",      g_config.compressionPerG },
-        { L"Neck",      L"SpringHz",             g_config.springHz },
-        { L"Neck",      L"DampingRatio",         g_config.dampingRatio },
-        { L"Neck",      L"MaxCompression",       g_config.maxCompression },
-        { L"Neck",      L"MaxExtension",         g_config.maxExtension },
-        { L"Neck",      L"NodDegPerMeter",       g_config.nodDegPerMeter },
-        { L"Neck",      L"AccelFilterHz",        g_config.accelFilterHz },
-        { L"Replay",    L"Camera",               static_cast<double>(g_config.replayCamera) },
-        { L"Replay",    L"Distance",             g_config.replayDistance },
-        { L"Replay",    L"Height",               g_config.replayHeight },
-        { L"Replay",    L"PitchDeg",             g_config.replayPitchDeg },
-        { L"Replay",    L"HelmetHeight",         g_config.helmetHeight },
-        { L"Replay",    L"HelmetForward",        g_config.helmetForward },
-        { L"Replay",    L"HelmetTiltDeg",        g_config.helmetTiltDeg },
-        { L"Replay",    L"HelmetMount",          static_cast<double>(g_config.helmetMount) },
-        { L"Replay",    L"SideHeight",           g_config.sideHeight },
-        { L"Replay",    L"SideForward",          g_config.sideForward },
-        { L"Replay",    L"SideTiltDeg",          g_config.sideTiltDeg },
-        { L"Replay",    L"SideOut",              g_config.sideOut },
-        { L"Replay",    L"ChestHeight",          g_config.chestHeight },
-        { L"Replay",    L"ChestForward",         g_config.chestForward },
-        { L"Replay",    L"ChestTiltDeg",         g_config.chestTiltDeg },
-        { L"Replay",    L"HelmetSmoothing",      g_config.helmetSmoothing },
-        { L"Replay",    L"HelmetLevel",          g_config.helmetLevel },
-        { L"Graphics",  L"Shaders",              g_config.shaders ? 1.0 : 0.0 },
-        { L"Graphics",  L"TimeOfDay",            g_config.timeOfDay },
-        { L"Graphics",  L"MoveSun",              g_config.moveSun ? 1.0 : 0.0 },
-        { L"Graphics",  L"NightBrightness",      g_config.nightBrightness },
-        { L"Graphics",  L"HideGameFlare",        g_config.hideGameFlare ? 1.0 : 0.0 },
-        { L"Graphics",  L"Shadows",              g_config.shadows },
-        { L"Graphics",  L"ShadowLength",         g_config.shadowLength },
-        { L"Graphics",  L"ShadowMap",            g_config.shadowMap ? 1.0 : 0.0 },
-        { L"Graphics",  L"ShadowDistance",       g_config.shadowDistance },
-        { L"Graphics",  L"Headlight",            g_config.headlight },
-        { L"Graphics",  L"HeadlightBeamDeg",     g_config.headlightBeamDeg },
-        { L"Graphics",  L"AmbientOcclusion",     g_config.ambientOcclusion },
-        { L"Graphics",  L"SunRays",              g_config.sunRays },
-        { L"Graphics",  L"Bloom",                g_config.bloom },
-        { L"Graphics",  L"Exposure",             g_config.exposure },
-        { L"Graphics",  L"Contrast",             g_config.contrast },
-        { L"Graphics",  L"Saturation",           g_config.saturation },
-        { L"Graphics",  L"Vignette",             g_config.vignette },
-        { L"Graphics",  L"AntiAliasing",         static_cast<double>(g_config.antiAliasing) },
-        { L"Graphics",  L"Sharpen",              g_config.sharpen },
-        { L"Graphics",  L"Anisotropy",           g_config.anisotropy },
-        { L"Graphics",  L"Trilinear",            g_config.trilinear ? 1.0 : 0.0 },
-        { L"Graphics",  L"TextureLodBias",       g_config.textureLodBias },
-        { L"Graphics",  L"DirtDetail",           g_config.dirtDetail },
-        { L"Graphics",  L"DirtScale",            g_config.dirtScale },
-        { L"Graphics",  L"TireMarks",            g_config.tireMarks },
-        { L"Graphics",  L"TireDirt",             g_config.tireDirt },
-        { L"Graphics",  L"MotionBlur",           g_config.motionBlur },
-        { L"Graphics",  L"DepthOfField",         g_config.depthOfField },
-        { L"Graphics",  L"DofFocus",             g_config.dofFocus },
-    };
-
     bool ok = WritePrivateProfileStringW(L"General", L"Enabled", g_config.enabled ? L"1" : L"0", g_path) != FALSE;
     // The keybinds (the KEYBINDS tab).
     const struct { const wchar_t* section; const wchar_t* key; int vk; } keys[] = {
@@ -183,10 +224,21 @@ bool SaveConfig()
         swprintf_s(text, L"0x%02X", k.vk);
         ok = WritePrivateProfileStringW(k.section, k.key, text, g_path) != FALSE && ok;
     }
-    for (const Value& v : values) {
-        wchar_t text[32];
-        swprintf_s(text, L"%.6g", v.value);
-        ok = WritePrivateProfileStringW(v.section, v.key, text, g_path) != FALSE && ok;
+    // A display choice, shared by the presets.
+    ok = WritePrivateProfileStringW(L"Other", L"FullscreenWindow", g_config.fullscreenWindow ? L"1" : L"0", g_path) != FALSE && ok;
+    ok = WriteTunables(g_config, nullptr) && ok;
+    // The presets: which one is live (its settings are the ones above), and the others' own.
+    wchar_t active[8];
+    swprintf_s(active, L"%d", g_activePreset + 1);
+    ok = WritePrivateProfileStringW(L"Presets", L"Active", active, g_path) != FALSE && ok;
+    for (int i = 0; i < kPresetCount; ++i) {
+        if (i == g_activePreset) {
+            WritePrivateProfileStringW(PresetSection(i), nullptr, nullptr, g_path);  // it's the usual sections
+            continue;
+        }
+        Config preset = g_config;
+        CopyTunables(g_presets[i], preset);
+        ok = WriteTunables(preset, PresetSection(i)) && ok;
     }
     // Renamed to HorizonLock; drop the old key so the file can't disagree with itself.
     WritePrivateProfileStringW(L"Leveling", L"LeanCompensation", nullptr, g_path);
@@ -195,89 +247,108 @@ bool SaveConfig()
     return ok;
 }
 
+void CopyTunables(const Config& from, Config& to)
+{
+    to.customCamera         = from.customCamera;
+    to.keepGameAngle        = from.keepGameAngle;
+    to.cameraAngleDeg       = from.cameraAngleDeg;
+    to.headForward          = from.headForward;
+    to.headHeight           = from.headHeight;
+    to.hideOwnBody          = from.hideOwnBody;
+    to.rotationResponse     = from.rotationResponse;
+    to.maxLagDeg            = from.maxLagDeg;
+    to.horizonLock          = from.horizonLock;
+    to.pitchLock            = from.pitchLock;
+    to.maxRollCorrectionDeg = from.maxRollCorrectionDeg;
+    to.steadiness           = from.steadiness;
+    to.airLooseness         = from.airLooseness;
+    to.whipLock             = from.whipLock;
+    to.controllerLook       = from.controllerLook;
+    to.lookSideDeg          = from.lookSideDeg;
+    to.lookTurnSpeed        = from.lookTurnSpeed;
+    to.apexLook             = from.apexLook;
+    to.apexSpeed            = from.apexSpeed;
+    to.apexAnticipation     = from.apexAnticipation;
+    to.lookSideForward      = from.lookSideForward;
+    to.lookSideHeight       = from.lookSideHeight;
+    to.lookBackForward      = from.lookBackForward;
+    to.lookBackHeight       = from.lookBackHeight;
+    to.verticalResponse     = from.verticalResponse;
+    to.maxVerticalLag       = from.maxVerticalLag;
+    to.compressionPerG      = from.compressionPerG;
+    to.springHz             = from.springHz;
+    to.dampingRatio         = from.dampingRatio;
+    to.maxCompression       = from.maxCompression;
+    to.maxExtension         = from.maxExtension;
+    to.nodDegPerMeter       = from.nodDegPerMeter;
+    to.accelFilterHz        = from.accelFilterHz;
+    to.replayCamera         = from.replayCamera;
+    to.replayDistance       = from.replayDistance;
+    to.replayHeight         = from.replayHeight;
+    to.replayPitchDeg       = from.replayPitchDeg;
+    to.helmetHeight         = from.helmetHeight;
+    to.helmetForward        = from.helmetForward;
+    to.helmetTiltDeg        = from.helmetTiltDeg;
+    to.helmetMount          = from.helmetMount;
+    to.sideHeight           = from.sideHeight;
+    to.sideForward          = from.sideForward;
+    to.sideTiltDeg          = from.sideTiltDeg;
+    to.sideOut              = from.sideOut;
+    to.chestHeight          = from.chestHeight;
+    to.chestForward         = from.chestForward;
+    to.chestTiltDeg         = from.chestTiltDeg;
+    to.helmetSmoothing      = from.helmetSmoothing;
+    to.helmetLevel          = from.helmetLevel;
+    to.shaders              = from.shaders;
+    to.timeOfDay            = from.timeOfDay;
+    to.moveSun              = from.moveSun;
+    to.nightBrightness      = from.nightBrightness;
+    to.hideGameFlare        = from.hideGameFlare;
+    to.shadows              = from.shadows;
+    to.shadowLength         = from.shadowLength;
+    to.shadowMap            = from.shadowMap;
+    to.shadowDistance       = from.shadowDistance;
+    to.headlight            = from.headlight;
+    to.headlightBeamDeg     = from.headlightBeamDeg;
+    to.ambientOcclusion     = from.ambientOcclusion;
+    to.sunRays              = from.sunRays;
+    to.bloom                = from.bloom;
+    to.exposure             = from.exposure;
+    to.contrast             = from.contrast;
+    to.saturation           = from.saturation;
+    to.vignette             = from.vignette;
+    to.antiAliasing         = from.antiAliasing;
+    to.sharpen              = from.sharpen;
+    to.anisotropy           = from.anisotropy;
+    to.trilinear            = from.trilinear;
+    to.textureLodBias       = from.textureLodBias;
+    to.dirtDetail           = from.dirtDetail;
+    to.dirtScale            = from.dirtScale;
+    to.tireMarks            = from.tireMarks;
+    to.tireDirt             = from.tireDirt;
+    to.motionBlur           = from.motionBlur;
+    to.depthOfField         = from.depthOfField;
+    to.dofFocus             = from.dofFocus;
+    to.hideHud              = from.hideHud;
+    to.hideCursor           = from.hideCursor;
+    to.fadeMenu             = from.fadeMenu;
+}
+
 void ResetTunables()
 {
-    const Config defaults;
-    g_config.customCamera         = defaults.customCamera;
-    g_config.keepGameAngle        = defaults.keepGameAngle;
-    g_config.cameraAngleDeg       = defaults.cameraAngleDeg;
-    g_config.headForward          = defaults.headForward;
-    g_config.headHeight           = defaults.headHeight;
-    g_config.hideOwnBody          = defaults.hideOwnBody;
-    g_config.rotationResponse     = defaults.rotationResponse;
-    g_config.maxLagDeg            = defaults.maxLagDeg;
-    g_config.horizonLock          = defaults.horizonLock;
-    g_config.pitchLock            = defaults.pitchLock;
-    g_config.maxRollCorrectionDeg = defaults.maxRollCorrectionDeg;
-    g_config.steadiness           = defaults.steadiness;
-    g_config.airLooseness         = defaults.airLooseness;
-    g_config.whipLock             = defaults.whipLock;
-    g_config.controllerLook       = defaults.controllerLook;
-    g_config.lookSideDeg          = defaults.lookSideDeg;
-    g_config.lookTurnSpeed        = defaults.lookTurnSpeed;
-    g_config.apexLook             = defaults.apexLook;
-    g_config.apexSpeed            = defaults.apexSpeed;
-    g_config.apexAnticipation     = defaults.apexAnticipation;
-    g_config.lookSideForward      = defaults.lookSideForward;
-    g_config.lookSideHeight       = defaults.lookSideHeight;
-    g_config.lookBackForward      = defaults.lookBackForward;
-    g_config.lookBackHeight       = defaults.lookBackHeight;
-    g_config.verticalResponse     = defaults.verticalResponse;
-    g_config.maxVerticalLag       = defaults.maxVerticalLag;
-    g_config.compressionPerG      = defaults.compressionPerG;
-    g_config.springHz             = defaults.springHz;
-    g_config.dampingRatio         = defaults.dampingRatio;
-    g_config.maxCompression       = defaults.maxCompression;
-    g_config.maxExtension         = defaults.maxExtension;
-    g_config.nodDegPerMeter       = defaults.nodDegPerMeter;
-    g_config.accelFilterHz        = defaults.accelFilterHz;
-    g_config.replayCamera         = defaults.replayCamera;
-    g_config.replayDistance       = defaults.replayDistance;
-    g_config.replayHeight         = defaults.replayHeight;
-    g_config.replayPitchDeg       = defaults.replayPitchDeg;
-    g_config.helmetHeight         = defaults.helmetHeight;
-    g_config.helmetForward        = defaults.helmetForward;
-    g_config.helmetTiltDeg        = defaults.helmetTiltDeg;
-    g_config.helmetMount          = defaults.helmetMount;
-    g_config.sideHeight           = defaults.sideHeight;
-    g_config.sideForward          = defaults.sideForward;
-    g_config.sideTiltDeg          = defaults.sideTiltDeg;
-    g_config.sideOut              = defaults.sideOut;
-    g_config.chestHeight          = defaults.chestHeight;
-    g_config.chestForward         = defaults.chestForward;
-    g_config.chestTiltDeg         = defaults.chestTiltDeg;
-    g_config.helmetSmoothing      = defaults.helmetSmoothing;
-    g_config.helmetLevel          = defaults.helmetLevel;
-    g_config.shaders              = defaults.shaders;
-    g_config.timeOfDay            = defaults.timeOfDay;
-    g_config.moveSun              = defaults.moveSun;
-    g_config.nightBrightness      = defaults.nightBrightness;
-    g_config.hideGameFlare        = defaults.hideGameFlare;
-    g_config.shadows              = defaults.shadows;
-    g_config.shadowLength         = defaults.shadowLength;
-    g_config.shadowMap            = defaults.shadowMap;
-    g_config.shadowDistance       = defaults.shadowDistance;
-    g_config.headlight            = defaults.headlight;
-    g_config.headlightBeamDeg     = defaults.headlightBeamDeg;
-    g_config.ambientOcclusion     = defaults.ambientOcclusion;
-    g_config.sunRays              = defaults.sunRays;
-    g_config.bloom                = defaults.bloom;
-    g_config.exposure             = defaults.exposure;
-    g_config.contrast             = defaults.contrast;
-    g_config.saturation           = defaults.saturation;
-    g_config.vignette             = defaults.vignette;
-    g_config.antiAliasing         = defaults.antiAliasing;
-    g_config.sharpen              = defaults.sharpen;
-    g_config.anisotropy           = defaults.anisotropy;
-    g_config.trilinear            = defaults.trilinear;
-    g_config.textureLodBias       = defaults.textureLodBias;
-    g_config.dirtDetail           = defaults.dirtDetail;
-    g_config.dirtScale            = defaults.dirtScale;
-    g_config.tireMarks            = defaults.tireMarks;
-    g_config.tireDirt             = defaults.tireDirt;
-    g_config.motionBlur           = defaults.motionBlur;
-    g_config.depthOfField         = defaults.depthOfField;
-    g_config.dofFocus             = defaults.dofFocus;
+    CopyTunables(Config{}, g_config);
+}
+
+int ActivePreset() { return g_activePreset; }
+
+void SwitchPreset(int index)
+{
+    if (index < 0 || index >= kPresetCount || index == g_activePreset)
+        return;
+    CopyTunables(g_config, g_presets[g_activePreset]);  // the live settings stay with their preset
+    CopyTunables(g_presets[index], g_config);
+    g_activePreset = index;
+    Log("config: preset %d", index + 1);
 }
 
 void LoadConfig(const wchar_t* iniPath)
@@ -323,16 +394,13 @@ void ForgetLearned(const char* key)
     WritePrivateProfileStringW(L"Learned", wkey, nullptr, g_path);
 }
 
-void ReloadConfig()
+namespace {
+
+// Everything in the ini (or, with g_presetSection set, a preset's section), over base: what's
+// missing keeps base's value. Every value is kept to a range the physics can't blow up with.
+Config ParseConfig(const Config& base)
 {
-    Config c;  // start from defaults so keys missing from the file keep sane values
-
-    if (GetFileAttributesW(g_path) == INVALID_FILE_ATTRIBUTES) {
-        Log("config: %ls not found, using built-in defaults", g_path);
-        g_config = c;
-        return;
-    }
-
+    Config c = base;
     c.enabled   = ReadInt(L"General", L"Enabled", c.enabled) != 0;
     c.toggleKey = ReadInt(L"General", L"ToggleKey", c.toggleKey);
     c.reloadKey = ReadInt(L"General", L"ReloadKey", c.reloadKey);
@@ -450,6 +518,10 @@ void ReloadConfig()
     c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
     c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);
     c.dofFocus         = ReadDouble(L"Graphics", L"DofFocus", c.dofFocus);
+    c.hideHud          = ReadInt(L"Other", L"HideHud", c.hideHud) != 0;
+    c.hideCursor       = ReadInt(L"Other", L"HideCursor", c.hideCursor) != 0;
+    c.fadeMenu         = ReadInt(L"Other", L"FadeMenu", c.fadeMenu) != 0;
+    c.fullscreenWindow = ReadInt(L"Other", L"FullscreenWindow", c.fullscreenWindow) != 0;
     c.dumpShaders      = ReadInt(L"Graphics", L"DumpShaders", c.dumpShaders) != 0;
 
     // Keep every value inside a range the physics can't blow up with.
@@ -537,8 +609,36 @@ void ReloadConfig()
     c.motionBlur           = Clamp(c.motionBlur, 0.0, 1.0);
     c.depthOfField         = Clamp(c.depthOfField, 0.0, 1.0);
     c.dofFocus             = Clamp(c.dofFocus, 0.0, 500.0);
+    return c;
+}
 
+}  // namespace
+
+void ReloadConfig()
+{
+    g_activePreset = 0;
+    if (GetFileAttributesW(g_path) == INVALID_FILE_ATTRIBUTES) {
+        Log("config: %ls not found, using built-in defaults", g_path);
+        g_config = Config{};
+        for (Config& preset : g_presets)
+            preset = g_config;
+        return;
+    }
+    const Config c = ParseConfig(Config{});  // from the defaults: keys missing from the file keep sane values
     g_config = c;
+    // The presets: the active one is what was just read; the others from their own sections (what
+    // a section doesn't have, or a preset never saved, is a copy of the active one).
+    wchar_t buffer[16];
+    GetPrivateProfileStringW(L"Presets", L"Active", L"1", buffer, _countof(buffer), g_path);
+    g_activePreset = Clamp(_wtoi(buffer) - 1, 0, kPresetCount - 1);
+    for (int i = 0; i < kPresetCount; ++i) {
+        g_presets[i] = c;
+        if (i == g_activePreset)
+            continue;
+        g_presetSection = PresetSection(i);
+        g_presets[i] = ParseConfig(c);
+        g_presetSection = nullptr;
+    }
     Log("config: loaded %ls (enabled=%d, %s camera, modelview='%s', camera program has '%s', up=%.2f,%.2f,%.2f)",
         g_path, c.enabled ? 1 : 0, c.customCamera ? "custom" : "game", c.modelviewUniform, c.cameraProgramUniform,
         c.worldUp[0], c.worldUp[1], c.worldUp[2]);

@@ -1245,19 +1245,21 @@ struct Wheel {
     bool   fromBike = false;  // placed from your bike this frame (its part wasn't seen)
     double roll = 0;          // placed from your bike: how far it has rolled (rad), so its dirt keeps turning
     double savedWeight = -1;  // onBikeWeight when it was last written to the ini
-    // For the shadow map (OwnWheelCast): its part as the game draws it, this frame, and where that
-    // part sat on your bike when it was last seen (for when the game doesn't draw it).
+    // For the shadow map (OwnWheelCast): its part as the game draws it this frame, and its axle in
+    // its own model (the point and which of its axes), to put that model on the axle where the
+    // wheel sits on your bike when the game doesn't draw it.
     bool     drawnNow = false;
     unsigned partProgram = 0;
     float    drawnViewModel[16] = {};
-    double   partOnBike[16] = {};
-    bool     havePart = false;
+    Vec3     partAxleLocal;
+    int      partLocalAxis = -1;
 };
 Wheel  g_wheels[2];            // 0 rear, 1 front
 // A wheel read from the ini counts as this many seconds learnt: enough to place it from your bike,
 // little enough that what it's seen doing this session soon takes over.
 constexpr double kLoadedWheelWeight = 1.0;
 constexpr double kWheelOnBikeMin = 0.5;  // seconds learnt before it's placed from your bike
+bool WheelPlausibleOnBike(int i, Vec3 point);
 
 // Game units per metre. MX Simulator measures in feet (a bike's 1.5 m wheelbase comes out ~4.9
 // units): taken from your wheels once they're found (wheelbase / 1.48 m), feet until then.
@@ -1470,6 +1472,12 @@ void LoadLearnedBike()
     for (int i = 0; i < 2; ++i) {
         Wheel& w = g_wheels[i];
         if (ReadLearned(i ? "FrontWheelOnBike" : "RearWheelOnBike", v)) {
+            if (!WheelPlausibleOnBike(i, Vec3{ v[0], v[1], v[2] })) {
+                Log("postfx: your %s wheel: (%.2f, %.2f, %.2f) on your bike can't be right; learning it again", i ? "front" : "rear",
+                    v[0], v[1], v[2]);
+                ForgetLearned(i ? "FrontWheelOnBike" : "RearWheelOnBike");
+                continue;
+            }
             w.onBike = Vec3{ v[0], v[1], v[2] };
             w.axisOnBike = Normalize(Cross(b.forward, b.up));  // the bike's own across
             w.onBikeWeight = kLoadedWheelWeight;
@@ -1649,12 +1657,32 @@ void PartWorld(const SkeletonRecord& rec, const double world[16], int b, double 
 // A wheel seen turning: where its axle sits on your bike, averaged over a couple of seconds (it
 // moves with the suspension). A sample far from what's learnt is another part's (or a crash) and
 // is ignored, unless it keeps coming: then the bike was changed.
-void LearnWheelOnBike(Wheel& w, Vec3 axis, double dt)
+// Whether a point in your bike's space is somewhere wheel i's axle can be: on the bike's centreline,
+// within 3 m of its origin (which can sit well under the ground), and (once the other wheel is learnt too) a wheelbase from
+// it, the front ahead of the rear. Anything else came from a bad moment (a crash, a reset, the bike
+// mistaken for another part).
+bool WheelPlausibleOnBike(int i, Vec3 point)
+{
+    const BikeModel& b = g_bikeModel;
+    const Vec3 across = Normalize(Cross(b.forward, b.up));
+    const double u = g_unitsPerMetre;
+    if (std::fabs(Dot(point, across)) > 0.35 * u || Length(point) > 3.0 * u)
+        return false;
+    const Wheel& other = g_wheels[1 - i];
+    if (other.onBikeWeight < kWheelOnBikeMin || std::fabs(Dot(other.onBike, across)) > 0.35 * u)
+        return true;  // nothing to check it against
+    const double ahead = Dot((i == 1 ? point - other.onBike : other.onBike - point), b.forward);  // front minus rear
+    return ahead > 0.5 * kWheelbase * u && ahead < 1.5 * kWheelbase * u;
+}
+
+void LearnWheelOnBike(int index, Wheel& w, Vec3 axis, double dt)
 {
     double inv[16];
     if (!g_bikeNow.found || dt <= 0.0 || !AffineInverse(g_bikeNow.model, inv))
         return;
     const Vec3 point = TransformPoint(inv, w.axle);
+    if (!WheelPlausibleOnBike(index, point))
+        return;  // not where a wheel can be on a bike: this frame's bike (or wheel) is off
     Vec3 dir = Normalize(TransformDirection(inv, axis));
     if (w.onBikeWeight > 0 && Dot(dir, w.axisOnBike) < 0)
         dir = dir * -1.0;
@@ -2053,19 +2081,18 @@ void UpdateWheels(double now, double dt)
             if (Dot(wheelUp, worldUp) < 0)
                 wheelUp = wheelUp * -1.0;
             w.up = wheelUp;
-            LearnWheelOnBike(w, axis, dt);
+            LearnWheelOnBike(i, w, axis, dt);
             w.fromBike = false;
-            // Its draw call, for the shadow map: kept while the game draws it, cast from your bike
+            // Its draw call, for the shadow map: kept while the game draws it, cast on your bike
             // when it doesn't.
-            double inv[16];
-            if (t.drawnAsIs && g_bikeNow.found && AffineInverse(g_bikeNow.model, inv)) {
+            if (t.drawnAsIs) {
                 w.drawnNow = true;
                 w.partProgram = t.program;
                 std::copy(t.viewModel, t.viewModel + 16, w.drawnViewModel);
-                MatMul(inv, t.world, w.partOnBike);
-                w.havePart = true;
+                w.partAxleLocal = t.axleLocal;
+                w.partLocalAxis = t.localAxis;
             }
-        } else if (g_bikeNow.found && w.onBikeWeight >= kWheelOnBikeMin) {
+        } else if (g_bikeNow.found && w.onBikeWeight >= kWheelOnBikeMin && WheelPlausibleOnBike(i, w.onBike)) {
             PlaceWheelFromBike(w, i, dt);
             w.fromBike = true;
         } else if (w.haveFromRider && w.missing <= 1.0) {
@@ -3132,12 +3159,27 @@ WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16])
         std::copy(w.drawnViewModel, w.drawnViewModel + 16, viewModel);
         return WheelCast::Drawn;
     }
-    if (!w.on || !w.havePart || !g_bikeNow.found)
+    // Only a wheel placed from your bike this frame (where it sits on it, learnt over seconds and
+    // checked), close to your rider.
+    if (!w.on || !w.fromBike || w.partLocalAxis < 0 || !g_bikeNow.found || !WheelPlausibleOnBike(i, w.onBike) ||
+        Length(w.axle - g_rider.position) > 2.0 * g_unitsPerMetre)
         return WheelCast::None;
-    // Where the game would draw it: on your bike as it was last seen, in the eye space the frame
-    // is drawn from (like an uploaded u_modelview).
-    double model[16], eyeModel[16];
-    MatMul(g_bikeNow.model, w.partOnBike, model);
+    // Its own model put on that axle: the axis it turns about along the axle, turned as far as it
+    // has rolled, its own axle point on the axle.
+    const int k = w.partLocalAxis;
+    const Vec3 columns[3] = { w.axes[0], w.axes[1], w.axes[2] };  // the axle, then across it (rolling)
+    Vec3 axes[3];
+    axes[k] = columns[0];
+    axes[(k + 1) % 3] = columns[1];
+    axes[(k + 2) % 3] = columns[2];
+    double model[16] = { axes[0].x, axes[0].y, axes[0].z, 0, axes[1].x, axes[1].y, axes[1].z, 0,
+                         axes[2].x, axes[2].y, axes[2].z, 0, 0, 0, 0, 1 };
+    const Vec3 at = w.axle - TransformDirection(model, w.partAxleLocal);
+    model[12] = at.x;
+    model[13] = at.y;
+    model[14] = at.z;
+    // In the eye space the frame is drawn from (like an uploaded u_modelview).
+    double eyeModel[16];
     MatMul(g_frame.rendered, model, eyeModel);
     *program = w.partProgram;
     ToFloat(eyeModel, viewModel, 16);

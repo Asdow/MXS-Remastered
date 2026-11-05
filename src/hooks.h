@@ -72,6 +72,12 @@ void DiscardShadowCasters();
 // this frame.
 bool EndShaderFrame();
 
+// The last frame drew the 3D scene (riding, or a replay), not just the game's menus.
+bool SceneOnScreen();
+
+// For the OTHER tab: what hiding the game's HUD and cursor is doing ("" when both are off).
+const char* GameOverlayStatusText();
+
 // Writes the last 15 s of per-frame camera data to mxcam_trace.csv, then keeps recording for
 // the given number of seconds.
 void StartTrace(double seconds);

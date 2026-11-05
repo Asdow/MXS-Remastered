@@ -39,6 +39,7 @@
 #include <windows.h>
 #include <GL/gl.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +56,7 @@
 #include "gamepad.h"
 #include "hooks.h"
 #include "log.h"
+#include "overlay.h"
 #include "postfx.h"
 #include "replay.h"
 #include "terrain.h"
@@ -148,6 +150,9 @@ struct ProgramProjection {
     GLfloat value[16] = {};
 };
 std::unordered_map<GLuint, ProgramProjection> g_programProjection;  // render thread only
+// Flat projections (the HUD's), which the perspective-only record above leaves out: where the
+// HUD's draws land on screen, for finding the game's cursor (Config::hideCursor).
+std::unordered_map<GLuint, ProgramProjection> g_flatProjection;     // render thread only
 unsigned g_frameNumber   = 1;
 bool     g_shaderViewSet = false;  // postfx has this frame's camera
 
@@ -647,8 +652,21 @@ void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean tr
         std::copy(m, m + 16, projection.value);
         return;
     }
-    if (!isModelview)
+    if (!isModelview) {
+        // A flat projection (the HUD's): where its draws land on screen (LeaveOutGameOverlay).
+        if (GetConfig().hideCursor) {
+            AcquireSRWLockShared(&g_lock);
+            const auto name = g_uniforms.find(UniformKey(program, location));
+            const bool projection = name != g_uniforms.end() && name->second.find("proj") != std::string::npos;
+            ReleaseSRWLockShared(&g_lock);
+            if (projection) {
+                ProgramProjection& flat = g_flatProjection[program];
+                flat.location = location;
+                std::copy(m, m + 16, flat.value);
+            }
+        }
         return;
+    }
     const bool identity = IsIdentity(m);
     const bool scene = !identity && IsRigid(m);
     ProgramModelview& kind = g_programModelview[program];
@@ -671,21 +689,28 @@ void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean tr
     }
 }
 
-// Before a draw call, while the shaders wait for the HUD: is this draw the start of it?
-void CheckSceneEnd()
+// Whether the bound program's next draw is flat, drawn over the 3D scene (the HUD, the game's
+// menus): why, or null for part of the 3D scene.
+const char* FlatDrawReason()
 {
     const auto found = g_programModelview.find(g_program);
     const bool fresh = found != g_programModelview.end() && found->second.frame == g_frameNumber;
     if (fresh && found->second.kind == ModelviewKind::Scene)
-        return;
-    if (fresh && found->second.kind == ModelviewKind::Scaled) {
-        postfx::SceneEnd(g_program, "a scaled u_modelview");
-        return;
-    }
+        return nullptr;
+    if (fresh && found->second.kind == ModelviewKind::Scaled)
+        return "a scaled u_modelview";
     if (!real_glIsEnabled)
         real_glIsEnabled = reinterpret_cast<PFN_IsEnabled>(GetRealGLFunction("glIsEnabled"));
     if (real_glIsEnabled && !real_glIsEnabled(GL_DEPTH_TEST))
-        postfx::SceneEnd(g_program, fresh ? "an identity u_modelview without depth testing" : "drawn without depth testing");
+        return fresh ? "an identity u_modelview without depth testing" : "drawn without depth testing";
+    return nullptr;
+}
+
+// Before a draw call, while the shaders wait for the HUD: is this draw the start of it?
+void CheckSceneEnd()
+{
+    if (const char* why = FlatDrawReason())
+        postfx::SceneEnd(g_program, why);
 }
 
 // The game's lens flare: its sprites are added onto the picture (additive blending) after the
@@ -718,6 +743,202 @@ bool IsGameFlare()
         Log("postfx: hiding the game's lens flare while a time of day is set (program %u, %s)", g_program,
             flat ? "added onto the picture in 2D" : "a billboard in the sky");
     return true;
+}
+
+// ---- The game's HUD and cursor while riding (Config::hideHud / hideCursor) -----------------
+// The HUD is what's drawn flat over this frame's 3D scene (FlatDrawReason), on screen, up to the
+// swap; frames with no 3D scene are the game's menus and are never touched. The game's cursor,
+// if it draws one of its own, is the flat draw whose place on screen follows the mouse: learnt
+// while the mouse moves (in the menus too), by its program, texture, size and vertex count. When
+// and for how long they're hidden is overlay.cpp's (HideGameOverlayNow).
+std::atomic<bool> g_sceneOnScreen{ false };
+int  g_hudSkipped = 0, g_cursorSkipped = 0;  // this frame
+bool g_loggedHudHidden = false;
+
+struct CursorTrack {
+    unsigned long long signature = 0;
+    unsigned frame = 0, prevFrame = 0;     // the frames it was last drawn in
+    float    x = 0, y = 0, prevX = 0, prevY = 0;  // where on screen (client pixels from the top left)
+    bool     twice = false;                // drawn more than once this frame: which one moved?
+    int      hits = 0;                     // frames in a row it moved with the mouse
+};
+std::vector<CursorTrack> g_cursorTracks;
+constexpr size_t kMaxCursorTracks = 128;
+constexpr int    kCursorHits = 4;
+unsigned long long g_cursorSignature = 0;  // the game's cursor (0: not found)
+float g_mouseX = 0, g_mouseY = 0;
+float g_mouseMoveX[2] = {}, g_mouseMoveY[2] = {};  // the mouse's move over this frame and the one before
+bool  g_haveMouse = false;
+GLint g_viewport[4] = {};
+unsigned g_viewportFrame = 0;
+
+// Blended additively onto the picture (the lens flare): not the HUD.
+bool AddedOntoPicture()
+{
+    if (!real_glIsEnabled)
+        real_glIsEnabled = reinterpret_cast<PFN_IsEnabled>(GetRealGLFunction("glIsEnabled"));
+    if (!real_glGetIntegerv)
+        real_glGetIntegerv = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+    if (!real_glIsEnabled || !real_glGetIntegerv || !real_glIsEnabled(GL_BLEND))
+        return false;
+    constexpr GLenum kBlendDstRgb = 0x80C8;
+    GLint dst = 0;
+    real_glGetIntegerv(kBlendDstRgb, &dst);
+    return dst == GL_ONE;
+}
+
+bool DrawingToScreen()
+{
+    if (!real_glGetIntegerv)
+        real_glGetIntegerv = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+    if (!real_glGetIntegerv)
+        return false;
+    constexpr GLenum kDrawFramebufferBinding = 0x8CA6;
+    GLint fb = 0;
+    real_glGetIntegerv(kDrawFramebufferBinding, &fb);
+    return fb == 0;
+}
+
+// A flat draw with a modelview of its own: where its origin lands on screen, and what it is.
+bool FlatDrawPlace(const DrawCall& draw, float& x, float& y, unsigned long long& signature)
+{
+    const auto mv = g_programModelview.find(g_program);
+    if (mv == g_programModelview.end() || mv->second.frame != g_frameNumber || mv->second.kind != ModelviewKind::Scaled ||
+        mv->second.transposed)
+        return false;
+    const GLfloat* m = mv->second.raw;
+    float clip[4] = { m[12], m[13], m[14], 1.0f };
+    const auto flat = g_flatProjection.find(g_program);
+    if (flat != g_flatProjection.end()) {
+        const GLfloat* p = flat->second.value;
+        for (int i = 0; i < 4; ++i)
+            clip[i] = p[i] * m[12] + p[4 + i] * m[13] + p[8 + i] * m[14] + p[12 + i];
+    }
+    if (std::fabs(clip[3]) < 1e-6f)
+        return false;
+    if (g_viewportFrame != g_frameNumber) {
+        g_viewportFrame = g_frameNumber;
+        if (real_glGetIntegerv)
+            real_glGetIntegerv(GL_VIEWPORT, g_viewport);
+    }
+    if (g_viewport[2] <= 0 || g_viewport[3] <= 0)
+        return false;
+    x = (clip[0] / clip[3] * 0.5f + 0.5f) * g_viewport[2] + g_viewport[0];
+    y = (0.5f - clip[1] / clip[3] * 0.5f) * g_viewport[3];
+    const unsigned long long scaleX = static_cast<unsigned long long>(std::lround(std::fabs(m[0]) * 4096.0f));
+    const unsigned long long scaleY = static_cast<unsigned long long>(std::lround(std::fabs(m[5]) * 4096.0f));
+    signature = (static_cast<unsigned long long>(g_program) * 0x9E3779B97F4A7C15ull) ^
+                (static_cast<unsigned long long>(g_boundTextures[0]) * 0xC2B2AE3D27D4EB4Full) ^
+                (static_cast<unsigned long long>(draw.count) * 0x165667B19E3779F9ull) ^ (scaleX << 20) ^ (scaleY << 40);
+    return signature != 0;
+}
+
+// Notes where a flat draw is this frame, for finding the cursor among them.
+void TrackFlatDraw(unsigned long long signature, float x, float y)
+{
+    CursorTrack* track = nullptr;
+    for (CursorTrack& t : g_cursorTracks)
+        if (t.signature == signature) {
+            track = &t;
+            break;
+        }
+    if (!track) {
+        if (g_cursorTracks.size() >= kMaxCursorTracks)
+            return;
+        g_cursorTracks.push_back(CursorTrack{});
+        track = &g_cursorTracks.back();
+        track->signature = signature;
+    }
+    if (track->frame == g_frameNumber) {
+        track->twice = true;
+        return;
+    }
+    track->prevFrame = track->frame;
+    track->prevX = track->x;
+    track->prevY = track->y;
+    track->frame = g_frameNumber;
+    track->x = x;
+    track->y = y;
+    track->twice = false;
+}
+
+// At the end of a frame: the flat draw that moved with the mouse, a few frames running, is the
+// game's cursor. (The game may draw it where the mouse was a frame ago: either move counts.)
+void LearnCursor()
+{
+    float mx = 0, my = 0;
+    const bool have = GameCursorPos(mx, my);
+    g_mouseMoveX[1] = g_mouseMoveX[0];
+    g_mouseMoveY[1] = g_mouseMoveY[0];
+    g_mouseMoveX[0] = have && g_haveMouse ? mx - g_mouseX : 0.0f;
+    g_mouseMoveY[0] = have && g_haveMouse ? my - g_mouseY : 0.0f;
+    g_haveMouse = have;
+    g_mouseX = mx;
+    g_mouseY = my;
+    if (!have)
+        return;
+    const bool mouseMoved = std::fabs(g_mouseMoveX[0]) + std::fabs(g_mouseMoveY[0]) >= 4.0f ||
+                            std::fabs(g_mouseMoveX[1]) + std::fabs(g_mouseMoveY[1]) >= 4.0f;
+    for (size_t i = 0; i < g_cursorTracks.size();) {
+        CursorTrack& t = g_cursorTracks[i];
+        if (g_frameNumber - t.frame > 600) {  // not drawn for a while
+            g_cursorTracks[i] = g_cursorTracks.back();
+            g_cursorTracks.pop_back();
+            continue;
+        }
+        ++i;
+        if (t.frame != g_frameNumber || t.prevFrame + 1 != g_frameNumber || t.twice)
+            continue;
+        const float dx = t.x - t.prevX, dy = t.y - t.prevY;
+        const bool itMoved = std::fabs(dx) + std::fabs(dy) > 0.5f;
+        if (!mouseMoved && !itMoved)
+            continue;
+        bool withMouse = false;
+        for (int k = 0; k < 2 && !withMouse; ++k) {
+            const float mdx = g_mouseMoveX[k], mdy = g_mouseMoveY[k];
+            const float size = std::fabs(mdx) + std::fabs(mdy);
+            withMouse = size >= 4.0f && std::fabs(dx - mdx) + std::fabs(dy - mdy) < 3.0f + 0.05f * size;
+        }
+        withMouse = withMouse && std::fabs(t.x - mx) + std::fabs(t.y - my) < 160.0f;
+        t.hits = withMouse ? t.hits + 1 : 0;
+        if (t.hits >= kCursorHits && g_cursorSignature != t.signature) {
+            g_cursorSignature = t.signature;
+            Log("hud: found the game's own mouse cursor (it follows the mouse on screen); hidden while riding");
+        }
+    }
+}
+
+// Whether to leave this draw out: the HUD or the game's cursor, while riding with them hidden.
+bool LeaveOutGameOverlay(const DrawCall& draw)
+{
+    const Config& cfg = GetConfig();
+    if (!cfg.hideHud && !cfg.hideCursor)
+        return false;
+    const char* flat = FlatDrawReason();
+    if (!flat)
+        return false;
+    float x = 0, y = 0;
+    unsigned long long signature = 0;
+    const bool placed = cfg.hideCursor && FlatDrawPlace(draw, x, y, signature);
+    if (placed)
+        TrackFlatDraw(signature, x, y);
+    if (!g_shaderViewSet || !DrawingToScreen() || AddedOntoPicture())
+        return false;  // the game's menus (no 3D scene), into a texture of its own, or the lens flare
+    if (cfg.hideHud && HideGameOverlayNow(false)) {
+        ++g_hudSkipped;
+        if (!g_loggedHudHidden) {
+            g_loggedHudHidden = true;
+            Log("hud: hiding the game's HUD while riding (first HUD draw: program %u, %s)", g_program, flat);
+        }
+        DumpCall("^ SKIPPED  the game's HUD (%s)", flat);
+        return true;
+    }
+    if (placed && g_cursorSignature && signature == g_cursorSignature && HideGameOverlayNow(true)) {
+        ++g_cursorSkipped;
+        DumpCall("^ SKIPPED  the game's mouse cursor");
+        return true;
+    }
+    return false;
 }
 
 // ---- Your own torso and head (see SkinnedProgram) -----------------------------------------
@@ -1928,6 +2149,8 @@ bool NoteDraw(const DrawCall& draw)
             DumpCall("^ SKIPPED  the game's lens flare (a time of day is set)");
             return false;
         }
+        if (LeaveOutGameOverlay(draw))
+            return false;
         PrepareSkinnedDraw();
         if (postfx::WantsShadowCasters())
             CastShadow(draw);
@@ -2003,6 +2226,13 @@ bool EndShaderFrame()
     if (!captured)
         g_camera.haveCorrection = false;
     g_camera.capturedThisFrame = false;
+    // The game's HUD and cursor (LeaveOutGameOverlay): this frame's 3D scene, and the cursor.
+    if (IsDumping() && (g_hudSkipped || g_cursorSkipped))
+        Log("  hud: %d HUD draw(s) and %d cursor draw(s) left out", g_hudSkipped, g_cursorSkipped);
+    g_sceneOnScreen = g_shaderViewSet;
+    g_hudSkipped = g_cursorSkipped = 0;
+    if (GetConfig().hideCursor)
+        LearnCursor();
     ++g_frameNumber;
     g_shaderViewSet = false;
     g_camera.havePreview = false;
@@ -2011,6 +2241,25 @@ bool EndShaderFrame()
     g_camera.otherRotations = 0;
     g_camera.correctedThisFrame = 0;
     return captured;
+}
+
+bool SceneOnScreen()
+{
+    return g_sceneOnScreen.load(std::memory_order_relaxed);
+}
+
+const char* GameOverlayStatusText()
+{
+    const Config& cfg = GetConfig();
+    if (!cfg.hideHud && !cfg.hideCursor)
+        return "";
+    static char text[200];
+    const char* hud = cfg.hideHud ? (g_loggedHudHidden ? "HUD: HIDDEN WHILE RIDING" : "HUD: HIDDEN ONCE YOU RIDE") : "";
+    const char* cursor = !cfg.hideCursor ? ""
+                       : g_cursorSignature ? "CURSOR: FOUND, HIDDEN WHILE RIDING"
+                                           : "CURSOR: HIDDEN WHILE RIDING";
+    snprintf(text, sizeof text, "%s%s%s   \xB7   MOVE THE MOUSE TO SHOW THEM", hud, hud[0] && cursor[0] ? "   \xB7   " : "", cursor);
+    return text;
 }
 
 }  // namespace mxcam

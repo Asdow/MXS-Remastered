@@ -795,8 +795,8 @@ RowDef KeyRow(int tab, const char* section, const char* label, int Config::* key
     return { tab, section, label, RowKind::Key, nullptr, nullptr, 0, 1, 1, 1, 0, "", nullptr, nullptr, nullptr, false, key };
 }
 
-const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS" };
-constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3;
+const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS", "OTHER" };
+constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3, kTabOther = 4;
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
 
 // Each tab's rows, column by column (.Col starts the next one).
@@ -1021,6 +1021,22 @@ const RowDef kRows[] = {
     KeyRow(3, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
         .Help("Turns all the shaders on and off in game, for before / after comparisons (the GRAPHICS "
               "tab's Shaders switch). Click the key, then press the new one. Esc cancels."),
+    // ======== OTHER ========
+    Toggle(4, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
+        .Help("Hides the game's HUD (timing, positions, chat) while you ride or watch a replay, for a "
+              "clean view. Move or click the mouse (or press Esc) and it shows again for a few "
+              "seconds, so the game's menus still work. Never hidden in the game's menus.")
+        .Col(0),
+    Toggle(4, nullptr,          "Hide cursor",               &Config::hideCursor)
+        .Help("Hides the game's mouse cursor while you ride or watch a replay. It comes back as soon "
+              "as you move the mouse, and is never hidden in the game's menus."),
+    Toggle(4, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
+        .Help("With the game in windowed mode, makes its window cover the whole screen with no border "
+              "(borderless fullscreen): Alt+Tab stays instant. Off puts the window back as it was. "
+              "Shared by all the presets."),
+    Toggle(4, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
+        .Help("While you drag a GRAPHICS slider (or step it with the arrow keys) the menu fades out, "
+              "all but that slider, so you can see the whole picture change."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -1042,8 +1058,120 @@ struct PanelState {
     bool   closeRequest = false;
     char   status[96]   = "";
     double statusUntil  = 0;
+    // Fading while a GRAPHICS slider is adjusted (Config::fadeMenu): all but that slider.
+    float  opacity      = 1.0f;
+    double lastFrame    = 0;
+    int    adjustRow    = -1;   // index into kRows of the slider last adjusted
+    double adjustedAt   = -1;   // when (by the keys; dragging counts for as long as it lasts)
 };
 PanelState g_panel;
+
+// Parts of the batch the fade leaves alone (the slider being adjusted, the cursor): [begin, end).
+struct KeepRange { size_t begin, end; };
+std::vector<KeepRange> g_keepRanges;
+constexpr float  kFadedOpacity = 0.06f;
+constexpr double kAdjustHold   = 0.6;  // s the menu stays faded after the last arrow key step
+
+// ---- The game's HUD and cursor while riding (Config::hideHud / hideCursor) -----------------
+// Activity is the mouse moving or a button / Esc going down; it shows them for a few seconds.
+constexpr ULONGLONG kRevealMs = 3000;
+std::atomic<ULONGLONG> g_lastMouseActivity{ 0 };
+std::atomic<long long> g_lastMousePos{ 0 };   // (x << 32) | y, screen pixels
+std::atomic<HWND>      g_gameWindow{ nullptr };
+
+// ---- Fullscreen window (Config::fullscreenWindow) --------------------------------------------
+// The game's window in windowed mode made borderless and stretched over its monitor; what it was
+// (style, extended style, placement) is kept to put it back when the option is turned off. A
+// window already bare and covering its monitor (the game's own fullscreen) is left alone.
+struct FullscreenWindow {
+    HWND            window = nullptr;   // the window made fullscreen (null: none)
+    LONG_PTR        style = 0, exStyle = 0;
+    WINDOWPLACEMENT placement{};
+    ULONGLONG       lastTry = 0;
+};
+FullscreenWindow g_fullscreen;
+
+constexpr LONG_PTR kFrameStyles   = WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+constexpr LONG_PTR kFrameExStyles = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE;
+
+void UpdateFullscreenWindow(HWND window, bool wanted)
+{
+    FullscreenWindow& f = g_fullscreen;
+    if (!window || (GetWindowLongPtrW(window, GWL_STYLE) & WS_CHILD))
+        return;  // drawn into a window inside another: not one to stretch
+    if (f.window && (f.window != window || !IsWindow(f.window)))
+        f.window = nullptr;  // the game made a new window: the old one's state is gone with it
+    if (!wanted) {
+        if (!f.window)
+            return;
+        // Back as it was: its frame, then its place and size.
+        SetWindowLongPtrW(window, GWL_STYLE, f.style);
+        SetWindowLongPtrW(window, GWL_EXSTYLE, f.exStyle);
+        SetWindowPlacement(window, &f.placement);
+        SetWindowPos(window, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+        f.window = nullptr;
+        Log("window: back to a normal window");
+        return;
+    }
+    if (IsIconic(window))
+        return;  // minimised: nothing to fill
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof monitor;
+    if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor))
+        return;
+    const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    RECT rect;
+    if (!GetWindowRect(window, &rect))
+        return;
+    // One pixel taller than the screen (the extra row is off its bottom edge): a window exactly the
+    // size of the screen is taken for real fullscreen and no longer synced to the screen by Windows,
+    // which tears the picture into bands whenever the game runs without vsync. The taskbar still
+    // goes behind it.
+    const RECT& m = monitor.rcMonitor;
+    const RECT target = { m.left, m.top, m.right, m.bottom + 1 };
+    const bool bare = !(style & (WS_CAPTION | WS_THICKFRAME));
+    if (bare && (EqualRect(&rect, &target) || EqualRect(&rect, &m)))
+        return;  // already fullscreen (ours, or the game's own)
+    // At most once a second, so a window that won't take it isn't fought every frame.
+    const ULONGLONG now = GetTickCount64();
+    if (now - f.lastTry < 1000)
+        return;
+    f.lastTry = now;
+    if (!f.window) {
+        f.window = window;
+        f.style = style;
+        f.exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        f.placement.length = sizeof f.placement;
+        GetWindowPlacement(window, &f.placement);
+        Log("window: fullscreen window (%ldx%ld, borderless, one pixel taller than the screen so it stays in sync with it)",
+            monitor.rcMonitor.right - monitor.rcMonitor.left,
+            monitor.rcMonitor.bottom - monitor.rcMonitor.top);
+    }
+    if (IsZoomed(window))
+        ShowWindow(window, SW_RESTORE);  // a maximised window keeps its own size
+    SetWindowLongPtrW(window, GWL_STYLE, style & ~kFrameStyles);
+    SetWindowLongPtrW(window, GWL_EXSTYLE, GetWindowLongPtrW(window, GWL_EXSTYLE) & ~kFrameExStyles);
+    SetWindowPos(window, nullptr, target.left, target.top, target.right - target.left, target.bottom - target.top,
+                 SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
+}
+
+void NoteMouseActivity()
+{
+    // For automated tests: the real mouse (whoever is at the desk) doesn't count.
+    static const bool testIdle = GetEnvironmentVariableA("MXCAM_TEST_MOUSE_IDLE", nullptr, 0) > 0;
+    if (testIdle)
+        return;
+    POINT p;
+    if (!GetCursorPos(&p))
+        return;
+    const long long packed = (static_cast<long long>(p.x) << 32) | static_cast<unsigned int>(p.y);
+    const bool moved = g_lastMousePos.exchange(packed) != packed;
+    const bool pressed = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) ||
+                         (GetAsyncKeyState(VK_MBUTTON) & 0x8000) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+    if (moved || pressed)
+        g_lastMouseActivity = GetTickCount64();
+}
 
 struct Input {
     float mx = -1, my = -1;
@@ -1098,6 +1226,15 @@ bool    g_windowUnicode  = true;
 
 LRESULT CALLBACK PanelWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    // The game's cursor while riding (Config::hideCursor), if it's the system's: none over the
+    // game while the mouse is left alone. A move sends this first, and shows the game's again.
+    if (message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT && !g_menuOpen.load(std::memory_order_relaxed)) {
+        NoteMouseActivity();
+        if (HideGameOverlayNow(true)) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+    }
     if (g_menuOpen.load(std::memory_order_relaxed)) {
         switch (message) {
         case WM_SETCURSOR:
@@ -1420,7 +1557,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     int rowsInTab = 0;
     for (const RowDef& def : kRows)
         rowsInTab += def.tab == g_panel.tab ? 1 : 0;
-    const int saveItem = kFirstRowItem + rowsInTab, defaultsItem = saveItem + 1, closeItem = saveItem + 2;
+    const int presetItem = kFirstRowItem + rowsInTab;
+    const int saveItem = presetItem + 1, defaultsItem = saveItem + 1, closeItem = saveItem + 2;
     const int itemCount = closeItem + 1;
     if (g_panel.selected >= itemCount)
         g_panel.selected = itemCount - 1;
@@ -1573,6 +1711,12 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         if (hot && in.pressed)
             g_panel.selected = thisItem;
         const bool active = g_panel.dragging == i;
+        // The slider being adjusted while the menu fades: kept, on a backdrop of its own.
+        const bool kept = i == g_panel.adjustRow && g_panel.opacity < 0.999f;
+        const size_t keptBegin = g_batch.size();
+        if (kept)
+            RoundedRect(hx - S(6), y - S(4), hw + S(12), rowH + S(8), S(10),
+                        Rgba(13, 17, 26, 0.9f * (1.0f - g_panel.opacity)));
         if (hot || active)
             RoundedRect(hx, y, hw, rowH, S(6), Rgba(40, 90, 176, 0.14f));
         if (focused)
@@ -1584,10 +1728,15 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             double& value = cfg.*SliderField(def, cfg);
             if (hot && in.pressed && !def.locked)
                 g_panel.dragging = i;
-            if (active && in.down)
+            if (active && in.down) {
                 SetSlider(def, value, def.min + Clamp((in.mx - cx) / cw, 0.0f, 1.0f) * (def.max - def.min));
-            if (focused && in.step && !def.locked)
+                g_panel.adjustRow = i;
+            }
+            if (focused && in.step && !def.locked) {
                 SetSlider(def, value, value + in.step * def.step * (in.coarse ? 10 : 1));
+                g_panel.adjustRow = i;
+                g_panel.adjustedAt = now;
+            }
 
             char text[32];
             FormatValue(def, value, text, sizeof text);
@@ -1677,6 +1826,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 Pick((current + 1) % count);
             Text(kFontBody, cx, labelY, def.label, labelColor, 0);
         }
+        if (kept)
+            g_keepRanges.push_back({ keptBegin, g_batch.size() });
         y += rowH;
     }
     y = rowsTop + contentH;
@@ -1691,6 +1842,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         snprintf(readout, sizeof readout, "%s   \xB7   %s", postfx::StatusText(), tires[0] ? tires : texfilter::StatusText());
     } else if (g_panel.tab == kTabKeybinds) {
         snprintf(readout, sizeof readout, "CLICK A KEY, THEN PRESS THE NEW ONE   \xB7   ESC CANCELS   \xB7   SAVE TO KEEP THEM");
+    } else if (g_panel.tab == kTabOther) {
+        const char* status = GameOverlayStatusText();
+        snprintf(readout, sizeof readout, "%s", status[0] ? status : "MOVE THE MOUSE TO BRING A HIDDEN HUD OR CURSOR BACK");
     } else if (!cfg.enabled) {
         snprintf(readout, sizeof readout, "FIRST PERSON MOD IS OFF%s",
                  g_panel.tab == kTabReplay ? " - REPLAYS USE THE GAME'S OWN CAMERA" : "");
@@ -1752,8 +1906,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         }
     }
     if (Button(defaultsItem, buttonsX + bw + gap, bw, "DEFAULTS", false,
-               "Puts every first person, replay and graphics setting back to its default (not the "
-               "keybinds). Press SAVE to keep it.")) {
+               "Puts every first person, replay, graphics and other setting of this preset back to its "
+               "default (not the keybinds). Press SAVE to keep it.")) {
         ResetTunables();
         camera::Reset();
         g_panel.dirty = true;
@@ -1763,19 +1917,77 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                "Closes the menu. Unsaved changes stay until you quit the game."))
         g_panel.closeRequest = true;
 
+    // ---- Presets (left): PRESET 1 | 2 | 3 ----
+    float hintX = x;
+    {
+        const char* label = "PRESET";
+        const float labelW = TextWidth(kFontSmall, label, S(2));
+        const float segH = S(32), segW = S(46), segY = std::round(y + (buttonH - segH) * 0.5f);
+        const float sx0 = x + labelW + S(14), total = kPresetCount * segW;
+        const bool focused = g_panel.selected == presetItem;
+        const bool areaHot = in.Inside(x, y, sx0 + total - x, buttonH);
+        OfferHelp("Three presets, each with its own copy of every setting (not the keybinds). Click one to "
+                  "switch to it: your changes stay with the preset you made them in. SAVE writes all three "
+                  "to mxcam.ini, and the game starts with the one in use.",
+                  y, y + buttonH, x, sx0 + total - x, areaHot, focused);
+        if (focused)
+            Marker(px + S(10), segY, segH);
+        Text(kFontSmall, x, y + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), label, focused ? kLabel : kDim, S(2));
+        const int current = ActivePreset();
+        int wanted = current;
+        RoundedRect(sx0 - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, kBorder);
+        RoundedRect(sx0, segY, total, segH, segH * 0.5f, kPanelSolid);
+        for (int p = 0; p < kPresetCount; ++p) {
+            const float sx = sx0 + p * segW;
+            const bool hot = in.Inside(sx, segY, segW, segH);
+            if (hot && in.pressed) {
+                wanted = p;
+                g_panel.selected = presetItem;
+            }
+            if (p == current)
+                RoundedRect(sx, segY, segW, segH, segH * 0.5f, hot ? kBlueHot : kBlue);
+            char number[4];
+            snprintf(number, sizeof number, "%d", p + 1);
+            const float numberW = TextWidth(kFontSmall, number, S(2));
+            Text(kFontSmall, std::round(sx + (segW - numberW) * 0.5f), segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f),
+                 number, p == current ? White(1.0f) : (hot ? kLabel : kDim), S(2));
+        }
+        if (focused && in.step)
+            wanted = Clamp(current + (in.step > 0 ? 1 : -1), 0, kPresetCount - 1);
+        if (focused && in.activate)
+            wanted = (current + 1) % kPresetCount;
+        if (wanted != current) {
+            SwitchPreset(wanted);
+            camera::Reset();
+            g_panel.dirty = true;
+            char text[64];
+            snprintf(text, sizeof text, "PRESET %d IN USE - SAVE TO KEEP IT", wanted + 1);
+            SetStatus(text, now);
+        }
+        hintX = sx0 + total + S(24);
+    }
+
     {
         const float hintY = y + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f);
+        const float room = buttonsX - S(12) - hintX;
+        // Whatever doesn't fit beside the presets goes on the readout line above instead.
+        const auto Hint = [&](const char* text, uint32_t color) {
+            if (TextWidth(kFontSmall, text, S(1)) <= room)
+                Text(kFontSmall, hintX, hintY, text, color, S(1));
+            else
+                Text(kFontSmall, x + innerW - TextWidth(kFontSmall, text, S(1)), y - S(36), text, color, S(1));
+        };
         if (g_panel.listening >= 0) {
             char label[64], hint[160];
             Upper(kRows[g_panel.listening].label, label, sizeof label);
             snprintf(hint, sizeof hint, "PRESS THE NEW KEY FOR %s   \xB7   ESC CANCELS", label);
-            Text(kFontSmall, x, hintY, hint, White(1.0f), S(1));
+            Hint(hint, White(1.0f));
         } else if (now < g_panel.statusUntil) {
-            Text(kFontSmall, x, hintY, g_panel.status, White(1.0f), S(1));
+            Hint(g_panel.status, White(1.0f));
         } else {
             char hint[128];
             snprintf(hint, sizeof hint, "%s TO CLOSE   \xB7   ARROW KEYS ADJUST", KeyName(cfg.menuKey));
-            Text(kFontSmall, x, hintY, hint, kDim, S(1));
+            Hint(hint, kDim);
         }
     }
     y += buttonH + S(14);
@@ -1819,8 +2031,58 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
 
     // Our own cursor (the system one is hidden over the game window while the panel is open).
     if (in.inside) {
+        const size_t cursorBegin = g_batch.size();
         Disc(in.mx, in.my, S(6) + 1.5f, Rgba(0, 0, 0, 0.55f));
         Disc(in.mx, in.my, S(5), White(1.0f));
+        g_keepRanges.push_back({ cursorBegin, g_batch.size() });
+    }
+}
+
+// The fade (Config::fadeMenu): toward nearly see-through while a GRAPHICS slider is being dragged
+// or stepped, back when it's let go; quick out, a little slower back in.
+void UpdateFade(double now)
+{
+    const Config& cfg = GetConfig();
+    const double dt = g_panel.lastFrame > 0 ? Clamp(now - g_panel.lastFrame, 0.0, 0.1) : 0.0;
+    g_panel.lastFrame = now;
+    // For automated tests: as if the GRAPHICS tab's first slider were being stepped.
+    static const bool testFade = GetEnvironmentVariableA("MXCAM_TEST_MENU_FADE", nullptr, 0) > 0;
+    if (testFade) {
+        for (int i = 0; i < kRowCount; ++i)
+            if (kRows[i].tab == kTabGraphics && kRows[i].kind == RowKind::Slider) {
+                g_panel.adjustRow = i;
+                g_panel.adjustedAt = now;
+                break;
+            }
+    }
+    const int row = g_panel.adjustRow;
+    const bool graphicsSlider = row >= 0 && row < kRowCount && kRows[row].tab == kTabGraphics &&
+                                kRows[row].kind == RowKind::Slider && g_panel.tab == kTabGraphics;
+    const bool adjusting = cfg.fadeMenu && graphicsSlider &&
+                           (g_panel.dragging == row || (g_panel.adjustedAt >= 0 && now - g_panel.adjustedAt < kAdjustHold));
+    const float target = adjusting ? kFadedOpacity : 1.0f;
+    const double tau = target < g_panel.opacity ? 0.08 : 0.2;
+    g_panel.opacity = target + (g_panel.opacity - target) * static_cast<float>(std::exp(-dt / tau));
+    if (std::fabs(g_panel.opacity - target) < 0.002f)
+        g_panel.opacity = target;
+    if (!adjusting && g_panel.opacity >= 1.0f && g_panel.dragging != row)
+        g_panel.adjustRow = -1;
+}
+
+// Everything drawn this frame but the kept parts, at the fade's opacity.
+void ApplyFade()
+{
+    if (g_panel.opacity >= 1.0f)
+        return;
+    size_t next = 0;  // the kept ranges are in batch order
+    for (size_t v = 0; v < g_batch.size(); ++v) {
+        while (next < g_keepRanges.size() && v >= g_keepRanges[next].end)
+            ++next;
+        if (next < g_keepRanges.size() && v >= g_keepRanges[next].begin)
+            continue;
+        uint32_t& color = g_batch[v].color;
+        const uint32_t alpha = static_cast<uint32_t>((color >> 24) * g_panel.opacity + 0.5f);
+        color = (color & 0x00FFFFFFu) | (alpha << 24);
     }
 }
 
@@ -1863,6 +2125,25 @@ bool OverlayListeningForKey()
     return g_panel.listening >= 0 || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
 }
 
+bool HideGameOverlayNow(bool cursor)
+{
+    const Config& cfg = GetConfig();
+    if (!(cursor ? cfg.hideCursor : cfg.hideHud) || !SceneOnScreen() || g_menuOpen.load(std::memory_order_relaxed))
+        return false;
+    return GetTickCount64() - g_lastMouseActivity.load(std::memory_order_relaxed) > kRevealMs;
+}
+
+bool GameCursorPos(float& x, float& y)
+{
+    const HWND window = g_gameWindow.load(std::memory_order_relaxed);
+    POINT p;
+    if (!window || !GetCursorPos(&p) || !ScreenToClient(window, &p))
+        return false;
+    x = static_cast<float>(p.x);
+    y = static_cast<float>(p.y);
+    return true;
+}
+
 void OverlayFrame(HDC dc)
 {
     if (!g_glLoaded) {
@@ -1876,6 +2157,22 @@ void OverlayFrame(HDC dc)
     const Config& cfg = GetConfig();
     const bool focus = GameHasFocus();
     const HWND window = WindowFromDC(dc);
+    g_gameWindow = window;
+    NoteMouseActivity();
+    UpdateFullscreenWindow(window, cfg.fullscreenWindow);
+    // The game's cursor while riding (Config::hideCursor): if it's the system's, the window
+    // procedure keeps it hidden; it's put away here the moment hiding starts.
+    if (cfg.hideCursor && window && g_glAvailable) {
+        SubclassWindow(window);
+        static bool wasHidden = false;
+        const bool hidden = HideGameOverlayNow(true);
+        float mx = 0, my = 0;
+        RECT area;
+        if (hidden && !wasHidden && focus && GameCursorPos(mx, my) && GetClientRect(window, &area) && mx >= 0 &&
+            my >= 0 && mx < area.right && my < area.bottom)
+            SetCursor(nullptr);
+        wasHidden = hidden;
+    }
 
     // Polled every frame, even while closed, so a key held during the toggle doesn't re-fire.
     const bool menuKey = PollKey(g_keys.menu, cfg.menuKey, false, now);
@@ -1926,7 +2223,10 @@ void OverlayFrame(HDC dc)
     SaveState(saved);
     if (EnsureResources(scale)) {
         g_batch.clear();
+        g_keepRanges.clear();
+        UpdateFade(now);
         BuildPanel(width, height, in, now);
+        ApplyFade();
         DrawBatch(width, height);
     }
     RestoreState(saved);
