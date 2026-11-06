@@ -924,8 +924,12 @@ const RowDef kRows[] = {
     Toggle(1, nullptr,           "Detailed shadows",     &Config::shadowMap)
         .Help("Draws bikes, riders and objects again from the sun for full, sharp shadows, even from "
               "things off screen. Off uses cheaper screen-space shadows only."),
-    Slider(1, nullptr,           "Shadow distance",      &Config::shadowDistance,   10.0,  60.0,  1.0,    1.0,    0, " m")
-        .Help("Detailed shadows: how far around you they reach. Shorter is sharper."),
+    Slider(1, nullptr,           "Shadow distance",      &Config::shadowDistance,   5.0,   200.0, 1.0,    1.0,    0, " m")
+        .Help("Detailed shadows: how far around you they reach. Shadows near you stay sharp at any "
+              "distance; the far ones get softer the further it goes. Further costs some speed."),
+    Choice3(1, nullptr,          "Shadow resolution",    &Config::shadowResolution, "2048", "4096", "8192")
+        .Help("Detailed shadows: how sharp they are, near and far. Higher is sharper, at the cost of "
+              "graphics memory and speed (8192 is for high-end graphics cards)."),
     Slider(1, nullptr,           "Contact shadows",      &Config::shadowLength,     1.0,   20.0,  0.5,    1.0,    1, " m")
         .Help("Screen-space shadows: how far they reach from what casts them. They add shadows from "
               "the ground's own shape (ruts, jumps)."),
@@ -1509,7 +1513,7 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.timeOfDay < 0;
         if (def.number == &Config::shadowLength || def.flag == &Config::shadowMap)
             return cfg.shadows <= 0;
-        if (def.number == &Config::shadowDistance)
+        if (def.number == &Config::shadowDistance || def.option == &Config::shadowResolution)
             return cfg.shadows <= 0 || !cfg.shadowMap;
         if (def.number == &Config::headlight)
             return cfg.timeOfDay < 0;

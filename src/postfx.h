@@ -56,7 +56,13 @@ bool WantsShadowCasters();
 // any correction), anchorEye an eye-space point the object is around (its skeleton; null: its
 // origin). Gives the modelview and projection that draw it from the sun, or false when it is too
 // far away to matter.
-bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], float lightProjection[16]);
+// The map is a grid of cascades (sharper near you, wider further out): cascades gets which of them
+// the object can reach (bit i: cascade i); draw it into each with UseShadowCascade.
+bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades);
+int  ShadowCascades();
+// Between BeginShadowDraw and EndShadowDraw: draw into cascade i from now (its tile of the map),
+// with this projection (uploaded in place of the object's own).
+void UseShadowCascade(int i, float projection[16]);
 
 // Around the repeated draw: draw into the shadow map (cleared on the first of the frame), then
 // put the game's framebuffer, viewport and depth state back.
@@ -70,9 +76,54 @@ void EndShadowDraw();
 //            recognise its draw call and keep it) and program the program that drew it;
 //   Missing: not drawn, but known on your bike; viewModel is the modelview to cast the kept draw
 //            call with (in the eye space the frame is drawn from, like an uploaded u_modelview);
-//   None:    neither.
+//   None:    neither. (A wheel the game hasn't drawn yet this session, like your rear one in first
+//            person, has a shape of postfx's own standing in for it.)
 enum class WheelCast { None, Drawn, Missing };
 WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16]);
+
+// What the parts of your bike and rider the game leaves out are placed from (proc_hooks.cpp keeps
+// their draw calls while they're drawn and casts them when they aren't: in first person the game
+// draws neither your helmet nor your rear wheel and swingarm). World transforms (game units,
+// column-major), asked right before the held-back casters are drawn.
+struct OwnAnchors {
+    bool   bike = false, torso = false;  // found this frame
+    double bikeWorld[16] = {};           // your bike's model
+    double torsoWorld[16] = {};          // your rider's torso bone (it carries the head)
+    double riderPosition[3] = {};        // the middle of your rider and bike
+    double raw[16] = {};                 // the game's view this frame, and the one drawn with
+    double rendered[16] = {};
+    double unitsPerMetre = 3.2808;
+    bool   thirdPerson = false;          // the camera is metres away from your rider
+};
+bool GetOwnAnchors(OwnAnchors& out);
+
+// Something of the game's own was cast this frame in place of a stand-in shape: a part kept on your
+// torso (your helmet; piece = false: no ball for your head), or a body piece of your rider's
+// (piece = true: no torso shape).
+void NoteRiderPartCast(bool piece);
+
+// Your wheels this frame, for the trace (F11): per wheel (rear, front) found, its part seen, the part
+// far from where the wheel sits, its axle on your bike (x, y, z); the tire dirt's stretch; bike found.
+const char* WheelTraceText();
+
+// Tire dirt goes only where the game drew your wheel: each frame your wheel's own draw call is
+// drawn again, as the game drew it, into a depth mask of ours, and the dirt is put only on what the
+// picture shows of it there (never on the ground, someone else's bike, or your leg in front of it).
+// Cheap: whether the draws near the camera should be collected for it (they find your wheels'
+// draw calls for the tire dirt, drawn by the bike shader itself: proc_hooks PaintTireDirt).
+bool WantsWheelMask();
+// This frame's camera (the game's view), once the 3D scene has started.
+bool FrameRawView(double raw[16]);
+// Wheel i (0 rear, 1 front) drawn by the game this frame and taken for yours: every part of it that
+// turns about its axle (the tire, rim and spokes, the brake disc, the sprocket: the one followed can
+// be any of them, and the mask was once just the disc), each one's u_modelview as the game sent it
+// (to find its draw calls among this frame's, all programs) and its axle in its own model (the point
+// that stays put as it turns: the model's origin swings round). Returns how many (up to max).
+constexpr int kWheelMaskParts = 6;
+int WheelMaskDraws(int i, float viewModels[][16], double axleLocals[][3], int max);
+// Around drawing them again into the mask (cleared on the first of the frame).
+bool BeginWheelMask();
+void EndWheelMask();
 
 // Cheap: whether the game's lens flare (and its sun sprite) should be hidden: a time of day is
 // set, so the game's sun is in the wrong place, and at night there's no sun to flare at all.

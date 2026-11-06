@@ -223,19 +223,51 @@ struct DeferredCaster {
     GLuint   textures[kTrackedUnits] = {};
     GLint    modelviewLoc = -1, projectionLoc = -1;
     GLint    boneCountLoc = -1;  // a skinned program's u_nbones, set to 0 for this rigid draw
-    float    lightModelview[16] = {}, lightProjection[16] = {};
+    float    lightModelview[16] = {};
+    unsigned cascades = 0;       // which of the shadow map's cascades it reaches (bit i: cascade i)
+    int      bones = -1;         // >= 0: a skinned draw, its bones in g_casterBones[bones] (else rigid)
 };
 std::vector<DeferredCaster> g_deferredCasters;
+struct CasterBones {
+    int     count = 0;
+    bool    transposed = false;
+    GLfloat centre[kMaxBones * 3] = {}, position[kMaxBones * 3] = {}, rotation[kMaxBones * 9] = {};
+};
+std::vector<CasterBones> g_casterBones;  // this frame's, for the skinned held-back casters
+
+// Your rider in the shadow map. In first person the game draws fewer pieces of your rider (a capture:
+// 3 skinned draws against 8 in third person; the torso among those left out). Each skinned draw of
+// your rider is kept while the game makes it; one it leaves out is cast with your rider's bones this
+// frame, found by their rest positions (u_bone_c: the same bone has the same one in every piece).
+struct RiderDraw {
+    DeferredCaster caster;
+    CasterBones    bones;
+    GLfloat        raw[16];  // its u_modelview as the game sent it
+};
+std::vector<RiderDraw> g_riderDraws;  // this frame's skinned draws near the camera
+constexpr size_t kMaxRiderDraws = 64;
+struct KeptRiderPiece {
+    bool                used = false, loggedCast = false, loggedUnmatched = false;
+    DeferredCaster      caster;
+    std::vector<GLuint> buffers;
+    int                 count = 0;                  // its bones' rest positions, in its own order
+    GLfloat             centre[kMaxBones * 3] = {};
+    unsigned            drawnFrame = 0;
+};
+std::vector<KeptRiderPiece> g_riderPieces;
+constexpr size_t kMaxRiderPieces = 24;
 // Your bike's wheels in the shadow map (postfx::OwnWheelCast): this frame's rigid draws near the
 // camera (with the game's own u_modelview, to find a wheel's among them), and each wheel's draw call
 // kept from when the game last drew it, cast in its place on your bike when the game doesn't.
 struct NearDraw {
     DeferredCaster caster;
     GLfloat        raw[16];
+    GLfloat        uploaded[16];    // its u_modelview and projection as drawn (the tire dirt's mask
+    GLfloat        projection[16];  // draws it again exactly so)
 };
 std::vector<NearDraw> g_nearDraws;
-constexpr size_t kMaxNearDraws = 256;
-constexpr float  kNearDrawRange = 40.0f;  // game units from the camera (~12 m in feet)
+constexpr size_t kMaxNearDraws = 512;
+constexpr float  kNearDrawRange = 60.0f;  // game units from the camera (~18 m in feet; the chase camera sits ~12 m back)
 struct KeptWheel {
     bool                valid = false;
     DeferredCaster      caster;
@@ -243,6 +275,25 @@ struct KeptWheel {
     bool                loggedKept = false, loggedCast = false;
 };
 KeptWheel g_keptWheels[2];  // 0 rear, 1 front
+struct RiddenPart {
+    bool                used = false, learnt = false, loggedCast = false;
+    DeferredCaster      caster;                  // its draw call, as last drawn
+    std::vector<GLuint> buffers;                 // its vertex array's buffers (dropped if one is deleted)
+    double              rel[2][16] = {};         // on your bike (0) / on your torso (1), as last drawn
+    double              mean[2][16] = {};        // its average place there (over about half a second)
+    double              wobble[2] = { 0, 0 };    // how far it strays from that (mean square, units^2)
+    bool                haveRel[2] = { false, false };
+    double              seen = 0;                // seconds drawn near your rider
+    double              travel = 0;              // how far it has moved through the world meanwhile (units)
+    double              lastWorld[3] = {};
+    int                 anchor = -1;
+    unsigned            drawnFrame = 0;
+};
+constexpr size_t kMaxRiddenParts = 48;
+std::vector<RiddenPart> g_riddenParts;
+unsigned g_riddenFrame = 0;
+double   g_riddenTime = -1.0;
+int      g_riddenLogs = 0;
 int  g_castAtOnce = 0;          // this frame's shadow casters drawn straight away (skinned, streamed)
 bool g_loggedShadowBatch = false;  // by program; nodes stay put, so pointers last
 bool g_hidingLogged = false;
@@ -1594,8 +1645,115 @@ void APIENTRY Wrap_glDeleteSamplers(GLsizei count, const GLuint* samplers)
 }
 
 // DumpShaders=1: every shader source the game compiles goes to mxcam_shaders\shader_<id>.glsl.
+// ---- Tire dirt in the game's own drawing of your tires -----------------------------------------
+// The mud goes into the bike shader itself: its vertex shader passes each point's place in its own
+// model on (a wheel's turns with it), and its fragment shader mixes mud onto the dark rubber of the
+// tire's own texture (a dusting on metal) when u_mx_mud is set, which it is only while your wheels
+// are drawn (see PaintTireDirt). Nothing on screen is guessed: it can't land on the ground, the
+// disc or another bike. A shader that doesn't compile changed is handed over unchanged.
+constexpr char kMudVertexDecl[] = "out vec3 mx_pos;\n";
+constexpr char kMudFragmentDecl[] =
+    "in vec3 mx_pos;\n"
+    "uniform float u_mx_mud;\n"
+    "uniform float u_mx_metre;\n"
+    "highp float mx_hash(highp vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }\n"
+    "highp float mx_noise(highp vec3 x) {\n"
+    "    highp vec3 i = floor(x); highp vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);\n"
+    "    return mix(mix(mix(mx_hash(i), mx_hash(i + vec3(1.0, 0.0, 0.0)), f.x),\n"
+    "                   mix(mx_hash(i + vec3(0.0, 1.0, 0.0)), mx_hash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),\n"
+    "               mix(mix(mx_hash(i + vec3(0.0, 0.0, 1.0)), mx_hash(i + vec3(1.0, 0.0, 1.0)), f.x),\n"
+    "                   mix(mx_hash(i + vec3(0.0, 1.0, 1.0)), mx_hash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);\n"
+    "}\n";
+// (The game's colours are not linear: mud in its terms.)
+constexpr char kMudFragmentApply[] =
+    "\tif (u_mx_mud > 0.0) {\n"
+    "\t\tvec4 mx_albedo = texture(u_tex, interp_texcoord);\n"
+    "\t\tfloat mx_rubber = 1.0 - smoothstep(0.35, 0.55, dot(mx_albedo.rgb, vec3(0.2126, 0.7152, 0.0722)));\n"
+    "\t\thighp vec3 mx_q = mx_pos * (13.0 / u_mx_metre);\n"
+    "\t\tfloat mx_n = mx_noise(mx_q) * 0.6 + mx_noise(mx_q * 2.4 + 7.0) * 0.4;\n"
+    "\t\tfloat mx_edge = 0.75 - 0.6 * u_mx_mud;\n"
+    "\t\tfloat mx_cover = mx_rubber * smoothstep(mx_edge, mx_edge + 0.1, mx_n);\n"
+    "\t\tmx_cover = max(mx_cover, (1.0 - mx_rubber) * 0.3 * u_mx_mud * smoothstep(0.5, 0.75, mx_n));\n"
+    "\t\tvec3 mx_mud = mix(vec3(0.24, 0.18, 0.13), vec3(0.37, 0.29, 0.21), mx_noise(mx_q * 0.45 + 3.0));\n"
+    "\t\tcolor.rgb = mix(color.rgb, mx_mud * (u_ambient.rgb + u_diffuse.rgb * ndl), mx_cover);\n"
+    "\t}\n";
+bool g_loggedMudShader[2] = { false, false };
+
+// Whether the changed source compiles (on a shader of our own; the game's is untouched until then).
+bool CompilesAs(GLenum type, const std::string& source)
+{
+    using PFN_CreateShader = GLuint(APIENTRY*)(GLenum);
+    using PFN_CompileShader = void(APIENTRY*)(GLuint);
+    using PFN_GetShaderiv = void(APIENTRY*)(GLuint, GLenum, GLint*);
+    using PFN_DeleteShader = void(APIENTRY*)(GLuint);
+    static const auto create = reinterpret_cast<PFN_CreateShader>(GetRealGLFunction("glCreateShader"));
+    static const auto compile = reinterpret_cast<PFN_CompileShader>(GetRealGLFunction("glCompileShader"));
+    static const auto get = reinterpret_cast<PFN_GetShaderiv>(GetRealGLFunction("glGetShaderiv"));
+    static const auto remove = reinterpret_cast<PFN_DeleteShader>(GetRealGLFunction("glDeleteShader"));
+    if (!create || !compile || !get || !remove || !real_glShaderSource)
+        return false;
+    const GLuint test = create(type);
+    if (!test)
+        return false;
+    const GLchar* text = source.c_str();
+    real_glShaderSource(test, 1, &text, nullptr);
+    compile(test);
+    GLint ok = 0;
+    get(test, 0x8B81 /* GL_COMPILE_STATUS */, &ok);
+    remove(test);
+    return ok != 0;
+}
+
+// The bike shaders, changed for the tire dirt (empty: not one of them, or it didn't compile).
+std::string MudShader(GLuint shader, const std::string& source)
+{
+    const bool vertex = source.find("u_bone_t") != std::string::npos && source.find("vattr_position") != std::string::npos &&
+                        source.find("interp_texcoord = vattr_texcoord;") != std::string::npos &&
+                        source.find("out vec2 interp_texcoord;") != std::string::npos;
+    const bool fragment = source.find("uniform sampler2D u_tex, u_nmap, u_smap;") != std::string::npos &&
+                          source.find("z = gl_FragCoord.z / gl_FragCoord.w;") != std::string::npos &&
+                          source.find("out vec4 f_fragcolor;") != std::string::npos &&
+                          source.find("ndl = dot(n, light);") != std::string::npos;
+    if (!vertex && !fragment)
+        return std::string();
+    std::string changed = source;
+    if (vertex) {
+        changed.insert(changed.find("out vec2 interp_texcoord;") + strlen("out vec2 interp_texcoord;") + 1, kMudVertexDecl);
+        const size_t at = changed.find("interp_texcoord = vattr_texcoord;");
+        changed.insert(at + strlen("interp_texcoord = vattr_texcoord;"), "\n\tmx_pos = vattr_position;");
+    } else {
+        changed.insert(changed.find("out vec4 f_fragcolor;") + strlen("out vec4 f_fragcolor;") + 1, kMudFragmentDecl);
+        changed.insert(changed.find("\tz = gl_FragCoord.z / gl_FragCoord.w;"), kMudFragmentApply);
+    }
+    using PFN_GetShaderiv = void(APIENTRY*)(GLuint, GLenum, GLint*);
+    static const auto get = reinterpret_cast<PFN_GetShaderiv>(GetRealGLFunction("glGetShaderiv"));
+    GLint type = vertex ? 0x8B31 : 0x8B30;  // GL_VERTEX_SHADER / GL_FRAGMENT_SHADER
+    if (get)
+        get(shader, 0x8B4F /* GL_SHADER_TYPE */, &type);
+    const bool ok = CompilesAs(static_cast<GLenum>(type), changed);
+    bool& logged = g_loggedMudShader[vertex ? 0 : 1];
+    if (!logged) {
+        logged = true;
+        Log("tire dirt: the bike's %s shader %s", vertex ? "vertex" : "fragment",
+            ok ? "carries the tire dirt (drawn on your tires themselves)" : "didn't compile changed: left as it was, no tire dirt");
+    }
+    return ok ? changed : std::string();
+}
+
 void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* const* strings, const GLint* lengths)
 {
+    if (strings && count > 0) {
+        std::string source;
+        for (GLsizei i = 0; i < count; ++i)
+            if (strings[i])
+                source.append(strings[i], lengths && lengths[i] >= 0 ? static_cast<size_t>(lengths[i]) : strlen(strings[i]));
+        const std::string changed = MudShader(shader, source);
+        if (!changed.empty()) {
+            const GLchar* text = changed.c_str();
+            real_glShaderSource(shader, 1, &text, nullptr);
+            return;
+        }
+    }
     if (GetConfig().dumpShaders && strings && count > 0) {
         wchar_t path[1024];
         swprintf_s(path, L"%smxcam_shaders", LogDirectory());
@@ -1679,6 +1837,24 @@ void DropKeptWheels(GLsizei count, const GLuint* names, bool vertexArrays)
             if (vertexArrays ? names[n] == kept.caster.vao
                              : std::find(kept.buffers.begin(), kept.buffers.end(), names[n]) != kept.buffers.end())
                 kept.valid = false;
+        }
+    }
+    for (KeptRiderPiece& piece : g_riderPieces) {
+        for (GLsizei n = 0; n < count && piece.used; ++n) {
+            if (names[n] == 0)
+                continue;
+            if (vertexArrays ? names[n] == piece.caster.vao
+                             : std::find(piece.buffers.begin(), piece.buffers.end(), names[n]) != piece.buffers.end())
+                piece.used = false;
+        }
+    }
+    for (RiddenPart& part : g_riddenParts) {
+        for (GLsizei n = 0; n < count && part.used; ++n) {
+            if (names[n] == 0)
+                continue;
+            if (vertexArrays ? names[n] == part.caster.vao
+                             : std::find(part.buffers.begin(), part.buffers.end(), names[n]) != part.buffers.end())
+                part.used = false;
         }
     }
 }
@@ -1765,7 +1941,9 @@ void StartTrace(double seconds)
                      "raw_yaw,raw_pitch,raw_roll,bike_yaw,bike_pitch,bike_roll,view_yaw,view_pitch,view_roll,"
                      "lag_deg,look_yaw,air_yaw,apex_deg,air,fall_g,accel_up_g,neck_mm,"
                      "cam_x,cam_y,cam_z,eye_dx,eye_dy,eye_dz,bike_x,bike_y,bike_z,"
-                     "away_deg,ground_passes,ground_game,ground_filled,ground_open,ground_note\n");
+                     "away_deg,ground_passes,ground_game,ground_filled,ground_open,ground_note,"
+                     "rear_on,rear_seen,rear_far,rear_x,rear_y,rear_z,front_on,front_seen,front_far,front_x,front_y,front_z,"
+                     "tire_stretch,bike_found\n");
     // Times are relative to the key press: the history before it is negative.
     const double now = camera::ContentTime();
     g_traceFrames = 0;
@@ -1800,8 +1978,8 @@ void TraceFrame(bool captured)
 
     const camera::Telemetry& t = camera::LastTelemetry();
     const bike::Pose& pose = bike::Current();
-    if (!captured) {
-        snprintf(line.text, sizeof line.text, "no camera\n");
+    if (!captured) {  // (the camera mod off or no camera: the wheels still, for the tire marks and dirt)
+        snprintf(line.text, sizeof line.text, "no camera,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,%s\n", postfx::WheelTraceText());
     } else if (replay::Current() != replay::Mode::Off) {
         replay::Describe(line.text, sizeof line.text - 1);
         strcat_s(line.text, "\n");
@@ -1811,7 +1989,7 @@ void TraceFrame(bool captured)
             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.3f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-            "%.1f,%d,%d,%d,%d,%s\n",
+            "%.1f,%d,%d,%d,%d,%s,%s\n",
             t.rawIntervalMs, t.dtMs, g_camera.previews, g_camera.otherRotations,
             t.cut ? 1 : 0, t.reset ? 1 : 0, t.bikeTracked ? 1 : 0, t.bikeFresh ? 1 : 0, t.customWeight,
             t.rawYaw, t.rawPitch, t.rawRoll, t.bikeYaw, t.bikePitch, t.bikeRoll, t.outYaw, t.outPitch, t.outRoll,
@@ -1819,7 +1997,7 @@ void TraceFrame(bool captured)
             t.rawPos[0], t.rawPos[1], t.rawPos[2], t.eyeOffset[0], t.eyeOffset[1], t.eyeOffset[2],
             pose.worldPosition[0], pose.worldPosition[1], pose.worldPosition[2],
             g_ground.awayDeg, g_ground.passes, g_ground.game, g_ground.filled, g_ground.open,
-            g_ground.note[0] ? g_ground.note : "-");
+            g_ground.note[0] ? g_ground.note : "-", postfx::WheelTraceText());
     }
 
     if (!g_trace)
@@ -1849,14 +2027,22 @@ bool Streamed(GLuint buffer)
 
 // Whether this draw can be repeated later in the frame (or a later frame) exactly as it is now:
 // rigid, its geometry in buffers nothing rewrites while running.
+bool StaticBuffers(const DrawCall& draw);
+
 bool StaticDraw(const DrawCall& draw)
 {
-    if (g_vao == 0 || g_activeUnit < 0 || g_activeUnit >= 16)
-        return false;
     // A skinned mesh's bones change from draw to draw; the same programs' rigid draws (no bones)
     // are fine: they're repeated with no bones again.
     const SkinnedProgram* skin = FindSkinned(g_program);
     if (skin && skin->positionLoc >= 0 && skin->bones != 0)
+        return false;
+    return StaticBuffers(draw);
+}
+
+// Its geometry in buffers nothing rewrites while running, so the same draw call draws it later.
+bool StaticBuffers(const DrawCall& draw)
+{
+    if (g_vao == 0 || g_activeUnit < 0 || g_activeUnit >= 16)
         return false;
     const auto buffers = g_vaoArrayBuffers.find(g_vao);
     if (buffers == g_vaoArrayBuffers.end() || buffers->second.empty())
@@ -1919,9 +2105,37 @@ void CastShadow(const DrawCall& draw)
         NearDraw candidate;
         candidate.caster = MakeCaster(draw, mv->second.location, projection->second.location);
         std::copy(raw, raw + 16, candidate.raw);
+        std::copy(mv->second.uploaded, mv->second.uploaded + 16, candidate.uploaded);
+        std::copy(projection->second.value, projection->second.value + 16, candidate.projection);
         g_nearDraws.push_back(candidate);
     }
+    // Skinned draws near the camera (your rider's pieces among them, see CastRiderPieces), with
+    // the game's own bones.
+    if (const SkinnedProgram* skin = FindSkinned(g_program)) {
+        const int n = skin->bones;
+        if (n >= 2 && n <= kMaxBones && skin->centres >= n && skin->positions >= n && skin->rotations >= n &&
+            skin->centreLoc >= 0 && skin->positionLoc >= 0 && skin->rotationLoc >= 0 && skin->countLoc >= 0 &&
+            g_riderDraws.size() < kMaxRiderDraws && StaticBuffers(draw)) {
+            const GLfloat* m = raw;
+            const GLfloat* b = skin->position;
+            const float x = m[0] * b[0] + m[4] * b[1] + m[8] * b[2] + m[12], y = m[1] * b[0] + m[5] * b[1] + m[9] * b[2] + m[13],
+                        z = m[2] * b[0] + m[6] * b[1] + m[10] * b[2] + m[14];
+            if (x * x + y * y + z * z < kNearDrawRange * kNearDrawRange) {
+                g_riderDraws.emplace_back();
+                RiderDraw& r = g_riderDraws.back();
+                r.caster = MakeCaster(draw, mv->second.location, projection->second.location);
+                r.bones.count = n;
+                r.bones.transposed = skin->transposed;
+                std::copy(skin->centre, skin->centre + n * 3, r.bones.centre);
+                std::copy(skin->position, skin->position + n * 3, r.bones.position);
+                std::copy(skin->rotation, skin->rotation + n * 9, r.bones.rotation);
+                std::copy(raw, raw + 16, r.raw);
+            }
+        }
+    }
 
+    if (!postfx::WantsShadowCasters())
+        return;  // (collected for the tire dirt's mask only)
     // Riders are skinned: their bones are placed in the world, and the modelview is the bare view.
     float anchor[3];
     const float* anchorEye = nullptr;
@@ -1934,8 +2148,9 @@ void CastShadow(const DrawCall& draw)
             anchorEye = anchor;
         }
     }
-    float lightModelview[16], lightProjection[16];
-    if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, lightProjection))
+    float lightModelview[16];
+    unsigned cascades = 0;
+    if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, &cascades))
         return;
 
     // Static scenery (not skinned, its geometry in buffers nothing rewrites while running): held
@@ -1943,7 +2158,7 @@ void CastShadow(const DrawCall& draw)
     if (CanHoldBack(draw)) {
         DeferredCaster c = MakeCaster(draw, mv->second.location, projection->second.location);
         std::copy(lightModelview, lightModelview + 16, c.lightModelview);
-        std::copy(lightProjection, lightProjection + 16, c.lightProjection);
+        c.cascades = cascades;
         if (g_deferredCasters.size() < 8192) {
             g_deferredCasters.push_back(c);
             return;
@@ -1965,10 +2180,21 @@ void CastShadow(const DrawCall& draw)
         UploadSkinnedVectors(hiddenBody->positionLoc, hiddenBody->positions, hiddenBody->position, hiddenBody->positionArb);
         UploadSkinnedRotations(hiddenBody->rotationLoc, hiddenBody->rotations, hiddenBody->transposed,
                                hiddenBody->rotation, hiddenBody->rotationArb);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log("postfx: shadow map: your hidden torso still casts its shadow (program %u)", g_program);
+        }
     }
     upload(mv->second.location, 1, GL_FALSE, lightModelview);
-    upload(projection->second.location, 1, GL_FALSE, lightProjection);
-    Replay(draw);
+    for (int i = 0; i < postfx::ShadowCascades(); ++i) {  // into each cascade it reaches
+        if (!(cascades & (1u << i)))
+            continue;
+        float lightProjection[16];
+        postfx::UseShadowCascade(i, lightProjection);
+        upload(projection->second.location, 1, GL_FALSE, lightProjection);
+        Replay(draw);
+    }
     upload(mv->second.location, 1, GL_FALSE, mv->second.uploaded);
     upload(projection->second.location, 1, GL_FALSE, projection->second.value);
     if (hiddenBody) {
@@ -1980,13 +2206,663 @@ void CastShadow(const DrawCall& draw)
     postfx::EndShadowDraw();
 }
 
+// ---- Parts of your bike and rider the game leaves out ---------------------------------------
+// In first person the game doesn't draw your helmet, your rear wheel or the swingarm (a capture:
+// 7 rigid parts around your rider in third person, 4 in first), so they'd cast no shadow. While the
+// game draws a part that rides on your torso bone (the helmet: it keeps still there while the torso
+// moves about on the bike), its draw call is kept with where it sits there; when the game leaves it
+// out, it's cast from there with the held-back casters. (Parts that keep still on the bike aren't:
+// another rider alongside can too. postfx draws shapes of its own for the back of your bike.)
+
+bool SameDrawCall(const DeferredCaster& a, const DeferredCaster& b)
+{
+    return a.program == b.program && a.vao == b.vao && a.elementBuffer == b.elementBuffer && a.draw.kind == b.draw.kind &&
+           a.draw.mode == b.draw.mode && a.draw.count == b.draw.count && a.draw.type == b.draw.type &&
+           a.draw.indices == b.draw.indices && a.draw.first == b.draw.first && a.draw.start == b.draw.start &&
+           a.draw.end == b.draw.end;
+}
+
+// Column-major 4 x 4 (affine) helpers.
+void Mul4(const double a[16], const double b[16], double out[16])
+{
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r) {
+            double sum = 0;
+            for (int k = 0; k < 4; ++k)
+                sum += a[k * 4 + r] * b[c * 4 + k];
+            out[c * 4 + r] = sum;
+        }
+}
+
+bool InverseAffine(const double m[16], double out[16])
+{
+    const double a = m[0], b = m[4], c = m[8], d = m[1], e = m[5], f = m[9], g = m[2], h = m[6], i = m[10];
+    const double A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    const double det = a * A + b * B + c * C;
+    if (std::fabs(det) < 1e-12)
+        return false;
+    const double s = 1.0 / det;
+    const double inv[9] = { A * s, -(b * i - c * h) * s, (b * f - c * e) * s,
+                            B * s, (a * i - c * g) * s, -(a * f - c * d) * s,
+                            C * s, -(a * h - b * g) * s, (a * e - b * d) * s };  // row-major
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 3; ++k)
+            out[k * 4 + r] = inv[r * 3 + k];
+        out[12 + r] = -(inv[r * 3] * m[12] + inv[r * 3 + 1] * m[13] + inv[r * 3 + 2] * m[14]);
+        out[r * 4 + 3] = 0;
+    }
+    out[15] = 1;
+    return true;
+}
+
+// How far apart two placements are: their origins (units) and their axes (about radians).
+void Apart(const double a[16], const double b[16], double* move, double* turn)
+{
+    const double dx = a[12] - b[12], dy = a[13] - b[13], dz = a[14] - b[14];
+    *move = std::sqrt(dx * dx + dy * dy + dz * dz);
+    *turn = 0;
+    for (int c = 0; c < 3; ++c) {
+        const double x = a[c * 4] - b[c * 4], y = a[c * 4 + 1] - b[c * 4 + 1], z = a[c * 4 + 2] - b[c * 4 + 2];
+        *turn = std::max(*turn, std::sqrt(x * x + y * y + z * z));
+    }
+}
+
+void UpdateRiddenParts(const postfx::OwnAnchors& own)
+{
+    const double now = camera::ContentTime();
+    const double dt = g_riddenTime >= 0 ? std::min(std::max(now - g_riddenTime, 0.0), 0.1) : 0.0;
+    g_riddenTime = now;
+    ++g_riddenFrame;
+    double invRaw[16], invAnchor[2][16];
+    if (!InverseAffine(own.raw, invRaw))
+        return;
+    const bool have[2] = { own.bike && InverseAffine(own.bikeWorld, invAnchor[0]),
+                           own.torso && InverseAffine(own.torsoWorld, invAnchor[1]) };
+    const double u = own.unitsPerMetre;
+    // How far a part may stray and still ride on it: the torso carries the helmet exactly; the
+    // bike's swingarm moves a little with the suspension.
+    const double kAllowed[2] = { 0.10 * u, 0.03 * u };
+
+    for (const NearDraw& drawn : g_nearDraws) {
+        const SkinnedProgram* skin = FindSkinned(drawn.caster.program);
+        if (!skin || skin->positionLoc < 0)
+            continue;  // only the game's model shaders (riders and bikes), not its sprites
+        double vm[16], world[16];
+        for (int i = 0; i < 16; ++i)
+            vm[i] = drawn.raw[i];
+        Mul4(invRaw, vm, world);
+        const double dx = world[12] - own.riderPosition[0], dy = world[13] - own.riderPosition[1],
+                     dz = world[14] - own.riderPosition[2];
+        if (dx * dx + dy * dy + dz * dz > (2.5 * u) * (2.5 * u))
+            continue;  // not part of your bike or rider
+        double rel[2][16];
+        for (int a = 0; a < 2; ++a)
+            if (have[a])
+                Mul4(invAnchor[a], world, rel[a]);
+
+        // Which part: the same draw call, in the same place on you (other bikes can share the model).
+        RiddenPart* part = nullptr;
+        double best = 0.5 * u;
+        for (RiddenPart& p : g_riddenParts) {
+            if (!p.used || p.drawnFrame == g_riddenFrame || !SameDrawCall(p.caster, drawn.caster))
+                continue;
+            const int a = have[1] && p.haveRel[1] ? 1 : have[0] && p.haveRel[0] ? 0 : -1;
+            double move = 0, turn = 0;
+            if (a >= 0)
+                Apart(rel[a], p.rel[a], &move, &turn);
+            if (move < best) {
+                best = move;
+                part = &p;
+            }
+        }
+        if (!part) {
+            for (RiddenPart& p : g_riddenParts)
+                if (!p.used) {
+                    part = &p;
+                    break;
+                }
+            if (!part) {
+                if (g_riddenParts.size() >= kMaxRiddenParts)
+                    continue;
+                g_riddenParts.emplace_back();
+                part = &g_riddenParts.back();
+            }
+            *part = RiddenPart{};
+            part->used = true;
+        }
+        RiddenPart& p = *part;
+        p.caster = drawn.caster;
+        const auto buffers = g_vaoArrayBuffers.find(drawn.caster.vao);
+        p.buffers = buffers != g_vaoArrayBuffers.end() ? buffers->second : std::vector<GLuint>{};
+        if (drawn.caster.elementBuffer)
+            p.buffers.push_back(drawn.caster.elementBuffer);
+        p.drawnFrame = g_riddenFrame;
+        if (p.seen > 0) {
+            const double mx = world[12] - p.lastWorld[0], my = world[13] - p.lastWorld[1], mz = world[14] - p.lastWorld[2];
+            p.travel += std::sqrt(mx * mx + my * my + mz * mz);
+        }
+        p.lastWorld[0] = world[12];
+        p.lastWorld[1] = world[13];
+        p.lastWorld[2] = world[14];
+        p.seen += std::max(dt, 1e-6);
+        const double k = 1.0 - std::exp(-dt / 0.5);
+        double score[2] = { 1e9, 1e9 };  // its wobble there against what's allowed there (under 1: rides on it)
+        for (int a = 0; a < 2; ++a) {
+            if (!have[a])
+                continue;
+            if (!p.haveRel[a]) {
+                std::copy(rel[a], rel[a] + 16, p.mean[a]);
+                p.wobble[a] = 0;
+            } else {
+                double move = 0, turn = 0;
+                Apart(rel[a], p.mean[a], &move, &turn);
+                const double off = move + 0.5 * u * turn;
+                p.wobble[a] += (off * off - p.wobble[a]) * k;
+                for (int i = 0; i < 16; ++i)
+                    p.mean[a][i] += (rel[a][i] - p.mean[a][i]) * k;
+            }
+            std::copy(rel[a], rel[a] + 16, p.rel[a]);
+            p.haveRel[a] = true;
+            score[a] = std::sqrt(p.wobble[a]) / kAllowed[a];
+        }
+        // On whichever it keeps still on, once it's been seen long enough to tell: clearly stiller
+        // there than on the other (the torso moves about on the bike as you ride), or still on both
+        // for a long while, or the other isn't found. And only once it has gone 2 m with you: an
+        // object standing beside you (the start gate, a block) keeps still on you too while you wait.
+        // Only parts that ride on your torso (your helmet) are learnt. Parts that keep still on your
+        // bike can be someone else's: a rider alongside at your speed off the start gate kept still
+        // on it and travelled with you, and cast as a block beside your shadow.
+        // And only while the camera is really in third person (metres away: the only time the game
+        // draws your helmet); a camera close behind you (a replay, another view) once taught small
+        // parts that then floated behind your shadow's head.
+        if (own.thirdPerson && p.seen >= 0.75 && p.travel >= 2.0 * u && score[1] < 1.0 && have[0] &&
+            score[0] > 2.0 * score[1] + 0.3)
+            p.anchor = 1;
+        p.learnt = p.anchor >= 0 && p.haveRel[p.anchor];
+    }
+
+    // The learnt parts the game didn't draw this frame: cast where they sit.
+    for (RiddenPart& p : g_riddenParts) {
+        if (!p.used || !p.learnt || p.drawnFrame == g_riddenFrame || !have[p.anchor])
+            continue;
+        if (g_deferredCasters.size() >= 8192)
+            break;
+        double world[16], eye[16];
+        Mul4(p.anchor == 1 ? own.torsoWorld : own.bikeWorld, p.rel[p.anchor], world);
+        Mul4(own.rendered, world, eye);
+        float viewModel[16];
+        for (int i = 0; i < 16; ++i)
+            viewModel[i] = static_cast<float>(eye[i]);
+        DeferredCaster c = p.caster;
+        if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, &c.cascades))
+            continue;
+        g_deferredCasters.push_back(c);
+        if (p.anchor == 1)
+            postfx::NoteRiderPartCast(false);
+        if (!p.loggedCast && g_riddenLogs < 20) {
+            p.loggedCast = true;
+            ++g_riddenLogs;
+            Log("postfx: shadow map: a part of your %s the game doesn't draw here casts its shadow anyway (program %u, %d indices)",
+                p.anchor == 1 ? "rider (on the torso: the helmet)" : "bike", p.caster.program, p.caster.draw.count);
+        }
+    }
+}
+
+// The tire dirt's mask (postfx::WheelMaskDraw): each of your wheels the game drew this frame, every
+// draw call of it (all programs: its tire, its shiny parts), drawn again as it was into the mask.
+// Once a wheel's parts are known they're found every frame by themselves, not only while the wheel
+// tracker holds your wheel (the dirt went whenever it let go): each the same draw call where its
+// axle was last frame, moved as far as your rider moved since (within the suspension's travel), so
+// another bike's identical wheel isn't it.
+struct MaskPart {
+    DeferredCaster id;
+    double         axleLocal[3] = {};  // its axle in its own model (its origin swings round as it turns)
+    double         world[3] = {};      // its axle last frame (world), and your rider then
+    double         rider[3] = {};
+};
+struct MaskWheel {
+    int      count = 0;
+    MaskPart parts[postfx::kWheelMaskParts];
+};
+MaskWheel g_maskWheels[2];
+
+// The rest of a wheel: the brake disc, the sprocket, whatever is bolted to it, drawn as models of
+// their own. A draw that keeps exactly its place on the wheel frame after frame while the wheel
+// turns is part of it (the frame and fork don't: the wheel turns against them; another bike's wheel
+// doesn't stay locked to yours). (Each part's own axle estimate is no good for this: small parts
+// spinning fast are followed poorly, and the mask was once the disc alone.)
+struct WheelMember {
+    DeferredCaster id;
+    double         rel[16] = {};   // its transform on the wheel's
+    int            steady = 0;     // frames in a row it kept it while the wheel turned
+    unsigned       seenFrame = 0;
+};
+std::vector<WheelMember> g_wheelMembers[2];
+double   g_lastWheelWorld[2][16] = {};
+bool     g_haveLastWheel[2] = { false, false };
+unsigned g_memberFrame = 0;
+
+void FindWheelMembers(int i, const NearDraw& main, const double invRaw[16], double unitsPerMetre,
+                      std::vector<const NearDraw*>& draws)
+{
+    double vm[16], wheel[16], invWheel[16];
+    for (int k = 0; k < 16; ++k)
+        vm[k] = main.raw[k];
+    Mul4(invRaw, vm, wheel);
+    if (!InverseAffine(wheel, invWheel))
+        return;
+    // Turning (a part still on a wheel that stands still is still on anything else still too).
+    bool turning = false;
+    if (g_haveLastWheel[i]) {
+        double move = 0, turn = 0;
+        Apart(wheel, g_lastWheelWorld[i], &move, &turn);
+        turning = turn > 0.05;
+    }
+    std::copy(wheel, wheel + 16, g_lastWheelWorld[i]);
+    g_haveLastWheel[i] = true;
+    std::vector<WheelMember>& members = g_wheelMembers[i];
+    std::vector<bool> taken(g_nearDraws.size(), false);
+    const double reach = 4.0 * unitsPerMetre;
+    const auto RelOf = [&](const NearDraw& d, double rel[16]) {
+        double dv[16], world[16];
+        for (int k = 0; k < 16; ++k)
+            dv[k] = d.raw[k];
+        Mul4(invRaw, dv, world);
+        Mul4(invWheel, world, rel);
+    };
+    // The known ones: each the draw of its kind nearest its place on the wheel.
+    for (WheelMember& m : members) {
+        int best = -1;
+        double bestMove = 1e9, bestTurn = 1e9, bestRel[16];
+        for (size_t k = 0; k < g_nearDraws.size(); ++k) {
+            const NearDraw& d = g_nearDraws[k];
+            if (taken[k] || !SameDrawCall(d.caster, m.id) || std::equal(d.raw, d.raw + 16, main.raw))
+                continue;
+            double rel[16], move = 0, turn = 0;
+            RelOf(d, rel);
+            Apart(rel, m.rel, &move, &turn);
+            if (move < bestMove) {
+                bestMove = move;
+                bestTurn = turn;
+                best = static_cast<int>(k);
+                std::copy(rel, rel + 16, bestRel);
+            }
+        }
+        if (best < 0)
+            continue;
+        taken[static_cast<size_t>(best)] = true;
+        m.seenFrame = g_memberFrame;
+        const bool kept = bestMove < 0.03 * unitsPerMetre && bestTurn < 0.03;
+        if (!kept)
+            m.steady = 0;
+        else if (turning)
+            ++m.steady;
+        std::copy(bestRel, bestRel + 16, m.rel);
+        if (m.steady >= 5)
+            for (const NearDraw& d : g_nearDraws)  // every program's copy of it
+                if (std::equal(d.raw, d.raw + 16, g_nearDraws[static_cast<size_t>(best)].raw))
+                    draws.push_back(&d);
+    }
+    // Candidates: the other rigid draws close to the wheel, while it turns.
+    if (turning) {
+        for (size_t k = 0; k < g_nearDraws.size() && members.size() < 24; ++k) {
+            const NearDraw& d = g_nearDraws[k];
+            if (taken[k] || std::equal(d.raw, d.raw + 16, main.raw))
+                continue;
+            double rel[16];
+            RelOf(d, rel);
+            if (std::sqrt(rel[12] * rel[12] + rel[13] * rel[13] + rel[14] * rel[14]) > reach)
+                continue;
+            bool known = false;
+            for (const WheelMember& m : members)
+                known = known || SameDrawCall(m.id, d.caster);
+            if (known)
+                continue;
+            WheelMember m;
+            m.id = d.caster;
+            std::copy(rel, rel + 16, m.rel);
+            m.seenFrame = g_memberFrame;
+            members.push_back(m);
+            taken[k] = true;
+        }
+    }
+    // Forget the ones gone a while.
+    for (size_t k = 0; k < members.size();)
+        if (g_memberFrame - members[k].seenFrame > 120)
+            members.erase(members.begin() + static_cast<std::ptrdiff_t>(k));
+        else
+            ++k;
+}
+
+// Your wheels' draw calls as last found (DrawWheelMasks), for PaintTireDirt: each draw of one this
+// frame is the same call with your wheel's axle where it should be by now.
+struct PaintPart {
+    DeferredCaster id;
+    double         axleLocal[3] = {};
+    double         world[3] = {}, velocity[3] = {};
+};
+std::vector<PaintPart> g_paintParts;
+double g_paintTime = 0, g_paintUnits = 3.2808;
+double g_paintAxle[2][3] = {}, g_paintAxleTime[2] = {};
+bool   g_havePaintAxle[2] = { false, false };
+std::unordered_map<GLuint, GLint> g_mudUniform;   // program -> u_mx_mud (-1: none)
+std::unordered_map<GLuint, float> g_mudSet;       // program -> what it holds
+
+// Right before each draw: u_mx_mud on for your wheels' draws, off for everything else.
+void PaintTireDirt(const DrawCall& draw)
+{
+    auto at = g_mudUniform.find(g_program);
+    if (at == g_mudUniform.end()) {
+        const GLint location = real_glGetUniformLocation ? real_glGetUniformLocation(g_program, "u_mx_mud") : -1;
+        at = g_mudUniform.emplace(g_program, location).first;
+        g_mudSet[g_program] = 0.0f;
+    }
+    if (at->second < 0 || !real_glUniform1f)
+        return;
+    const Config& cfg = GetConfig();
+    float want = 0.0f;
+    double raw[16];
+    const auto mv = g_programModelview.find(g_program);
+    if (cfg.shaders && cfg.tireDirt > 0.0 && !g_paintParts.empty() && postfx::FrameRawView(raw) && mv != g_programModelview.end() &&
+        mv->second.frame == g_frameNumber) {
+        const DeferredCaster id = MakeCaster(draw, -1, -1);
+        double invRaw[16];
+        if (InverseAffine(raw, invRaw)) {
+            const double ahead = camera::ContentTime() - g_paintTime;
+            for (const PaintPart& part : g_paintParts) {
+                if (!SameDrawCall(part.id, id))
+                    continue;
+                double dv[16], world[16];
+                for (int e = 0; e < 16; ++e)
+                    dv[e] = mv->second.raw[e];
+                Mul4(invRaw, dv, world);
+                double d2 = 0;
+                for (int r = 0; r < 3; ++r) {
+                    const double x = world[r] * part.axleLocal[0] + world[4 + r] * part.axleLocal[1] + world[8 + r] * part.axleLocal[2] +
+                                     world[12 + r];
+                    const double expected = part.world[r] + part.velocity[r] * ahead;
+                    d2 += (x - expected) * (x - expected);
+                }
+                if (d2 < (0.5 * g_paintUnits) * (0.5 * g_paintUnits)) {
+                    want = static_cast<float>(cfg.tireDirt);
+                    break;
+                }
+            }
+        }
+    }
+    float& set = g_mudSet[g_program];
+    if (want != set) {
+        real_glUniform1f(at->second, want);
+        if (want > 0.0f && real_glGetUniformLocation) {
+            const GLint metre = real_glGetUniformLocation(g_program, "u_mx_metre");
+            if (metre >= 0)
+                real_glUniform1f(metre, static_cast<float>(g_paintUnits));
+        }
+        set = want;
+    }
+}
+
+void DrawWheelMasks(const postfx::OwnAnchors* own)
+{
+    ++g_memberFrame;
+    std::vector<PaintPart> paint;
+    double invRaw[16];
+    const bool frame = own && InverseAffine(own->raw, invRaw);
+    const auto Axle = [&](const NearDraw& d, const double local[3], double out[3]) {
+        double vm[16], world[16];
+        for (int k = 0; k < 16; ++k)
+            vm[k] = d.raw[k];
+        Mul4(invRaw, vm, world);
+        for (int r = 0; r < 3; ++r)
+            out[r] = world[r] * local[0] + world[4 + r] * local[1] + world[8 + r] * local[2] + world[12 + r];
+    };
+    std::vector<const NearDraw*> draws;
+    for (int i = 0; i < 2; ++i) {
+        MaskWheel& m = g_maskWheels[i];
+        float viewModels[postfx::kWheelMaskParts][16];
+        double axleLocals[postfx::kWheelMaskParts][3];
+        const int given = postfx::WheelMaskDraws(i, viewModels, axleLocals, postfx::kWheelMaskParts);
+        const NearDraw* found[postfx::kWheelMaskParts] = {};
+        int count = 0;
+        if (given > 0) {
+            // The parts as the wheel tracker gives them this frame: kept for the frames it doesn't.
+            for (int k = 0; k < given; ++k) {
+                for (const NearDraw& d : g_nearDraws)
+                    if (std::equal(d.raw, d.raw + 16, viewModels[k])) {
+                        m.parts[count].id = d.caster;
+                        std::copy(axleLocals[k], axleLocals[k] + 3, m.parts[count].axleLocal);
+                        found[count++] = &d;
+                        break;
+                    }
+            }
+            m.count = count;
+            static int logged[2] = { 0, 0 };  // (each new most, once: how much of the wheel the mask has)
+            if (count > logged[i]) {
+                logged[i] = count;
+                Log("postfx: tire dirt: your %s wheel's mask has %d part(s) of it (tire, rim, disc...)", i ? "front" : "rear", count);
+            }
+        } else if (m.count > 0 && frame) {
+            for (int k = 0; k < m.count; ++k) {
+                MaskPart& part = m.parts[k];
+                double expected[3], best = 0.4 * own->unitsPerMetre;
+                for (int c = 0; c < 3; ++c)
+                    expected[c] = part.world[c] + own->riderPosition[c] - part.rider[c];
+                for (const NearDraw& d : g_nearDraws) {
+                    if (!SameDrawCall(d.caster, part.id))
+                        continue;
+                    double at[3];
+                    Axle(d, part.axleLocal, at);
+                    const double dx = at[0] - expected[0], dy = at[1] - expected[1], dz = at[2] - expected[2];
+                    const double off = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (off < best) {
+                        best = off;
+                        found[k] = &d;
+                    }
+                }
+            }
+            count = m.count;
+        } else if (!frame) {
+            m.count = 0;
+        }
+        const NearDraw* main = nullptr;
+        int mainPart = -1;
+        const size_t first = draws.size();
+        for (int k = 0; k < count; ++k) {
+            if (!found[k])
+                continue;
+            if (!main) {
+                main = found[k];
+                mainPart = k;
+            }
+            if (frame) {
+                Axle(*found[k], m.parts[k].axleLocal, m.parts[k].world);
+                std::copy(own->riderPosition, own->riderPosition + 3, m.parts[k].rider);
+            }
+            for (const NearDraw& d : g_nearDraws)  // every program's copy of it
+                if (std::equal(d.raw, d.raw + 16, found[k]->raw))
+                    draws.push_back(&d);
+        }
+        if (main && frame)
+            FindWheelMembers(i, *main, invRaw, own->unitsPerMetre, draws);
+        else
+            g_haveLastWheel[i] = false;
+        // For PaintTireDirt next frame: each of these draws, with the wheel's axle in its own model
+        // (where it'll be checked for), the axle's place now and how fast it moves.
+        if (main && frame) {
+            const double* axle = m.parts[mainPart].world;
+            const double now = camera::ContentTime();
+            double velocity[3] = {};
+            if (g_havePaintAxle[i] && now > g_paintAxleTime[i])
+                for (int c = 0; c < 3; ++c)
+                    velocity[c] = (axle[c] - g_paintAxle[i][c]) / (now - g_paintAxleTime[i]);
+            std::copy(axle, axle + 3, g_paintAxle[i]);
+            g_paintAxleTime[i] = now;
+            g_havePaintAxle[i] = true;
+            for (size_t k = first; k < draws.size(); ++k) {
+                double dv[16], world[16], inv[16];
+                for (int e = 0; e < 16; ++e)
+                    dv[e] = draws[k]->raw[e];
+                Mul4(invRaw, dv, world);
+                if (!InverseAffine(world, inv))
+                    continue;
+                PaintPart part;
+                part.id = draws[k]->caster;
+                for (int r = 0; r < 3; ++r)
+                    part.axleLocal[r] = inv[r] * axle[0] + inv[4 + r] * axle[1] + inv[8 + r] * axle[2] + inv[12 + r];
+                std::copy(axle, axle + 3, part.world);
+                std::copy(velocity, velocity + 3, part.velocity);
+                paint.push_back(part);
+            }
+        } else {
+            g_havePaintAxle[i] = false;
+        }
+    }
+    g_paintParts.swap(paint);
+    g_paintTime = camera::ContentTime();
+    g_paintUnits = own ? own->unitsPerMetre : 3.2808;
+}
+
+// Your rider's pieces (see RiderDraw): kept while drawn, the left-out ones cast with this frame's bones.
+void CastRiderPieces(const postfx::OwnAnchors& own)
+{
+    double invRaw[16];
+    if (!InverseAffine(own.raw, invRaw))
+        return;
+    const double u = own.unitsPerMetre;
+    // Your rider's draws this frame: every bone within 1.5 m of your rider.
+    std::vector<const RiderDraw*> mine;
+    std::vector<std::vector<double>> models;  // each one's model (world), from its u_modelview
+    for (const RiderDraw& r : g_riderDraws) {
+        double vm[16], world[16];
+        for (int i = 0; i < 16; ++i)
+            vm[i] = r.raw[i];
+        Mul4(invRaw, vm, world);
+        bool close = true;
+        for (int b = 0; b < r.bones.count && close; ++b) {
+            const GLfloat* p = r.bones.position + b * 3;
+            double d2 = 0;
+            for (int k = 0; k < 3; ++k) {
+                const double w = world[k] * p[0] + world[4 + k] * p[1] + world[8 + k] * p[2] + world[12 + k] - own.riderPosition[k];
+                d2 += w * w;
+            }
+            close = d2 < (1.5 * u) * (1.5 * u);
+        }
+        if (close) {
+            mine.push_back(&r);
+            models.emplace_back(world, world + 16);
+        }
+    }
+    if (mine.empty())
+        return;  // your rider isn't drawn this frame
+
+    for (size_t i = 0; i < mine.size(); ++i) {
+        const RiderDraw& r = *mine[i];
+        KeptRiderPiece* piece = nullptr;
+        for (KeptRiderPiece& p : g_riderPieces)
+            if (p.used && SameDrawCall(p.caster, r.caster)) {
+                piece = &p;
+                break;
+            }
+        if (!piece) {
+            if (replay::Current() != replay::Mode::Off)
+                continue;  // a replay's rider can be someone else: nothing new is kept from it
+            for (KeptRiderPiece& p : g_riderPieces)
+                if (!p.used) {
+                    piece = &p;
+                    break;
+                }
+            if (!piece) {
+                if (g_riderPieces.size() >= kMaxRiderPieces)
+                    continue;
+                g_riderPieces.emplace_back();
+                piece = &g_riderPieces.back();
+            }
+            *piece = KeptRiderPiece{};
+            piece->used = true;
+        }
+        piece->caster = r.caster;
+        const auto buffers = g_vaoArrayBuffers.find(r.caster.vao);
+        piece->buffers = buffers != g_vaoArrayBuffers.end() ? buffers->second : std::vector<GLuint>{};
+        if (r.caster.elementBuffer)
+            piece->buffers.push_back(r.caster.elementBuffer);
+        piece->count = r.bones.count;
+        std::copy(r.bones.centre, r.bones.centre + r.bones.count * 3, piece->centre);
+        piece->drawnFrame = g_riddenFrame;
+    }
+
+    // The pieces left out: each bone by its rest position, from whichever of this frame's draws has it.
+    const double same = 1e-3 * u;
+    for (KeptRiderPiece& piece : g_riderPieces) {
+        if (!piece.used || piece.drawnFrame == g_riddenFrame)
+            continue;
+        if (g_deferredCasters.size() >= 8192)
+            break;
+        CasterBones bones;
+        bones.count = piece.count;
+        int model = -1;
+        bool all = true;
+        for (int b = 0; b < piece.count && all; ++b) {
+            const GLfloat* c = piece.centre + b * 3;
+            bool found = false;
+            for (size_t i = 0; i < mine.size() && !found; ++i) {
+                const CasterBones& from = mine[i]->bones;
+                for (int k = 0; k < from.count && !found; ++k) {
+                    const GLfloat* o = from.centre + k * 3;
+                    if (std::fabs(o[0] - c[0]) + std::fabs(o[1] - c[1]) + std::fabs(o[2] - c[2]) > same)
+                        continue;
+                    found = true;
+                    std::copy(o, o + 3, bones.centre + b * 3);
+                    std::copy(from.position + k * 3, from.position + k * 3 + 3, bones.position + b * 3);
+                    std::copy(from.rotation + k * 9, from.rotation + k * 9 + 9, bones.rotation + b * 9);
+                    bones.transposed = from.transposed;
+                    if (model < 0)
+                        model = static_cast<int>(i);
+                }
+            }
+            all = found;
+        }
+        if (!all) {
+            if (!piece.loggedUnmatched && g_riddenLogs < 20) {
+                piece.loggedUnmatched = true;
+                ++g_riddenLogs;
+                Log("postfx: shadow map: a piece of your rider the game doesn't draw here (%d bones, %d indices) uses bones "
+                    "the game doesn't send here; it casts no shadow",
+                    piece.count, piece.caster.draw.count);
+            }
+            continue;
+        }
+        // Drawn like the piece whose bones it took (riders: the bare view), in the eye space the
+        // frame is drawn from.
+        double eye[16];
+        Mul4(own.rendered, models[static_cast<size_t>(model)].data(), eye);
+        float viewModel[16];
+        for (int i = 0; i < 16; ++i)
+            viewModel[i] = static_cast<float>(eye[i]);
+        DeferredCaster c = piece.caster;
+        if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, &c.cascades))
+            continue;
+        c.bones = static_cast<int>(g_casterBones.size());
+        g_casterBones.push_back(bones);
+        g_deferredCasters.push_back(c);
+        postfx::NoteRiderPartCast(true);
+        if (!piece.loggedCast && g_riddenLogs < 20) {
+            piece.loggedCast = true;
+            ++g_riddenLogs;
+            Log("postfx: shadow map: a piece of your rider the game doesn't draw here casts its shadow anyway, with your "
+                "rider's bones (program %u, %d bones, %d indices)",
+                piece.caster.program, piece.count, piece.caster.draw.count);
+        }
+    }
+}
+
 // Your wheels: a wheel the game drew this frame has its draw call kept (found among the rigid draws
 // near the camera by its u_modelview); one it didn't draw is cast from the kept call, in its place
-// on your bike, with the held-back casters.
+// on your bike, with the held-back casters. (A wheel never drawn this session, your rear one in
+// first person, gets a shape of postfx's own instead.)
 void KeepOrCastWheels()
 {
     static const char* const kWheelName[2] = { "rear", "front" };
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 1; i >= 0; --i) {
         unsigned program = 0;
         float viewModel[16];
         const postfx::WheelCast cast = postfx::OwnWheelCast(i, &program, viewModel);
@@ -2010,7 +2886,7 @@ void KeepOrCastWheels()
             }
         } else if (cast == postfx::WheelCast::Missing && kept.valid && g_deferredCasters.size() < 8192) {
             DeferredCaster c = kept.caster;
-            if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, c.lightProjection))
+            if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, &c.cascades))
                 continue;
             g_deferredCasters.push_back(c);
             if (!kept.loggedCast) {
@@ -2045,14 +2921,28 @@ void DiscardShadowCasters()
 {
     g_deferredCasters.clear();
     g_nearDraws.clear();
+    g_riderDraws.clear();
+    g_casterBones.clear();
 }
 
 void FlushShadowCasters()
 {
     KeepOrCastWheels();  // (the frame already counts as applied here: ShadowMatrices says if the map is on)
+    {
+        postfx::OwnAnchors own;
+        const bool haveOwn = postfx::GetOwnAnchors(own);
+        if (haveOwn) {
+            UpdateRiddenParts(own);
+            CastRiderPieces(own);
+        }
+        DrawWheelMasks(haveOwn ? &own : nullptr);
+    }
     g_nearDraws.clear();
-    if (g_deferredCasters.empty())
+    g_riderDraws.clear();
+    if (g_deferredCasters.empty()) {
+        g_casterBones.clear();
         return;
+    }
     const PFN_UniformMatrix4fv upload = real_glUniformMatrix4fv ? real_glUniformMatrix4fv : real_glUniformMatrix4fvARB;
     static PFN_EnableDisable enable = nullptr, disable = nullptr;
     static PFN_BindTexture bindTexture = nullptr;
@@ -2070,6 +2960,7 @@ void FlushShadowCasters()
     if (!upload || !real_glUseProgram || !real_glBindVertexArray || !real_glActiveTexture || !enable || !disable ||
         !bindTexture || !real_glIsEnabled || !postfx::BeginShadowDraw()) {
         g_deferredCasters.clear();
+        g_casterBones.clear();
         return;
     }
     // Both faces: the nearest surface to the sun is the same either way, and two-sided leaves cast.
@@ -2079,8 +2970,14 @@ void FlushShadowCasters()
     GLuint bound[kTrackedUnits];
     for (int u = 0; u < kTrackedUnits; ++u)
         bound[u] = g_boundTextures[u];
-    std::vector<GLuint> touched;
+    std::vector<GLuint> touched, boned;  // programs used; those given bones of ours
+    // Cascade by cascade (each a tile of the shadow map), each caster into those it reaches.
+    for (int cascade = 0; cascade < postfx::ShadowCascades(); ++cascade) {
+    float cascadeProjection[16];
+    postfx::UseShadowCascade(cascade, cascadeProjection);
     for (const DeferredCaster& c : g_deferredCasters) {
+        if (!(c.cascades & (1u << cascade)))
+            continue;
         const auto element = g_elementBuffers.find(c.vao);
         if (c.draw.kind != DrawCall::Arrays && (element == g_elementBuffers.end() || element->second != c.elementBuffer))
             continue;  // its vertex array was given other indices since: skip it
@@ -2102,11 +2999,25 @@ void FlushShadowCasters()
             }
         }
         upload(c.modelviewLoc, 1, GL_FALSE, c.lightModelview);
-        upload(c.projectionLoc, 1, GL_FALSE, c.lightProjection);
-        if (c.boneCountLoc >= 0 && real_glUniform1i)
+        upload(c.projectionLoc, 1, GL_FALSE, cascadeProjection);
+        const SkinnedProgram* skin = c.bones >= 0 ? FindSkinned(c.program) : nullptr;
+        if (skin && static_cast<size_t>(c.bones) < g_casterBones.size()) {
+            const CasterBones& b = g_casterBones[static_cast<size_t>(c.bones)];
+            UploadSkinnedVectors(skin->centreLoc, b.count, b.centre, skin->positionArb);
+            UploadSkinnedVectors(skin->positionLoc, b.count, b.position, skin->positionArb);
+            UploadSkinnedRotations(skin->rotationLoc, b.count, b.transposed, b.rotation, skin->rotationArb);
+            if (real_glUniform1i)
+                real_glUniform1i(skin->countLoc, b.count);
+            if (std::find(boned.begin(), boned.end(), c.program) == boned.end())
+                boned.push_back(c.program);
+        } else if (c.bones >= 0) {
+            continue;
+        } else if (c.boneCountLoc >= 0 && real_glUniform1i) {
             real_glUniform1i(c.boneCountLoc, 0);
+        }
         Replay(c.draw);
     }
+    }  // (each cascade)
     // Back as the game left it: each program's own matrices, its program, arrays and textures.
     for (GLuint p : touched) {
         real_glUseProgram(p);
@@ -2119,6 +3030,17 @@ void FlushShadowCasters()
         const SkinnedProgram* skin = FindSkinned(p);
         if (skin && skin->positionLoc >= 0 && skin->countLoc >= 0 && real_glUniform1i)
             real_glUniform1i(skin->countLoc, skin->bones);  // the game's bone count again
+        if (skin && std::find(boned.begin(), boned.end(), p) != boned.end()) {
+            // Its bones as they were: the game's, or ours with your torso hidden.
+            if (skin->centres > 0)
+                UploadSkinnedVectors(skin->centreLoc, skin->centres, skin->centre, skin->positionArb);
+            if (skin->positions > 0)
+                UploadSkinnedVectors(skin->positionLoc, skin->positions,
+                                     skin->positionEdited ? skin->hiddenPosition : skin->position, skin->positionArb);
+            if (skin->rotations > 0)
+                UploadSkinnedRotations(skin->rotationLoc, skin->rotations, skin->transposed,
+                                       skin->rotationEdited ? skin->hiddenRotation : skin->rotation, skin->rotationArb);
+        }
     }
     real_glUseProgram(g_program);
     real_glBindVertexArray(g_vao);
@@ -2138,6 +3060,7 @@ void FlushShadowCasters()
             static_cast<int>(g_deferredCasters.size()), g_castAtOnce);
     }
     g_deferredCasters.clear();
+    g_casterBones.clear();
 }
 
 bool NoteDraw(const DrawCall& draw)
@@ -2152,8 +3075,9 @@ bool NoteDraw(const DrawCall& draw)
         if (LeaveOutGameOverlay(draw))
             return false;
         PrepareSkinnedDraw();
-        if (postfx::WantsShadowCasters())
+        if (postfx::WantsShadowCasters() || postfx::WantsWheelMask())
             CastShadow(draw);
+        PaintTireDirt(draw);
         return true;
     }
     const auto found = g_elementBuffers.find(g_vao);
@@ -2185,6 +3109,8 @@ bool EndShaderFrame()
 {
     g_deferredCasters.clear();  // a frame whose shadows weren't applied
     g_nearDraws.clear();
+    g_riderDraws.clear();
+    g_casterBones.clear();
     g_castAtOnce = 0;
     // A terrain pass still open at the end of the frame isn't filled in, only forgotten.
     g_ground.open = static_cast<int>(g_terrain.patches.size());

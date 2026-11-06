@@ -184,6 +184,9 @@ uniform float u_metre;          // game units per metre (MX Simulator: feet)
 uniform float u_wheelOn[2];     // 0 rear, 1 front
 uniform mat4  u_wheelLocal[2];  // view space -> the wheel's own (axle along x, turning with it)
 uniform float u_wheelRadius[2]; // m, to the outside of the tire
+uniform sampler2D u_wheelMask;    // depth of your wheels as the game drew them (tire dirt goes only there)
+uniform float u_wheelMaskOn;
+uniform float u_wheelStretch[2];// 1 standing still; smaller the faster it turns (the mud blurs into rings)
 uniform mat3  u_viewToWorld;
 uniform vec3  u_camWrapped;     // camera position, wrapped to keep the numbers small
 uniform vec3  u_up;
@@ -203,9 +206,9 @@ uniform float u_time;
 uniform float u_pixelAngle;     // radians per pixel
 uniform sampler2DShadow u_shadowMap;  // depth seen from the sun (shadow map)
 uniform float u_shadowMapOn;
-uniform mat4  u_viewToShadow;   // view space -> the sun's clip space
-uniform float u_shadowTexel;
-uniform float u_shadowBias;
+uniform mat4  u_viewToShadow[4];  // view space -> each cascade's clip space (the sun's)
+uniform float u_shadowTexel;      // one texel of the whole map (the cascades are its 2 x 2 tiles)
+uniform float u_shadowBias[4];
 uniform vec3  u_lightView;      // toward the light, view space
 uniform float u_headlight;      // 0 = off
 uniform vec3  u_headPos;        // view space: the front plate
@@ -216,19 +219,44 @@ uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of
 
 // 1 = lit, 0 = in the shadow of something the sun's view saw first. 3 x 3 hardware-filtered
 // taps for soft edges; fades out at the edge of the map.
-float MapShadow(vec3 p, vec3 n)
+// One cascade's shadow at q (1 = lit), and how far inside it q is (0 at its usable edge, up to 1).
+float CascadeShadow(int i, vec3 q, out float inside)
 {
-    vec3 q = p + n * (0.04 + 0.0015 * -p.z);  // pushed off the surface: no self-shadowing
-    vec4 s = u_viewToShadow * vec4(q, 1.0);
+    vec4 s = u_viewToShadow[i] * vec4(q, 1.0);
     vec3 c = s.xyz / s.w * 0.5 + 0.5;
     vec2 e = min(c.xy, 1.0 - c.xy);
-    if (e.x <= 0.0 || e.y <= 0.0 || c.z >= 1.0)
+    inside = clamp((min(e.x, e.y) - 0.03) / 0.12, 0.0, 1.0);
+    if (c.z >= 1.0 || inside <= 0.0)
         return 1.0;
+    vec2 tile = vec2(float(i - (i / 2) * 2), float(i / 2)) * 0.5;  // each a quarter tile of the map
+    vec2 uv = tile + c.xy * 0.5;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += texture(u_shadowMap, vec3(c.xy + vec2(float(x), float(y)) * u_shadowTexel * 1.25, c.z - u_shadowBias));
-    return mix(1.0, sum / 9.0, smoothstep(0.0, 0.06, min(e.x, e.y)));
+            sum += texture(u_shadowMap, vec3(uv + vec2(float(x), float(y)) * u_shadowTexel * 1.25, c.z - u_shadowBias[i]));
+    return sum / 9.0;
+}
+
+float MapShadow(vec3 p, vec3 n)
+{
+    vec3 q = p + n * (0.04 + 0.0015 * -p.z);  // pushed off the surface: no self-shadowing
+    // The smallest (sharpest) cascade it's inside. Near that one's edge it blends into the next
+    // one out, so there's no line where shadows suddenly turn softer (those lines go round with
+    // the camera: they flickered). The biggest fades out at its edge.
+    for (int i = 0; i < 4; ++i) {
+        float inside;
+        float lit = CascadeShadow(i, q, inside);
+        if (inside <= 0.0)
+            continue;
+        if (inside >= 1.0)
+            return lit;
+        if (i == 3)
+            return mix(1.0, lit, inside);
+        float outerInside;
+        float outer = CascadeShadow(i + 1, q, outerInside);
+        return mix(mix(1.0, outer, outerInside), lit, smoothstep(0.0, 1.0, inside));
+    }
+    return 1.0;
 }
 
 // The headlight's light on a surface: a round, soft-edged cone seen from the plate, aimed down
@@ -359,7 +387,7 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
 
 // Mud on your tires: clumps caked on the tread and the sidewalls that turn with the wheel, a
 // little dust on the rim and hub. Lit by the sun from the surface's own normal.
-vec3 TireDirt(vec3 c, vec3 p, vec3 nView)
+vec3 TireDirt(vec3 c, vec3 p, vec3 nView, float ground)
 {
     float m = u_metre;
     for (int i = 0; i < 2; ++i) {
@@ -367,25 +395,44 @@ vec3 TireDirt(vec3 c, vec3 p, vec3 nView)
             continue;
         vec3 q = (u_wheelLocal[i] * vec4(p, 1.0)).xyz;
         float r = length(q.yz), a = abs(q.x), R = u_wheelRadius[i];
-        if (r > R + 0.06 * m || a > 0.09 * m)
+        // Only pixels of your wheel get here (the mask), so where the tire is isn't guessed from how
+        // far it is from the axle (that guess, a few cm off, put the mud on the rim and spokes): the
+        // tire is the dark rubber. From the rim (about 0.6 of the wheel's radius) out to a little past
+        // the tire (in case its size or the axle is a bit off).
+        // (From the rim out: the spokes in the bike's shade are dark too.)
+        if (r < 0.58 * R || r > 1.25 * R || a > 0.25 * m)
             continue;
-        float rim = R - 0.11 * m;
-        float tire = smoothstep(rim - 0.02 * m, rim + 0.01 * m, r) * (1.0 - smoothstep(R + 0.01 * m, R + 0.05 * m, r)) *
-                     (1.0 - smoothstep(0.055 * m, 0.075 * m, a));
-        float hub = (1.0 - smoothstep(rim - 0.02 * m, rim + 0.01 * m, r)) * (1.0 - smoothstep(0.05 * m, 0.07 * m, a));
+        float radial = smoothstep(0.58 * R, 0.66 * R, r) * (1.0 - smoothstep(1.15 * R, 1.25 * R, r));
+        float rubber = 1.0 - smoothstep(0.08, 0.2, Luma(c));  // c is linear here
+        float tire = radial * rubber;
+        float hub = radial * (1.0 - rubber);                  // the rim, spokes and hub: a dusting
+        float tread = smoothstep(0.75 * R, 0.95 * R, r);
+        float edge0 = 0.7 - 0.7 * u_tireDirt - 0.2 * tread;
+        // The pattern turns with the tire. Turning fast, a frame apart it would be a different one
+        // (it flickered), so it's blended into how much mud there is all the way round at that
+        // distance from the axle, 8 places round averaged: what a spinning tire looks like. Never
+        // all or nothing, and steady whatever the speed.
+        float spin = 1.0 - u_wheelStretch[i];  // 0 standing still, towards 1 turning fast
         vec3 cp = vec3(atan(q.z, q.y) * R, q.x, r) * (26.0 / m);
         float n = ValueNoise(cp) * 0.6 + ValueNoise(cp * 2.4 + 7.0) * 0.4;
-        float tread = smoothstep(R - 0.06 * m, R, r);
-        float edge0 = 0.7 - 0.7 * u_tireDirt - 0.2 * tread;
-        float cover = tire * smoothstep(edge0, edge0 + 0.1, n);
-        cover = max(cover, hub * 0.45 * u_tireDirt * smoothstep(0.45, 0.7, n));
-        vec3 mud = mix(vec3(0.15, 0.095, 0.055), vec3(0.34, 0.23, 0.14), ValueNoise(cp * 0.45 + 3.0));
+        float still = smoothstep(edge0, edge0 + 0.1, n), around = 0.0, hubRound = 0.0;
+        if (spin > 0.01) {
+            for (int k = 0; k < 8; ++k) {
+                vec3 ck = vec3(float(k) * (6.2831853 * R / 8.0) * (26.0 / m) + 0.37, cp.y, cp.z);
+                float nk = ValueNoise(ck) * 0.6 + ValueNoise(ck * 2.4 + 7.0) * 0.4;
+                around += smoothstep(edge0, edge0 + 0.1, nk) * 0.125;
+                hubRound += smoothstep(0.45, 0.7, nk) * 0.125;
+            }
+        }
+        float cover = tire * mix(still, around, spin);
+        cover = max(cover, hub * 0.35 * u_tireDirt * mix(smoothstep(0.45, 0.7, n), hubRound, spin));
+        vec3 mud = mix(vec3(0.15, 0.095, 0.055), vec3(0.34, 0.23, 0.14), ValueNoise(vec3(cp.x * (1.0 - spin), cp.yz) * 0.45 + 3.0));
         float lit = 0.45 + 0.8 * max(dot(nView, u_lightView), 0.0);
         c = mix(c, mud * lit, cover);
     }
     return c;
 }
-
+)GLSL" R"GLSL(
 vec3 Stars(vec3 d)
 {
     vec3 a = abs(d);
@@ -483,8 +530,10 @@ void main()
             }
             if (u_marks > 0.0 && ground > 0.5)
                 c = TireMarks(c, p, wp, nWorld);
-            if (u_tireDirt > 0.0 && ground < 0.5)
-                c = TireDirt(c, p, nView);
+            // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
+            // tire is in the terrain's depth too and counted as ground, and its mud came and went.
+            // TireDirt keeps to the tire around its own axle.)
+            // (Tire dirt: drawn by the bike shader itself on your tires, see proc_hooks PaintTireDirt.)
             float ao = 1.0, lit = 1.0;
             if (u_lightOn > 0.5) {
                 vec2 l = LightAt(v_uv, z);

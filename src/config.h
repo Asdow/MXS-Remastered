@@ -105,8 +105,9 @@ struct Config {
     bool   invertLight      = false;      // the light uniform points away from the sun, not toward it
     double shadows          = 0.6;        // 0..1 sun shadows
     bool   shadowMap        = true;       // shadow maps: objects drawn again from the sun (off: screen-space only)
-    double shadowDistance   = 25.0;       // m: shadow maps cover this far around the camera
-    int    shadowMapSize    = 2048;       // texels per side
+    double shadowDistance   = 20.0;       // m (real metres: the game's unit is feet): shadow maps cover this far around the camera
+    int    shadowResolution = 0;          // 0 = 2048, 1 = 4096, 2 = 8192 texels per side
+    int    shadowMapSize    = 2048;       // texels per side (from shadowResolution)
     bool   shadowBatch      = true;       // static objects' shadows drawn together (0: one at a time)
     double shadowLength     = 6.0;        // m: how far a screen-space shadow can reach
     double headlight        = 0.8;        // 0..1 the bike's headlight (when the time of day makes it dark)

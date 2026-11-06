@@ -157,7 +157,8 @@ bool WriteTunables(const Config& c, const wchar_t* presetSection)
         { L"Graphics",  L"Shadows",              c.shadows },
         { L"Graphics",  L"ShadowLength",         c.shadowLength },
         { L"Graphics",  L"ShadowMap",            c.shadowMap ? 1.0 : 0.0 },
-        { L"Graphics",  L"ShadowDistance",       c.shadowDistance },
+        { L"Graphics",  L"ShadowDistanceM",      c.shadowDistance },
+        { L"Graphics",  L"ShadowResolution",     static_cast<double>(c.shadowResolution) },
         { L"Graphics",  L"Headlight",            c.headlight },
         { L"Graphics",  L"HeadlightBeamDeg",     c.headlightBeamDeg },
         { L"Graphics",  L"AmbientOcclusion",     c.ambientOcclusion },
@@ -308,6 +309,8 @@ void CopyTunables(const Config& from, Config& to)
     to.shadowLength         = from.shadowLength;
     to.shadowMap            = from.shadowMap;
     to.shadowDistance       = from.shadowDistance;
+    to.shadowResolution     = from.shadowResolution;
+    to.shadowMapSize        = from.shadowMapSize;
     to.headlight            = from.headlight;
     to.headlightBeamDeg     = from.headlightBeamDeg;
     to.ambientOcclusion     = from.ambientOcclusion;
@@ -489,8 +492,24 @@ Config ParseConfig(const Config& base)
     c.shadows          = ReadDouble(L"Graphics", L"Shadows", c.shadows);
     c.shadowLength     = ReadDouble(L"Graphics", L"ShadowLength", c.shadowLength);
     c.shadowMap        = ReadInt(L"Graphics", L"ShadowMap", c.shadowMap) != 0;
-    c.shadowDistance   = ReadDouble(L"Graphics", L"ShadowDistance", c.shadowDistance);
-    c.shadowMapSize    = ReadInt(L"Graphics", L"ShadowMapSize", c.shadowMapSize);
+    // Shadow distance in real metres (ShadowDistanceM). The old ShadowDistance was used in the
+    // game's own unit, feet, though it said metres: read as that, so it covers what it did.
+    {
+        const double metres = ReadDouble(L"Graphics", L"ShadowDistanceM", -1.0);
+        const double feet = ReadDouble(L"Graphics", L"ShadowDistance", -1.0);
+        if (metres >= 0.0)
+            c.shadowDistance = metres;
+        else if (feet >= 0.0)
+            c.shadowDistance = feet / 3.2808;
+    }
+    {
+        const int resolution = ReadInt(L"Graphics", L"ShadowResolution", -1);
+        const int size = ReadInt(L"Graphics", L"ShadowMapSize", -1);  // (the old way to set it)
+        if (resolution >= 0)
+            c.shadowResolution = resolution;
+        else if (size > 0)
+            c.shadowResolution = size >= 8192 ? 2 : size >= 4096 ? 1 : 0;
+    }
     c.shadowBatch      = ReadInt(L"Graphics", L"ShadowBatch", c.shadowBatch) != 0;
     c.headlight        = ReadDouble(L"Graphics", L"Headlight", c.headlight);
     c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
@@ -582,8 +601,9 @@ Config ParseConfig(const Config& base)
     c.nightBrightness      = Clamp(c.nightBrightness, 0.0, 2.0);
     c.shadows              = Clamp(c.shadows, 0.0, 1.0);
     c.shadowLength         = Clamp(c.shadowLength, 1.0, 30.0);
-    c.shadowDistance       = Clamp(c.shadowDistance, 5.0, 100.0);
-    c.shadowMapSize        = c.shadowMapSize >= 4096 ? 4096 : c.shadowMapSize >= 2048 ? 2048 : 1024;
+    c.shadowDistance       = Clamp(c.shadowDistance, 5.0, 200.0);
+    c.shadowResolution     = c.shadowResolution < 0 ? 0 : c.shadowResolution > 2 ? 2 : c.shadowResolution;
+    c.shadowMapSize        = 2048 << c.shadowResolution;
     c.headlight            = Clamp(c.headlight, 0.0, 1.0);
     c.headlightBeamDeg     = Clamp(c.headlightBeamDeg, 5.0, 90.0);
     c.headlightForward     = Clamp(c.headlightForward, -3.0, 3.0);

@@ -21,6 +21,7 @@
 
 #include <windows.h>
 #include <GL/gl.h>
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include "mathlib.h"
 #include "postfx.h"
 #include "postfx_shaders.h"
+#include "replay.h"
 #include "timeofday.h"
 
 namespace mxcam {
@@ -448,8 +450,17 @@ struct Resources {
     Target  bloom[kBloomLevels];
     int     focusIndex = 0;
     bool    focusValid = false;
+    GLuint  wheelFbo = 0, wheelDepth = 0;          // your wheels as the game drew them (tire dirt's mask)
+    int     wheelWidth = 0, wheelHeight = 0;
+    GLuint  headProgram = 0, headVao = 0;          // the shadow stand-ins (DrawStandIns)
+    GLint   shapeLight = -1, shapeModel = -1, shapeKind = -1, shapeMinor = -1;
+    bool    headTried = false;
 };
 Resources g_res;
+// The tire dirt's mask this frame (see BeginWheelMask).
+struct WheelMaskState { bool cleared = false, drawn = false; GLint viewport[4] = {}; GLint drawFb = 0, depthFunc = 0;
+                        GLboolean depthMask = GL_TRUE; bool depthTest = false, scissor = false, stencil = false, cull = false; };
+WheelMaskState g_wheelMask;
 
 // ---- Per-frame scene information (from the hooks) -----------------------------------------
 struct Frame {
@@ -479,11 +490,18 @@ struct Motion {
 Motion g_motion;
 
 // The sun's camera for this frame's shadow map (set up by the first object that casts).
+// Cascades: the map is a 2 x 2 grid of four, each the same square seen from the sun but a bigger
+// one each time, from a sharp one close around you out to the whole shadow distance. Each point on
+// screen takes the smallest that has it: sharp shadows near you, shadows still far out.
+constexpr int kCascades = 4;
 struct ShadowFrame {
     bool   setup = false, usable = false, cleared = false, drawn = false;
-    double toLight[16] = {};    // the drawn camera's eye space -> the sun's view
-    float  projection[16] = {}; // the sun's orthographic projection
-    double half = 25.0;         // m, half the side of the square the map covers
+    double toLight[16] = {};    // the drawn camera's eye space -> the sun's view (centred on the camera)
+    double half = 25.0;         // game units, half the side of the biggest cascade (the shadow distance)
+    double depth = 100.0;       // game units on either side of the camera, along the light
+    double cascadeHalf[kCascades] = {};          // half the side of each cascade's square
+    double cascadeX[kCascades] = {}, cascadeY[kCascades] = {};  // its centre in the sun's view
+    float  cascadeProjection[kCascades][16] = {};
 };
 ShadowFrame g_shadow;
 
@@ -1060,7 +1078,8 @@ Vec3 SceneLight(const timeofday::Sky& sky)
 // ---- The sun's camera for the shadow map ---------------------------------------------------
 // A square of 2 x ShadowDistance around (and mostly ahead of) the camera, seen straight along
 // the light. Its centre moves in whole texels, so shadow edges don't crawl as the camera moves.
-constexpr double kShadowDepth = 100.0;  // m on either side of the centre, along the light
+double UnitsPerMetre();  // (the game's unit, measured from your bike's wheelbase: below)
+constexpr double kShadowDepth = 100.0;  // game units on either side of the centre, along the light, at least
 
 void SetupShadowFrame()
 {
@@ -1077,27 +1096,44 @@ void SetupShadowFrame()
     Vec3 ahead = EyeToWorld(V, Vec3{ 0, 0, -1 });
     ahead = ahead - up * Dot(ahead, up);
     ahead = Length(ahead) > 1e-3 ? Normalize(ahead) : Vec3{};
-    const double half = cfg.shadowDistance;
-    const Vec3 centre = CameraPosition(V) + ahead * (half * 0.45);
+    // (ShadowDistance is in metres; the game's unit is feet.) Deep enough along the light for what
+    // stands in the square to cast into it, however far it reaches.
+    const double half = cfg.shadowDistance * UnitsPerMetre();
+    const double depth = std::fmax(kShadowDepth, 2.0 * half);
+    const Vec3 camera = CameraPosition(V);
 
     const Vec3 z = light;  // the sun's camera looks down -z, at the scene
     const Vec3 side = std::fabs(Dot(z, up)) > 0.99 ? Vec3{ 1, 0, 0 } : up;
     const Vec3 x = Normalize(Cross(side, z));
     const Vec3 y = Cross(z, x);
-    const double texel = 2.0 * half / cfg.shadowMapSize;
-    const double cx = std::floor(Dot(centre, x) / texel) * texel;
-    const double cy = std::floor(Dot(centre, y) / texel) * texel;
-    const double cz = Dot(centre, z);
-    const double lightView[16] = { x.x, y.x, z.x, 0,  x.y, y.y, z.y, 0,  x.z, y.z, z.z, 0,  -cx, -cy, -cz, 1 };
+    // The sun's view, centred on the camera; each cascade a square in it.
+    const double ox = Dot(camera, x), oy = Dot(camera, y), oz = Dot(camera, z);
+    const double lightView[16] = { x.x, y.x, z.x, 0,  x.y, y.y, z.y, 0,  x.z, y.z, z.z, 0,  -ox, -oy, -oz, 1 };
     double invView[16];
     if (!AffineInverse(V, invView))
         return;
     MatMul(lightView, invView, g_shadow.toLight);
-    const float projection[16] = { static_cast<float>(1.0 / half), 0, 0, 0,  0, static_cast<float>(1.0 / half), 0, 0,
-                                   0, 0, static_cast<float>(-1.0 / kShadowDepth), 0,  0, 0, 0, 1 };
-    for (int i = 0; i < 16; ++i)
-        g_shadow.projection[i] = projection[i];
+    // From 12 m around you out to the shadow distance, each about the same times bigger than the
+    // last; each mostly ahead of the camera. Their centres move in whole texels of their own, so
+    // shadow edges don't crawl as the camera moves.
+    const double tile = cfg.shadowMapSize / 2.0;
+    const double nearest = std::fmin(half, 12.0 * UnitsPerMetre());
+    for (int c = 0; c < kCascades; ++c) {
+        const double h = nearest * std::pow(half / nearest, double(c) / (kCascades - 1));
+        const Vec3 centre = camera + ahead * (h * 0.45);
+        const double texel = 2.0 * h / tile;
+        const double cx = std::floor(Dot(centre, x) / texel) * texel - ox;
+        const double cy = std::floor(Dot(centre, y) / texel) * texel - oy;
+        g_shadow.cascadeHalf[c] = h;
+        g_shadow.cascadeX[c] = cx;
+        g_shadow.cascadeY[c] = cy;
+        const float projection[16] = { static_cast<float>(1.0 / h), 0, 0, 0,  0, static_cast<float>(1.0 / h), 0, 0,
+                                       0, 0, static_cast<float>(-1.0 / depth), 0,
+                                       static_cast<float>(-cx / h), static_cast<float>(-cy / h), 0, 1 };
+        std::copy(projection, projection + 16, g_shadow.cascadeProjection[c]);
+    }
     g_shadow.half = half;
+    g_shadow.depth = depth;
     g_shadow.usable = true;
 }
 
@@ -1124,6 +1160,7 @@ struct SkeletonRecord {
     bool     rider = false, transposed = false;
     float    position[kSkeletonBones * 3] = {};
     float    rotation[kSkeletonBones * 9] = {};
+    float    centre[kSkeletonBones * 3] = {};  // each bone's rest position (u_bone_c): which joint it is
 };
 std::vector<SkeletonRecord> g_skeletons;
 
@@ -1221,6 +1258,8 @@ struct Wheel {
     Vec3   fromRider;         // where it was against your rider (along, across, up)
     bool   haveFromRider = false;
     unsigned long long trackKey = 0;  // the part it is (its slot may be reused once it's gone)
+    bool   fromPair = false;  // its part was found with the other wheel's (both spinning, a wheelbase apart),
+                              // not on its own (that can be the sprocket or a brake disc on the same axle)
     double lateral = 0;       // along its axle, from its own axle point to the bike's centre plane
     bool   haveLateral = false;
     Vec3   axleRef[2];        // the axle seen from your bike / your rider: kept through dropouts
@@ -1230,6 +1269,12 @@ struct Wheel {
     Vec3   axes[3];           // the wheel's own axes (world): they turn with it
     int    axleAxis = 0;      // which of them is the axle
     double radius = 0.35;     // m, to the outside of the tire
+    double stretch = 1.0;     // tire dirt: how much of its pattern turns with it (see u_wheelStretch)
+    bool   farOff = false;    // its part was far from where it sits on your bike (pulled back)
+    double unseen = 0;        // seconds its part hasn't been seen (the game not drawing it)
+    int    maskParts = 0;     // drawn by the game this frame and yours: its parts go into the tire dirt's mask
+    float  maskViewModel[kWheelMaskParts][16] = {};
+    Vec3   maskAxleLocal[kWheelMaskParts];
     Vec3   contact;           // world
     Vec3   lastContact;       // world, the last one stamped
     bool   haveLast = false;  // the last contact stamped into the tire marks
@@ -1245,6 +1290,7 @@ struct Wheel {
     bool   fromBike = false;  // placed from your bike this frame (its part wasn't seen)
     double roll = 0;          // placed from your bike: how far it has rolled (rad), so its dirt keeps turning
     double savedWeight = -1;  // onBikeWeight when it was last written to the ini
+    bool   settled = false;   // learnt (or read from the ini): kept as it is, so it can't creep away
     // For the shadow map (OwnWheelCast): its part as the game draws it this frame, and its axle in
     // its own model (the point and which of its axes), to put that model on the axle where the
     // wheel sits on your bike when the game doesn't draw it.
@@ -1265,6 +1311,7 @@ bool WheelPlausibleOnBike(int i, Vec3 point);
 // units): taken from your wheels once they're found (wheelbase / 1.48 m), feet until then.
 constexpr double kWheelbase = 1.48;
 double g_unitsPerMetre = 3.2808;
+double UnitsPerMetre() { return g_unitsPerMetre; }
 bool   g_unitsMeasured = false;
 bool   g_unitsLocked = false;     // measured steadily for a while: never changes again (the rut map's
 int    g_unitsAgreeing = 0;       // scale hangs on it)
@@ -1305,13 +1352,107 @@ struct OwnRider {
     Vec3   lean;                   // unit: the rider's (and so the bike's) up, leaning in corners
     Vec3   hips;                   // world: on the seat, in the bike's centre plane
     Vec3   moved;                  // world: how far it moved since last frame
+    bool   haveTorso = false;      // this frame: its torso bone's whole transform (world), which
+    double torsoWorld[16] = {};    // carries the head (and the helmet the game draws on it)
+    bool   haveJoints = false;     // this frame: where its arms and legs join the body (world), left
+    Vec3   shoulder[2], hip[2];    // and right, from the limb bones (see FindJoints)
 };
 OwnRider g_rider;
+void PartWorld(const SkeletonRecord& rec, const double world[16], int b, double out[16]);
+
+// Where a rider's arms and legs join its body. Each bone turns about its rest position (u_bone_c),
+// so that point, moved, is its joint. The limb bones: four on each side of the body's midline (by
+// their rest positions); of each side's four, the two highest at rest are the arm, the other two the
+// leg. The shoulder is the arm bone nearer the midline (the elbow is further out), the hip the leg
+// bone nearer the torso bone (the knee is a thigh's length away). The two sides needn't mirror
+// exactly. False unless it's that, with the shoulders above the hips along the torso's up.
+bool FindJoints(const SkeletonRecord& rec, const double world[16], Vec3 shoulder[2], Vec3 hip[2])
+{
+    if (rec.torso < 0)
+        return false;
+    double halfSpan = 0;
+    for (int b = 0; b < rec.bones; ++b)
+        halfSpan = std::fmax(halfSpan, std::fabs(double(rec.centre[b * 3])));
+    if (halfSpan < 1e-3)
+        return false;
+    const float* torsoRest = rec.centre + rec.torso * 3;
+    for (int side = 0; side < 2; ++side) {
+        std::vector<int> limb;
+        for (int b = 0; b < rec.bones; ++b) {
+            const float x = rec.centre[b * 3];
+            if (side ? x > 0.05 * halfSpan : x < -0.05 * halfSpan)
+                limb.push_back(b);
+        }
+        if (limb.size() != 4)
+            return false;
+        std::sort(limb.begin(), limb.end(), [&](int x, int y) { return rec.centre[x * 3 + 1] > rec.centre[y * 3 + 1]; });
+        const auto Out = [&](int b) { return std::fabs(double(rec.centre[b * 3])); };
+        const auto FromTorso = [&](int b) {
+            const float* c = rec.centre + b * 3;
+            return Length(Vec3{ c[0] - torsoRest[0], c[1] - torsoRest[1], c[2] - torsoRest[2] });
+        };
+        const int shoulderBone = Out(limb[0]) <= Out(limb[1]) ? limb[0] : limb[1];
+        const int hipBone = FromTorso(limb[2]) <= FromTorso(limb[3]) ? limb[2] : limb[3];
+        shoulder[side] = BonePosition(rec, world, shoulderBone);
+        hip[side] = BonePosition(rec, world, hipBone);
+    }
+    const Vec3 spine = (shoulder[0] + shoulder[1]) * 0.5 - (hip[0] + hip[1]) * 0.5;
+    const double length = Length(spine);
+    if (length < 1e-4)
+        return false;
+    Vec3 axes[3];
+    BoneRotation(rec, world, rec.torso, axes);
+    return Dot(spine, Normalize(axes[1])) > 0.3 * length;
+}
+
+// Your rider's joints on its torso bone (its own frame): they don't move on it (the arms and legs
+// turn about them), so once found they're kept there and the torso shape is built from them every
+// frame, never switching between two shapes. Averaged, ignoring an odd frame far from the rest.
+struct Joints {
+    bool   have = false, logged = false;
+    int    samples = 0;
+    Vec3   shoulder[2], hip[2];   // in the torso bone's frame
+};
+Joints g_joints;
+
+void LearnJoints(const double torsoWorld[16], const Vec3 shoulder[2], const Vec3 hip[2])
+{
+    double inv[16];
+    if (!AffineInverse(torsoWorld, inv))
+        return;
+    Vec3 local[4] = { TransformPoint(inv, shoulder[0]), TransformPoint(inv, shoulder[1]), TransformPoint(inv, hip[0]),
+                      TransformPoint(inv, hip[1]) };
+    Joints& j = g_joints;
+    if (j.samples >= 60 || replay::Current() != replay::Mode::Off)
+        return;  // known: kept as it is (a replay's rider can be someone else)
+    Vec3* kept[4] = { &j.shoulder[0], &j.shoulder[1], &j.hip[0], &j.hip[1] };
+    if (j.samples > 30) {
+        for (int i = 0; i < 4; ++i)
+            if (Length(local[i] - *kept[i]) > 0.15 * g_unitsPerMetre)
+                return;  // an odd frame
+    }
+    const double k = j.samples == 0 ? 1.0 : 0.1;
+    for (int i = 0; i < 4; ++i)
+        *kept[i] = *kept[i] + (local[i] - *kept[i]) * k;
+    ++j.samples;
+    if (j.samples >= 10)
+        j.have = true;
+    if (j.have && !j.logged) {
+        j.logged = true;
+        const double u = g_unitsPerMetre;
+        Log("postfx: your rider's joints on its torso bone (m): shoulders %.2f %.2f %.2f / %.2f %.2f %.2f, hips %.2f %.2f %.2f / "
+            "%.2f %.2f %.2f",
+            j.shoulder[0].x / u, j.shoulder[0].y / u, j.shoulder[0].z / u, j.shoulder[1].x / u, j.shoulder[1].y / u,
+            j.shoulder[1].z / u, j.hip[0].x / u, j.hip[0].y / u, j.hip[0].z / u, j.hip[1].x / u, j.hip[1].y / u, j.hip[1].z / u);
+    }
+}
 
 void FindOwnRider(double dt)
 {
     OwnRider& r = g_rider;
     r.seen = false;
+    r.haveTorso = false;
+    r.haveJoints = false;
     if (g_skeletons.empty() || !g_frame.haveView)
         return;
     const Vec3 eye = CameraPosition(g_frame.raw);
@@ -1338,6 +1479,41 @@ void FindOwnRider(double dt)
     }
     if (best < 0)
         return;
+    // In first person the camera is in your rider's head: the nearest one is you. In third person it
+    // needn't be (someone between the camera and you, or close behind you, took your wheels, tire
+    // marks and dirt): there your rider is followed from frame to frame, and found again as the one
+    // the camera looks at (the chase camera follows you), not the nearest.
+    if (bestDistance > 1.4) {
+        int pick = -1;
+        if (r.haveLast) {
+            const Vec3 expected = r.last + r.velocity * dt;
+            double nearest = 0.6 * g_unitsPerMetre;
+            for (size_t i = 0; i < g_skeletons.size(); ++i) {
+                if (!g_skeletons[i].rider)
+                    continue;
+                const double d = Length(centroids[i] - expected);
+                if (d < nearest) {
+                    nearest = d;
+                    pick = static_cast<int>(i);
+                }
+            }
+        }
+        if (pick < 0) {
+            const Vec3 ahead = Normalize(EyeToWorld(g_frame.raw, Vec3{ 0, 0, -1 }));
+            double straightest = -1.0;
+            for (size_t i = 0; i < g_skeletons.size(); ++i) {
+                if (!g_skeletons[i].rider || Length(centroids[i] - eye) > 40.0)
+                    continue;
+                const double along = Dot(Normalize(centroids[i] - eye), ahead);
+                if (along > straightest) {
+                    straightest = along;
+                    pick = static_cast<int>(i);
+                }
+            }
+        }
+        if (pick >= 0)
+            best = pick;
+    }
     Vec3 sum;
     int n = 0;
     for (size_t i = 0; i < g_skeletons.size(); ++i) {
@@ -1350,11 +1526,35 @@ void FindOwnRider(double dt)
     {
         const SkeletonRecord& rec = g_skeletons[best];
         double world[16];
-        r.hips = rec.hips >= 0 && RecordWorld(rec, world) ? BonePosition(rec, world, rec.hips) : position;
+        const bool haveWorld = RecordWorld(rec, world);
+        r.hips = rec.hips >= 0 && haveWorld ? BonePosition(rec, world, rec.hips) : position;
+        if (rec.torso >= 0 && haveWorld) {
+            PartWorld(rec, world, rec.torso, r.torsoWorld);
+            r.haveTorso = true;
+        }
+        if (r.haveTorso && FindJoints(rec, world, r.shoulder, r.hip))
+            LearnJoints(r.torsoWorld, r.shoulder, r.hip);
+        r.haveJoints = r.haveTorso && g_joints.have;
+        if (r.haveJoints)
+            for (int side = 0; side < 2; ++side) {
+                r.shoulder[side] = TransformPoint(r.torsoWorld, g_joints.shoulder[side]);
+                r.hip[side] = TransformPoint(r.torsoWorld, g_joints.hip[side]);
+            }
     }
     r.moved = r.haveLast ? position - r.last : Vec3{};
     r.seen = true;
-    r.nearestBone = bestDistance;
+    {
+        // (The chosen rider's nearest bone: in third person it needn't be the nearest one.)
+        const SkeletonRecord& rec = g_skeletons[best];
+        double world[16];
+        r.nearestBone = bestDistance;
+        if (RecordWorld(rec, world)) {
+            double nearest = 1e9;
+            for (int b = 0; b < rec.bones; ++b)
+                nearest = std::fmin(nearest, Length(BonePosition(rec, world, b) - eye));
+            r.nearestBone = nearest;
+        }
+    }
     if (r.haveLast && dt > 0.0) {
         const Vec3 step = position - r.last;
         if (Length(step) > 3.0 * g_unitsPerMetre) {  // a respawn or a camera cut: start over
@@ -1481,8 +1681,18 @@ void LoadLearnedBike()
             w.onBike = Vec3{ v[0], v[1], v[2] };
             w.axisOnBike = Normalize(Cross(b.forward, b.up));  // the bike's own across
             w.onBikeWeight = kLoadedWheelWeight;
+            w.settled = true;
             w.savedWeight = kLoadedWheelWeight;
             Log("postfx: your %s wheel: at (%.2f, %.2f, %.2f) on your bike (learnt)", i ? "front" : "rear", v[0], v[1], v[2]);
+        }
+    }
+    // Both wheels learnt: their wheelbase gives the game's unit from the start (feet, or metres in a
+    // test scene; anything else isn't trusted).
+    if (g_wheels[0].onBikeWeight > 0 && g_wheels[1].onBikeWeight > 0) {
+        const double unit = Dot(g_wheels[1].onBike - g_wheels[0].onBike, b.forward) / kWheelbase;
+        if (std::fabs(unit - 3.2808) < 0.15 * 3.2808 || std::fabs(unit - 1.0) < 0.15) {
+            g_unitsPerMetre = std::fabs(unit - 3.2808) < 0.15 * 3.2808 ? 3.2808 : 1.0;
+            g_unitsMeasured = true;
         }
     }
     Log("postfx: your bike: eyes at (%.2f, %.2f, %.2f) on it (%s)", b.eye.x, b.eye.y, b.eye.z,
@@ -1530,6 +1740,7 @@ void LearnBike(const double model[16], const bike::Pose& pose, double dt)
 // doesn't jump).
 bool   g_haveLastBike = false;
 Vec3   g_lastBikeOrigin;
+double g_lastBikeWorld[16] = {};
 unsigned g_lastBikeProgram = 0;
 
 bool FindBike(double model[16])
@@ -1562,14 +1773,42 @@ bool FindBike(double model[16])
             const Vec3 origin{ world[12], world[13], world[14] };
             if (follow && Length(origin - g_lastBikeOrigin) > 2.0)
                 continue;
+            if (follow) {
+                // The same object as last frame: turned the same way (another part of the bike that
+                // also stands upright, turned otherwise, once made every part seem to turn at once),
+                // the nearest to where it was.
+                bool same = true;
+                for (int c = 0; c < 3 && same; ++c) {
+                    const Vec3 now = Normalize(Vec3{ world[c * 4], world[c * 4 + 1], world[c * 4 + 2] });
+                    const Vec3 was = Normalize(Vec3{ g_lastBikeWorld[c * 4], g_lastBikeWorld[c * 4 + 1], g_lastBikeWorld[c * 4 + 2] });
+                    same = Dot(now, was) > 0.95;
+                }
+                // Of those, the one carrying your rider best, as strictly as the search below: the
+                // nearest to where it was once kept a neighbouring part 44 cm off (every wheel, mark
+                // and bit of tire dirt measured on your bike went that far off with it).
+                const double carry = Length(TransformPoint(world, b.rider) - g_rider.position);
+                if (!same || carry > (b.learned || b.loaded ? 0.7 : 1.0))
+                    continue;
+                if (!found && carry < bestError) {  // (the first drawn: see below)
+                    bestError = carry;
+                    std::copy(world, world + 16, model);
+                    found = true;
+                    g_lastBikeProgram = o.program;
+                }
+                continue;
+            }
             if (!follow && g_rider.haveHeading) {
                 Vec3 f = TransformDirection(world, b.forward);
                 f = f - worldUp * Dot(f, worldUp);
                 if (Length(f) < 1e-3 || Dot(Normalize(f), g_rider.heading) < 0.7)
                     continue;
             }
+            // The first one drawn that carries your rider (the game draws the body first, as the
+            // first person tracker's "draw #0"), not the one that does it best: the swingarm, the
+            // body turned a little about its pivot, can, and measured from it your front wheel was
+            // 60 cm out of place and let go of.
             const double error = Length(TransformPoint(world, b.rider) - g_rider.position);
-            if (error < bestError) {
+            if (!found && error < bestError) {
                 bestError = error;
                 std::copy(world, world + 16, model);
                 found = true;
@@ -1578,8 +1817,10 @@ bool FindBike(double model[16])
         }
     }
     g_haveLastBike = found;
-    if (found)
+    if (found) {
         g_lastBikeOrigin = Vec3{ model[12], model[13], model[14] };
+        std::copy(model, model + 16, g_lastBikeWorld);
+    }
     return found;
 }
 
@@ -1666,10 +1907,10 @@ bool WheelPlausibleOnBike(int i, Vec3 point)
     const BikeModel& b = g_bikeModel;
     const Vec3 across = Normalize(Cross(b.forward, b.up));
     const double u = g_unitsPerMetre;
-    if (std::fabs(Dot(point, across)) > 0.35 * u || Length(point) > 3.0 * u)
-        return false;
+    if (std::fabs(Dot(point, across)) > 0.15 * u || Length(point) > 3.0 * u)
+        return false;  // a wheel sits on the bike's centreline (a crash once put one 25 cm off it)
     const Wheel& other = g_wheels[1 - i];
-    if (other.onBikeWeight < kWheelOnBikeMin || std::fabs(Dot(other.onBike, across)) > 0.35 * u)
+    if (other.onBikeWeight < kWheelOnBikeMin || std::fabs(Dot(other.onBike, across)) > 0.15 * u)
         return true;  // nothing to check it against
     const double ahead = Dot((i == 1 ? point - other.onBike : other.onBike - point), b.forward);  // front minus rear
     return ahead > 0.5 * kWheelbase * u && ahead < 1.5 * kWheelbase * u;
@@ -1678,11 +1919,28 @@ bool WheelPlausibleOnBike(int i, Vec3 point)
 void LearnWheelOnBike(int index, Wheel& w, Vec3 axis, double dt)
 {
     double inv[16];
-    if (!g_bikeNow.found || dt <= 0.0 || !AffineInverse(g_bikeNow.model, inv))
+    // Not in a replay: the bike and wheels followed there can be someone else's.
+    if (!g_bikeNow.found || dt <= 0.0 || replay::Current() != replay::Mode::Off || !AffineInverse(g_bikeNow.model, inv))
         return;
     const Vec3 point = TransformPoint(inv, w.axle);
     if (!WheelPlausibleOnBike(index, point))
         return;  // not where a wheel can be on a bike: this frame's bike (or wheel) is off
+    // Once learnt it stays put: refining it all session let odd moments (a crash, a replay) drag it
+    // further and further off, and the wheels' shadows with it. Only seen somewhere else for ten
+    // seconds on end (another bike) is it learnt again.
+    if (w.settled) {
+        if (Length(point - w.onBike) <= 0.3 * g_unitsPerMetre) {
+            w.onBikeRejected = 0;
+        } else if (++w.onBikeRejected >= 600) {
+            w.settled = false;
+            w.onBikeWeight = 0;
+            w.onBikeRejected = 0;
+            Log("postfx: your %s wheel has been somewhere else on your bike for ten seconds (another bike?): learning it again",
+                index ? "front" : "rear");
+        }
+        if (w.settled)
+            return;
+    }
     Vec3 dir = Normalize(TransformDirection(inv, axis));
     if (w.onBikeWeight > 0 && Dot(dir, w.axisOnBike) < 0)
         dir = dir * -1.0;
@@ -1696,13 +1954,19 @@ void LearnWheelOnBike(int index, Wheel& w, Vec3 axis, double dt)
     w.onBike = w.onBike + (point - w.onBike) * k;
     w.axisOnBike = Normalize(w.axisOnBike + (dir - w.axisOnBike) * k);
     w.onBikeWeight += dt;
+    if (w.onBikeWeight >= 3.0)
+        w.settled = true;
 }
 
 // A wheel whose part isn't seen: placed from your bike, rolling on at your speed.
 void PlaceWheelFromBike(Wheel& w, int index, double dt)
 {
     const Vec3 worldUp = WorldUp();
-    w.axle = TransformPoint(g_bikeNow.model, w.onBike);
+    {
+        // On the bike's centreline (where it sits, without the little it's off it).
+        const Vec3 across = Normalize(Cross(g_bikeModel.forward, g_bikeModel.up));
+        w.axle = TransformPoint(g_bikeNow.model, w.onBike - across * Dot(w.onBike, across));
+    }
     const Vec3 axis = Normalize(TransformDirection(g_bikeNow.model, w.axisOnBike));
     Vec3 bikeUp = Normalize(TransformDirection(g_bikeNow.model, g_bikeModel.up));
     bikeUp = Normalize(bikeUp - axis * Dot(bikeUp, axis));
@@ -1745,8 +2009,10 @@ void SaveLearnedWheels(double now)
 void UpdateWheels(double now, double dt)
 {
     const Vec3 worldUp = WorldUp();
-    for (Wheel& w : g_wheels)
+    for (Wheel& w : g_wheels) {
         w.on = w.drawnNow = false;
+        w.maskParts = 0;
+    }
     for (PartTrack& t : g_partTracks) {
         t.seenNow = false;
         if (t.used && now - t.lastSeen > 3.0)
@@ -1970,6 +2236,29 @@ void UpdateWheels(double now, double dt)
         const PartTrack& t = g_partTracks[i];
         return t.used && t.seenNow && t.spin > 3.0 && t.axleWeight > 2.0;
     };
+    // Where your wheels sit on your bike is settled: a part can only be one of them there (another
+    // bike close by has spinning wheels near you too: your tire marks and dirt went to its wheels).
+    // (Across the bike from the part's own axle point, not the centred estimate: a wheel a metre
+    // to your side is the same as yours once centred.)
+    const auto AtYourWheel = [&](int k, int wheel) {
+        const Wheel& w = g_wheels[wheel];
+        const PartTrack& t = g_partTracks[k];
+        if (reference != 0) {
+            // Seen from your rider (your bike not found): at least on your rider's centreline.
+            const Vec3 point = TransformPoint(refInverse, TransformPoint(t.world, t.axleLocal));
+            return std::fabs(Dot(point, refAcross)) < 0.4 * g_unitsPerMetre;
+        }
+        if (!w.settled)
+            return true;
+        const Vec3 learnt = w.onBike - refAcross * Dot(w.onBike, refAcross);
+        const Vec3 point = TransformPoint(refInverse, TransformPoint(t.world, t.axleLocal));
+        // Across your bike always (someone else's wheel alongside is a metre or so to the side);
+        // along and up it only with your bike measured precisely (first person: the bike tracker). In
+        // third person it's found as a part under your rider, which can be one turned a little
+        // about the swingarm's pivot (every wheel then looked 70 cm off and was let go of).
+        const bool aside = std::fabs(Dot(point - w.onBike, refAcross)) < 0.4 * g_unitsPerMetre;
+        return aside && (g_bikeNow.how != 0 || Length(t.axleEst - learnt) < 0.3 * g_unitsPerMetre);
+    };
     const auto Along = [&](int i) { return Dot(g_partTracks[i].axleEst, refForward); };
     // Keep the pair found while it's still good (each wheel is drawn twice, by two programs: hopping
     // between the copies would lose what was learnt about the axle).
@@ -1981,19 +2270,26 @@ void UpdateWheels(double now, double dt)
         int bestA = -1, bestB = -1;
         double bestScore = 0;
         for (int i = 0; i < 192; ++i) {
-            if (!Spinning(i))
+            if (!Spinning(i) || !AtYourWheel(i, 1))
                 continue;
             for (int j = 0; j < 192; ++j) {
-                if (j == i || !Spinning(j))
+                if (j == i || !Spinning(j) || !AtYourWheel(j, 0))
                     continue;
-                const double gap = Along(i) - Along(j);
-                if (gap < 0.9 || gap > 8.5)
-                    continue;  // i ahead of j by a wheelbase (in metres or feet)
+                // i ahead of j by a real wheelbase: in the game's feet (or metres, in a test scene),
+                // and in the unit already measured. Two other parts that spin (a crash, someone
+                // else's bike alongside: once 0.95 units apart) would make every size wrong.
+                const double unit = (Along(i) - Along(j)) / kWheelbase;
+                const bool feet = std::fabs(unit - 3.2808) < 0.15 * 3.2808, metres = std::fabs(unit - 1.0) < 0.15;
+                if ((!feet && !metres) || (g_unitsMeasured && std::fabs(unit - g_unitsPerMetre) > 0.2 * g_unitsPerMetre))
+                    continue;
                 const double si = g_partTracks[i].spin, sj = g_partTracks[j].spin;
                 if (si > 3.0 * sj || sj > 3.0 * si)
                     continue;  // both wheels roll at about the same speed
                 // Copies whose axle is already learnt first.
-                const double score = si + sj + (g_partTracks[i].localWeight > 1.5 && g_partTracks[j].localWeight > 1.5 ? 1000.0 : 0.0);
+                // (And copies drawn as they are, rigid: a skinned bone's has no draw call of its own
+                // for the tire dirt's mask.)
+                const double score = si + sj + (g_partTracks[i].localWeight > 1.5 && g_partTracks[j].localWeight > 1.5 ? 1000.0 : 0.0) +
+                                     (g_partTracks[i].drawnAsIs && g_partTracks[j].drawnAsIs ? 500.0 : 0.0);
                 if (score > bestScore) {
                     bestScore = score;
                     bestA = i;
@@ -2013,6 +2309,7 @@ void UpdateWheels(double now, double dt)
             }
             g_wheels[1].track = bestA;
             g_wheels[0].track = bestB;
+            g_wheels[0].fromPair = g_wheels[1].fromPair = true;
             g_wheels[1].trackKey = g_partTracks[bestA].key;
             g_wheels[0].trackKey = g_partTracks[bestB].key;
             // The game's unit, from the wheelbase: measured until it holds steady, then locked (MX
@@ -2047,10 +2344,52 @@ void UpdateWheels(double now, double dt)
             }
         }
     }
+    // One wheel drawn on its own (first person: the game never draws your rear wheel, so there's no
+    // pair to find): the part turning about an axle where that wheel was learnt on your bike.
+    if (reference == 0) {
+        for (int i = 0; i < 2; ++i) {
+            Wheel& w = g_wheels[i];
+            if (StillGood(w) || w.onBikeWeight < kWheelOnBikeMin || !WheelPlausibleOnBike(i, w.onBike))
+                continue;
+            const Vec3 learnt = w.onBike - refAcross * Dot(w.onBike, refAcross);
+            const int other = g_wheels[1 - i].track;
+            int best = -1;
+            double bestDistance = 0.3 * g_unitsPerMetre;
+            for (int k = 0; k < 192; ++k) {
+                const PartTrack& t = g_partTracks[k];
+                // Rolling like a wheel (not a part that only creeps round) where the wheel was learnt.
+                if (k == other || !t.used || !t.seenNow || t.reference != 0 || t.localWeight <= 1.5 || t.localAxis < 0 ||
+                    t.axleWeight < 0.5 || t.spin < 3.0 || !AtYourWheel(k, i))
+                    continue;
+                const double d = Length(t.axleEst - learnt);
+                if (d < bestDistance) {
+                    bestDistance = d;
+                    best = k;
+                }
+            }
+            if (best < 0)
+                continue;
+            w.track = best;
+            w.trackKey = g_partTracks[best].key;
+            w.fromPair = false;
+            if (!w.logged) {
+                w.logged = true;
+                Log("postfx: found your bike's %s wheel on its own (program %u), where it was learnt on your bike",
+                    i ? "front" : "rear", g_partTracks[best].program);
+            }
+        }
+    }
     // Each wheel: placed from its own model (the axle it turns about there), moved along that axle
     // into the bike's centre plane (where your rider's hips sit). A dropout of up to a second keeps
     // it where it was against your rider.
     bool any = false;
+    // Where the wheels sit on your bike is only learnt while both are seen together (a wheel found
+    // on its own can be another part turning on the same axle: the sprocket, a brake disc).
+    bool bothSeen = true;
+    for (const Wheel& w : g_wheels)
+        bothSeen = bothSeen && w.fromPair && w.track >= 0 && g_partTracks[w.track].used && g_partTracks[w.track].key == w.trackKey &&
+                   g_partTracks[w.track].seenNow && g_partTracks[w.track].localWeight > 1.5 &&
+                   g_partTracks[w.track].localAxis >= 0;
     for (int i = 0; i < 2; ++i) {
         Wheel& w = g_wheels[i];
         if (w.track >= 0 && (!g_partTracks[w.track].used || g_partTracks[w.track].key != w.trackKey))
@@ -2058,6 +2397,7 @@ void UpdateWheels(double now, double dt)
         const bool seen = w.track >= 0 && g_partTracks[w.track].seenNow && g_partTracks[w.track].localWeight > 1.5 &&
                           g_partTracks[w.track].localAxis >= 0;
         w.missing = seen ? 0.0 : w.missing + dt;
+        w.unseen = seen ? 0.0 : w.unseen + dt;
         if (seen) {
             const PartTrack& t = g_partTracks[w.track];
             const Vec3 point = TransformPoint(t.world, t.axleLocal);
@@ -2081,11 +2421,76 @@ void UpdateWheels(double now, double dt)
             if (Dot(wheelUp, worldUp) < 0)
                 wheelUp = wheelUp * -1.0;
             w.up = wheelUp;
-            LearnWheelOnBike(i, w, axis, dt);
+            if (bothSeen)
+                LearnWheelOnBike(i, w, axis, dt);
             w.fromBike = false;
+            // Where it sits on your bike is settled: the tire marks and the tire dirt hold to it.
+            // Across the bike, always on its centreline there (no sideways drift, whichever part
+            // turning on that axle is followed: the wheel, the sprocket, a brake disc); up / down and
+            // along it as the part says (the suspension, where the tire really touches the ground).
+            // A part far from it isn't the wheel: its draw call isn't kept for the shadow map.
+            bool farOff = false;  // the part is far from where the wheel sits: not the wheel itself
+            w.farOff = false;
+            if (w.settled && g_bikeNow.found) {
+                double inv[16];
+                if (AffineInverse(g_bikeNow.model, inv)) {
+                    const BikeModel& b = g_bikeModel;
+                    const Vec3 bikeAcross = Normalize(Cross(b.forward, b.up));
+                    Vec3 local = TransformPoint(inv, w.axle);
+                    local = local - bikeAcross * Dot(local - w.onBike, bikeAcross);
+                    const double aside = std::fabs(Dot(TransformPoint(inv, point) - w.onBike, bikeAcross));
+                    // Never further from it than 35 cm (the suspension's travel): pulled back
+                    // smoothly, not swapped for another position (that flickered). Along and up
+                    // only with your bike measured precisely (first person, see AtYourWheel).
+                    const bool precise = g_bikeNow.how == 0;
+                    const Vec3 off = precise ? local - w.onBike : Vec3{};
+                    const double limit = 0.35 * g_unitsPerMetre;
+                    farOff = Length(off) > limit;
+                    w.farOff = farOff;
+                    static bool lettingGo[2] = { false, false };  // (logged once a spell, not every frame)
+                    if (Length(off) > 0.6 * g_unitsPerMetre || aside > 0.4 * g_unitsPerMetre) {
+                        // Further than any suspension moves it: not your wheel (someone else's close
+                        // by). Let go of it and place yours from your bike.
+                        if (!lettingGo[i] && g_wheelLogLines < kWheelLogLinesMax) {
+                            ++g_wheelLogLines;
+                            Log("postfx: tire marks: let go of a part taken for your %s wheel: %.2f m to the side, %.2f m off "
+                                "(someone else's?)", i ? "front" : "rear", aside / g_unitsPerMetre, Length(off) / g_unitsPerMetre);
+                        }
+                        lettingGo[i] = true;
+                        w.track = -1;
+                        PlaceWheelFromBike(w, i, dt);
+                        w.fromBike = true;
+                    } else {
+                        lettingGo[i] = false;
+                        if (farOff)
+                            local = w.onBike + off * (limit / Length(off));
+                        w.axle = TransformPoint(g_bikeNow.model, local);
+                    }
+                }
+            }
             // Its draw call, for the shadow map: kept while the game draws it, cast on your bike
             // when it doesn't.
-            if (t.drawnAsIs) {
+            // Drawn as it is and taken for yours (not let go above): the tire dirt's mask.
+            if (!w.fromBike) {
+                // Every part drawn as it is that turns about the same axle: the tire with the rest
+                // (whichever of them is the one followed: a skinned bone has no draw call of its own,
+                // and the brake disc or sprocket alone put the dirt on just them).
+                for (int k = 0; k < 192 && w.maskParts < kWheelMaskParts; ++k) {
+                    const PartTrack& c = g_partTracks[k];
+                    if (!c.used || !c.seenNow || !c.drawnAsIs || c.reference != t.reference || c.localWeight <= 1.5 ||
+                        (&c != &t && (c.axleWeight < 0.5 || Length(c.axleEst - t.axleEst) > 0.15 * g_unitsPerMetre)))
+                        continue;
+                    bool dup = false;  // (the same transform drawn by two programs: found once)
+                    for (int m = 0; m < w.maskParts && !dup; ++m)
+                        dup = std::equal(c.viewModel, c.viewModel + 16, w.maskViewModel[m]);
+                    if (dup)
+                        continue;
+                    std::copy(c.viewModel, c.viewModel + 16, w.maskViewModel[w.maskParts]);
+                    w.maskAxleLocal[w.maskParts] = c.axleLocal;
+                    ++w.maskParts;
+                }
+            }
+            if (t.drawnAsIs && w.fromPair && !farOff) {
                 w.drawnNow = true;
                 w.partProgram = t.program;
                 std::copy(t.viewModel, t.viewModel + 16, w.drawnViewModel);
@@ -2112,6 +2517,12 @@ void UpdateWheels(double now, double dt)
         any = true;
         w.radius = (i == 1 ? 0.355 : 0.345) * g_unitsPerMetre;
         w.contact = w.axle - w.up * w.radius;
+        {
+            // How far the tire turns in a frame, in the dirt pattern's blotches (26 a metre): over a
+            // third of one and the pattern is stretched along the tire to keep it at that.
+            const double blotches = Length(g_rider.velocity) * dt / g_unitsPerMetre * 26.0;
+            w.stretch = blotches > 0.3 ? 0.3 / blotches : 1.0;
+        }
     }
     {
         const bool on = g_wheels[0].on && g_wheels[1].on;
@@ -2528,16 +2939,19 @@ void Render(int w, int h)
         const bool shadowMapOn = depthOk && g_shadow.usable && g_shadow.drawn && g_res.shadowMap && shadowAmount > 0.0;
         g_gl.Uniform1f(p["u_shadowMapOn"], shadowMapOn ? 1.0f : 0.0f);
         if (shadowMapOn) {
-            double projection[16], viewToShadow[16];
-            for (int i = 0; i < 16; ++i)
-                projection[i] = g_shadow.projection[i];
-            MatMul(projection, g_shadow.toLight, viewToShadow);
-            float matrix[16];
-            ToFloat(viewToShadow, matrix, 16);
-            g_gl.UniformMatrix4fv(p["u_viewToShadow"], 1, GL_FALSE, matrix);
+            float matrices[kCascades][16], bias[kCascades];
+            for (int c = 0; c < kCascades; ++c) {
+                double projection[16], viewToShadow[16];
+                for (int i = 0; i < 16; ++i)
+                    projection[i] = g_shadow.cascadeProjection[c][i];
+                MatMul(projection, g_shadow.toLight, viewToShadow);
+                ToFloat(viewToShadow, matrices[c], 16);
+                // About 4 cm along the light, plus a little more for a wider cascade's bigger texels.
+                bias[c] = static_cast<float>((0.04 + g_shadow.cascadeHalf[c] * 0.002) / (2.0 * g_shadow.depth));
+            }
+            g_gl.UniformMatrix4fv(p["u_viewToShadow[0]"], kCascades, GL_FALSE, &matrices[0][0]);
+            g_gl.Uniform1fv(p["u_shadowBias[0]"], kCascades, bias);
             g_gl.Uniform1f(p["u_shadowTexel"], 1.0f / g_res.shadowSize);
-            // About 4 cm along the light, plus a little more for the bigger texels of a wider map.
-            g_gl.Uniform1f(p["u_shadowBias"], static_cast<float>((0.04 + g_shadow.half * 0.002) / (2.0 * kShadowDepth)));
         }
         Vec(p, "u_lightView", lightView);
         // The headlight: only when the time of day makes it dark enough to see.
@@ -2564,6 +2978,8 @@ void Render(int w, int h)
         }
         // Tire marks: where the map's window is, from the camera, in the map's texels.
         Bind(p, "u_markMap", 6, marksOn ? g_res.marks.tex : 0);
+        Bind(p, "u_wheelMask", 7, g_wheelMask.drawn ? g_res.wheelDepth : 0);
+        g_gl.Uniform1f(p["u_wheelMaskOn"], g_wheelMask.drawn ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_marks"], marksOn ? static_cast<float>(cfg.tireMarks) : 0.0f);
         if (marksOn) {
             Vec3 mu, mv;
@@ -2605,6 +3021,8 @@ void Render(int w, int h)
             g_gl.UniformMatrix4fv(p[name], 1, GL_FALSE, local);
             snprintf(name, sizeof name, "u_wheelRadius[%d]", i);
             g_gl.Uniform1f(p[name], static_cast<float>(wheel.radius));
+            snprintf(name, sizeof name, "u_wheelStretch[%d]", i);
+            g_gl.Uniform1f(p[name], static_cast<float>(wheel.stretch));
         }
         g_gl.Uniform2f(p["u_halfTexel"], 1.0f / g_res.light.w, 1.0f / g_res.light.h);
         g_gl.Uniform1f(p["u_depthOk"], depthOk ? 1.0f : 0.0f);
@@ -2807,11 +3225,300 @@ bool WindowSize(int& w, int& h)
     return w > 0 && h > 0;
 }
 
+// ---- What the game leaves out of your shadow in first person ----------------------------------
+// In first person the game draws neither your helmet (your head), nor part of your body (the
+// torso), nor your rear wheel. Shapes of our own stand in for them in the shadow map, from the first
+// frame: a helmet-sized ball where your head is, a rounded torso on your torso bone (it leans and
+// turns with you), and a tire with its hub on the axle where your rear wheel sits on your bike.
+// Whatever of the game's own the mod could keep (the helmet and body pieces while the game drew
+// them in third person, the rear wheel's draw call) is cast instead (proc_hooks).
+bool  g_riderPartCast = false;     // this frame: your helmet's own model was cast
+bool  g_riderPieceCast = false;    // this frame: a body piece of your rider's own was cast
+bool  g_haveHeadRest = false;
+Vec3  g_headRest;                  // the game's eye in your torso bone's own frame (first person)
+int   g_headRestSamples = 0;
+bool  g_loggedStandIn[5] = {};     // head, torso (on its bone), wheel, swingarm, torso (on its joints)
+
+float g_shapeLight[kCascades][16];  // this frame's eye space -> each cascade's clip space (DrawStandIns)
+
+bool MakeShapeProgram()
+{
+    if (g_res.headTried)
+        return g_res.headProgram != 0;
+    g_res.headTried = true;
+    // Made from the vertex number alone (no buffers), 6 vertices per quad. u_shape 0: a unit sphere
+    // (12 x 8 quads); 1: a ring about the x axis, radius 1, its tube u_minor thick (24 x 8 quads).
+    static const char* const kVertexSource =
+        "uniform mat4 u_light; uniform mat4 u_model; uniform int u_shape; uniform float u_minor;\n"
+        "void main() {\n"
+        "    int quad = gl_VertexID / 6, corner = gl_VertexID - quad * 6;\n"
+        "    int du = (corner == 1 || corner == 2 || corner == 4) ? 1 : 0;\n"
+        "    int dv = (corner == 2 || corner == 4 || corner == 5) ? 1 : 0;\n"
+        "    vec3 p;\n"
+        "    if (u_shape == 0) {\n"
+        "        int ring = quad / 12, slice = quad - ring * 12;\n"
+        "        float theta = float(slice + du) * (6.2831853 / 12.0), phi = float(ring + dv) * (3.1415927 / 8.0);\n"
+        "        p = vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));\n"
+        "    } else {\n"
+        "        int tube = quad / 24, around = quad - tube * 24;\n"
+        "        float a = float(around + du) * (6.2831853 / 24.0), b = float(tube + dv) * (6.2831853 / 8.0);\n"
+        "        float r = 1.0 + u_minor * cos(b);\n"
+        "        p = vec3(u_minor * sin(b), r * cos(a), r * sin(a));\n"
+        "    }\n"
+        "    gl_Position = u_light * (u_model * vec4(p, 1.0));\n"
+        "}\n";
+    static const char* const kFragmentSource = "out vec4 o_color;\nvoid main() { o_color = vec4(1.0); }\n";
+    std::string error;
+    for (const char* version : { "#version 150\n", "#version 130\n" }) {
+        const GLuint vs = CompileShader(kVertexShader, version, kVertexSource, nullptr, error);
+        if (!vs)
+            continue;
+        const GLuint fs = CompileShader(kFragmentShader, version, kFragmentSource, nullptr, error);
+        if (!fs) {
+            g_gl.DeleteShader(vs);
+            continue;
+        }
+        const GLuint program = g_gl.CreateProgram();
+        g_gl.AttachShader(program, vs);
+        g_gl.AttachShader(program, fs);
+        g_gl.LinkProgram(program);
+        g_gl.DeleteShader(vs);
+        g_gl.DeleteShader(fs);
+        GLint linked = 0;
+        g_gl.GetProgramiv(program, kLinkStatus, &linked);
+        if (!linked) {
+            g_gl.DeleteProgram(program);
+            continue;
+        }
+        g_res.headProgram = program;
+        g_res.shapeLight = g_gl.GetUniformLocation(program, "u_light");
+        g_res.shapeModel = g_gl.GetUniformLocation(program, "u_model");
+        g_res.shapeKind = g_gl.GetUniformLocation(program, "u_shape");
+        g_res.shapeMinor = g_gl.GetUniformLocation(program, "u_minor");
+        g_gl.GenVertexArrays(1, &g_res.headVao);  // no attributes: everything comes from gl_VertexID
+        return true;
+    }
+    LogInfo("the shadow stand-ins for what the game leaves out couldn't be built", error);
+    return false;
+}
+
+// One shape: model is its world transform (scale included).
+void DrawShape(int kind, const double model[16], float minor)
+{
+    double eye[16];
+    MatMul(g_frame.rendered, model, eye);  // the eye space the frame is drawn from
+    float m[16];
+    ToFloat(eye, m, 16);
+    g_gl.UniformMatrix4fv(g_res.shapeModel, 1, GL_FALSE, m);
+    g_gl.Uniform1i(g_res.shapeKind, kind);
+    g_gl.Uniform1f(g_res.shapeMinor, minor);
+    const int tile = g_res.shadowSize / 2;
+    for (int c = 0; c < kCascades; ++c) {  // into every cascade (they're small: no point sorting them out)
+        g_gl.Viewport((c % 2) * tile, (c / 2) * tile, tile, tile);
+        g_gl.UniformMatrix4fv(g_res.shapeLight, 1, GL_FALSE, g_shapeLight[c]);
+        g_gl.DrawArrays(GL_TRIANGLES, 0, kind == 0 ? 12 * 8 * 6 : 24 * 8 * 6);
+    }
+}
+
+// A world transform: the given axes (scaled) at a point.
+void ShapeModel(Vec3 x, Vec3 y, Vec3 z, Vec3 at, double out[16])
+{
+    const double m[16] = { x.x, x.y, x.z, 0, y.x, y.y, y.z, 0, z.x, z.y, z.z, 0, at.x, at.y, at.z, 1 };
+    std::copy(m, m + 16, out);
+}
+
+void LogStandIn(int which, const char* text)
+{
+    if (!g_loggedStandIn[which]) {
+        g_loggedStandIn[which] = true;
+        Log("postfx: shadow map: %s", text);
+    }
+}
+
+void DrawStandIns()
+{
+    const Config& cfg = GetConfig();
+    if (!cfg.shaders || !cfg.shadowMap || cfg.shadows <= 0.0 || !g_frame.haveView || !g_rider.seen)
+        return;
+    const double u = g_unitsPerMetre;
+    bool head = false, torso = false;
+    if (g_rider.haveTorso && !g_thirdPerson) {
+        double invTorso[16];
+        if (AffineInverse(g_rider.torsoWorld, invTorso)) {
+            // Where the game's first person eye sits on your torso bone, learnt slowly while it's
+            // somewhere a head can be: centred, 50 to 85 cm above the bone, within 25 cm front to
+            // back. (A camera behind the rider, in a replay or another view, once dragged your
+            // head's shadow back behind you.) Until then: 65 cm straight above it (your rider's).
+            const Vec3 rest = TransformPoint(invTorso, CameraPosition(g_frame.raw));
+            if (!g_haveHeadRest) {
+                g_headRest = Vec3{ 0.0, 0.65 * u, 0.0 };
+                g_haveHeadRest = true;
+            }
+            if (std::fabs(rest.x) < 0.10 * u && rest.y > 0.50 * u && rest.y < 0.85 * u && std::fabs(rest.z) < 0.25 * u &&
+                replay::Current() == replay::Mode::Off && g_headRestSamples < 300) {
+                g_headRest = g_headRest + (rest - g_headRest) * 0.02;
+                ++g_headRestSamples;  // (then kept as it is: nothing can drag it away over a session)
+            }
+        }
+        head = g_haveHeadRest;  // (always: a part kept on your torso could be anything small)
+        torso = g_haveHeadRest;  // (always: a body piece of the game's own may be any small part)
+    }
+    // Your wheels the game isn't drawing (placed from your bike, see OwnWheelCast): a tire for one it
+    // has never drawn this session; the swingarm whenever the rear one isn't drawn (the game leaves
+    // the whole back of the bike out in first person).
+    bool placed[2] = { false, false }, wheel[2] = { false, false };
+    for (int i = 0; i < 2; ++i) {
+        const Wheel& w = g_wheels[i];
+        placed[i] = w.on && w.fromBike && g_bikeNow.found && WheelPlausibleOnBike(i, w.onBike) &&
+                    Length(w.axle - g_rider.position) < 2.0 * u;
+        wheel[i] = placed[i] && w.partLocalAxis < 0;
+    }
+    // (Only while the game really isn't drawing it, half a second on end: in first person that's
+    // always. Drawn in a moment its part was let go of, they'd sit a little off the real one, a
+    // shape following your bike about.)
+    for (int i = 0; i < 2; ++i)
+        if (g_wheels[i].unseen < 0.5)
+            placed[i] = wheel[i] = false;
+    const bool swingarm = placed[0];
+    if (!head && !torso && !wheel[0] && !wheel[1] && !swingarm)
+        return;
+    if (!g_shadow.setup || !g_shadow.usable || !MakeShapeProgram() || !BeginShadowDraw())
+        return;
+    for (int c = 0; c < kCascades; ++c) {  // the eye space -> each cascade's clip space
+        double light[16], projection[16];
+        for (int i = 0; i < 16; ++i)
+            projection[i] = g_shadow.cascadeProjection[c][i];
+        MatMul(projection, g_shadow.toLight, light);
+        ToFloat(light, g_shapeLight[c], 16);
+    }
+    g_gl.Disable(GL_CULL_FACE);
+    g_gl.UseProgram(g_res.headProgram);
+    g_gl.BindVertexArray(g_res.headVao);
+
+    const double* T = g_rider.torsoWorld;
+    const Vec3 tx = Normalize(Vec3{ T[0], T[1], T[2] }), ty = Normalize(Vec3{ T[4], T[5], T[6] }),
+               tz = Normalize(Vec3{ T[8], T[9], T[10] });  // the torso bone's own axes: up +y, facing -z
+    double model[16];
+    // A rounded piece on the torso bone: its middle and half-sizes (across, up, front to back) in
+    // metres, from the game's eye there (x across, y up, z backwards: the torso faces -z).
+    const auto Piece = [&](double x, double y, double z, double across, double up, double depth) {
+        const Vec3 centre = TransformPoint(T, g_headRest + Vec3{ x * u, y * u, z * u });
+        ShapeModel(tx * (across * u), ty * (up * u), tz * (depth * u), centre, model);
+        DrawShape(0, model, 0.0f);
+    };
+    if (head) {
+        // A motocross helmet: the shell, longer front to back than across, its middle a little
+        // above and behind the eyes; the chin bar out in front under them; the peak on top at the
+        // front; and the neck down into the shoulders, so the head never floats.
+        Piece(0.0, 0.03, 0.06, 0.13, 0.14, 0.16);     // shell
+        Piece(0.0, -0.09, -0.10, 0.08, 0.06, 0.07);   // chin bar
+        Piece(0.0, 0.11, -0.12, 0.11, 0.025, 0.10);   // peak
+        Piece(0.0, -0.20, 0.06, 0.07, 0.11, 0.07);    // neck
+        LogStandIn(0, "your helmet isn't drawn by the game in first person: a helmet shape stands in for it");
+    }
+    if (torso && g_rider.haveJoints) {
+        // From your rider's own joints, so the arms and legs the game draws join it: a bar across
+        // the shoulders (where the arms start), the body from the hips up to them as wide as the
+        // shoulders, a bar across the hips (where the legs start), and the neck from between the
+        // shoulders up into the helmet.
+        const Vec3* sh = g_rider.shoulder;
+        const Vec3* hp = g_rider.hip;
+        const Vec3 shoulderMid = (sh[0] + sh[1]) * 0.5, hipMid = (hp[0] + hp[1]) * 0.5;
+        const Vec3 spine = shoulderMid - hipMid;
+        const Vec3 up = Normalize(spine);
+        Vec3 side = sh[1] - sh[0];
+        side = side - up * Dot(side, up);
+        const double halfWide = std::fmax(Length(side) * 0.5, 0.15 * u);
+        side = Normalize(side);
+        const Vec3 depth = Cross(side, up);
+        const auto Bar = [&](Vec3 a, Vec3 c, double thick) {  // from a to c, thick (half, metres) around
+            const Vec3 along = (c - a) * 0.5;
+            Vec3 other = Cross(along, depth);
+            if (Length(other) < 1e-6)
+                other = side;
+            ShapeModel(along, Normalize(other) * (thick * u), Normalize(Cross(along, other)) * (thick * u), (a + c) * 0.5, model);
+            DrawShape(0, model, 0.0f);
+        };
+        Bar(sh[0] - side * (0.04 * u), sh[1] + side * (0.04 * u), 0.07);    // shoulders
+        Bar(hp[0] - side * (0.03 * u), hp[1] + side * (0.03 * u), 0.08);    // hips
+        ShapeModel(side * halfWide, spine * 0.5 + up * (0.04 * u), depth * (0.12 * u), (shoulderMid + hipMid) * 0.5, model);
+        DrawShape(0, model, 0.0f);                                           // the body
+        const Vec3 helmet = TransformPoint(T, g_headRest + Vec3{ 0.0, 0.03 * u, 0.06 * u });
+        Bar(shoulderMid, helmet, 0.065);                                     // neck
+        LogStandIn(4, "your torso isn't drawn by the game in first person: a torso shape on your rider's shoulders and hips stands in for it");
+    } else if (torso) {
+        // (No joints found:) from the hips to the shoulders (20 cm under the eyes), 40 cm across,
+        // 26 cm front to back, and the shoulders across its top (an oval alone would taper to a point there).
+        // (From the eye, in metres: the shoulders 20 cm under it, the hips 15 cm under the torso bone.)
+        const double top = -0.20, bottom = -0.15 - g_headRest.y / u;
+        const double half = std::fmax((top - bottom) * 0.5, 0.15);
+        Piece(0.0, (top + bottom) * 0.5, 0.04, 0.20, half, 0.13);
+        Piece(0.0, -0.30, 0.05, 0.22, 0.12, 0.12);   // shoulders, up to the neck
+        LogStandIn(1, "your torso isn't drawn by the game in first person: a torso shape on your torso bone stands in for it "
+                      "(until your rider's shoulders and hips are found)");
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (!wheel[i])
+            continue;
+        const Wheel& w = g_wheels[i];
+        // On the bike's centreline, its axle across the bike.
+        const BikeModel& b = g_bikeModel;
+        const Vec3 across = Normalize(Cross(b.forward, b.up));
+        const Vec3 centre = TransformPoint(g_bikeNow.model, w.onBike - across * Dot(w.onBike, across));
+        const Vec3 axle = Normalize(TransformDirection(g_bikeNow.model, across));
+        Vec3 up = TransformDirection(g_bikeNow.model, b.up);
+        up = Normalize(up - axle * Dot(up, axle));
+        const Vec3 ahead = Cross(axle, up);
+        // The tire: a ring to the outside of the tire (w.radius), 12 cm thick; then the hub.
+        const double tube = 0.06 * u, ring = w.radius - tube;
+        ShapeModel(axle * ring, up * ring, ahead * ring, centre, model);
+        DrawShape(1, model, static_cast<float>(tube / ring));
+        const double hub = 0.07 * u;
+        ShapeModel(axle * hub, up * hub, ahead * hub, centre, model);
+        DrawShape(0, model, 0.0f);
+        LogStandIn(2, i == 0 ? "your rear wheel hasn't been drawn by the game yet: a tire and hub stand in for it"
+                             : "your front wheel hasn't been drawn by the game yet: a tire and hub stand in for it");
+    }
+    if (swingarm) {
+        // The back of your bike, big enough for the shadow map to show (a pixel of it covers ~6 cm):
+        // the swingarm's two arms either side of the rear wheel, from its axle forward and a little up
+        // to the pivot behind the engine (about 58 cm on a motocross bike) with a brace across in
+        // front of the tire; the shock from there up under the seat; the rear fender over the wheel.
+        const Wheel& w = g_wheels[0];
+        const BikeModel& b = g_bikeModel;
+        const Vec3 across = Normalize(Cross(b.forward, b.up));
+        const Vec3 axleAt = TransformPoint(g_bikeNow.model, w.onBike - across * Dot(w.onBike, across));
+        const Vec3 side = Normalize(TransformDirection(g_bikeNow.model, across));
+        const Vec3 forward = Normalize(TransformDirection(g_bikeNow.model, b.forward));
+        Vec3 up = TransformDirection(g_bikeNow.model, b.up);
+        up = Normalize(up - side * Dot(up, side));
+        const Vec3 pivot = axleAt + forward * (0.58 * u) + up * (0.12 * u);
+        // A piece from a to b (its length), `tall` up and `wide` across (half-sizes, metres).
+        const auto Bar = [&](Vec3 a, Vec3 c, double tall, double wide) {
+            const Vec3 along = (c - a) * 0.5;
+            const Vec3 thick = Normalize(Cross(side, along)) * (tall * u);
+            ShapeModel(along, thick, side * (wide * u), (a + c) * 0.5, model);
+            DrawShape(0, model, 0.0f);
+        };
+        for (int k = -1; k <= 1; k += 2)
+            Bar(axleAt + side * (k * 0.10 * u), pivot + side * (k * 0.10 * u), 0.05, 0.04);
+        Bar(pivot - forward * (0.10 * u) - side * (0.13 * u), pivot - forward * (0.10 * u) + side * (0.13 * u), 0.05, 0.05);
+        Bar(axleAt + forward * (0.38 * u) + up * (0.08 * u), axleAt + forward * (0.50 * u) + up * (0.48 * u), 0.045, 0.045);
+        Bar(axleAt - forward * (0.25 * u) + up * (0.42 * u), axleAt + forward * (0.45 * u) + up * (0.50 * u), 0.04, 0.11);
+        LogStandIn(3, "your rear wheel isn't drawn by the game here: a swingarm shape stands in for the back of your bike "
+                      "(with the shock and the rear fender)");
+    }
+    EndShadowDraw();
+}
+
 void Apply()
 {
     if (!LoadGL())
         return;
     int w = 0, h = 0;
+    g_riderPartCast = false;
+    g_riderPieceCast = false;
+    g_wheelMask.cleared = g_wheelMask.drawn = false;
     if (!WindowSize(w, h)) {
         FlushShadowCasters();
         return;
@@ -2820,6 +3527,7 @@ void Apply()
     FlushShadowCasters();  // the held-back shadow casters, all at once, before the shadows are used
     SavedState saved;
     Save(saved);
+    DrawStandIns();       // (its program and vertex array are put back with the rest)
     PrepareState();
     if (EnsureResources(w, h)) {
         if (!g_loggedFirstApply) {
@@ -2904,8 +3612,9 @@ bool WantsShadowCasters()
            g_glState >= 0 && (!g_shadow.setup || g_shadow.usable);
 }
 
-bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], float lightProjection[16])
+bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades)
 {
+    *cascades = 0;
     if (!g_shadow.setup)
         SetupShadowFrame();
     if (!g_shadow.usable)
@@ -2928,15 +3637,143 @@ bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float ligh
             worldSpace = std::fabs(model[12]) + std::fabs(model[13]) + std::fabs(model[14]) < 1e-2 &&
                          std::fabs(model[0] - 1) + std::fabs(model[5] - 1) + std::fabs(model[10] - 1) < 1e-3;
         }
+        if (worldSpace)
+            *cascades = (1u << kCascades) - 1;  // (all of them)
         at = worldSpace ? Vec3{} : Vec3{ toLight[12], toLight[13], toLight[14] };
     }
-    const double reach = g_shadow.half * 1.5;
-    if (std::fabs(at.x) > reach || std::fabs(at.y) > reach || std::fabs(at.z) > kShadowDepth)
+    if (std::fabs(at.z) > g_shadow.depth)
+        return false;
+    // Into each cascade it can reach: half as far again past its edge, and never less than 40 m past
+    // it (a big object's origin can sit well off what it covers: left out of the sharp ones, the
+    // stands' and banners' shadows came and went near you).
+    for (int c = 0; c < kCascades; ++c) {
+        const double reach = g_shadow.cascadeHalf[c] + std::fmax(g_shadow.cascadeHalf[c] * 0.5, 40.0 * UnitsPerMetre());
+        if (std::fabs(at.x - g_shadow.cascadeX[c]) <= reach && std::fabs(at.y - g_shadow.cascadeY[c]) <= reach)
+            *cascades |= 1u << c;
+    }
+    if (!*cascades)
         return false;
     ToFloat(toLight, lightModelview, 16);
-    for (int i = 0; i < 16; ++i)
-        lightProjection[i] = g_shadow.projection[i];
     return true;
+}
+
+bool FrameRawView(double raw[16])
+{
+    if (!g_frame.haveView)
+        return false;
+    std::copy(g_frame.raw, g_frame.raw + 16, raw);
+    return true;
+}
+
+bool WantsWheelMask()
+{
+    const Config& cfg = GetConfig();
+    return cfg.shaders && cfg.tireDirt > 0.0 && g_frame.haveView && !g_res.failed && g_glState >= 0;
+}
+
+int WheelMaskDraws(int i, float viewModels[][16], double axleLocals[][3], int max)
+{
+    if (i < 0 || i > 1 || !WantsWheelMask() || !g_wheels[i].on)
+        return 0;
+    const Wheel& w = g_wheels[i];
+    const int n = std::min(w.maskParts, max);
+    for (int k = 0; k < n; ++k) {
+        std::copy(w.maskViewModel[k], w.maskViewModel[k] + 16, viewModels[k]);
+        axleLocals[k][0] = w.maskAxleLocal[k].x;
+        axleLocals[k][1] = w.maskAxleLocal[k].y;
+        axleLocals[k][2] = w.maskAxleLocal[k].z;
+    }
+    return n;
+}
+
+bool BeginWheelMask()
+{
+    if (!LoadGL())
+        return false;
+    WheelMaskState& s = g_wheelMask;
+    g_gl.GetIntegerv(kDrawFramebufferBinding, &s.drawFb);
+    if (s.drawFb != 0)
+        return false;  // not drawing the scene
+    g_gl.GetIntegerv(GL_VIEWPORT, s.viewport);
+    const int w = s.viewport[0] + s.viewport[2], h = s.viewport[1] + s.viewport[3];
+    if (w <= 0 || h <= 0)
+        return false;
+    if (!g_res.wheelFbo || g_res.wheelWidth != w || g_res.wheelHeight != h) {
+        GLint active = 0, bound = 0, unpack = 0;
+        g_gl.GetIntegerv(kActiveTexture, &active);
+        g_gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+        g_gl.GetIntegerv(kPixelUnpackBufferBinding, &unpack);
+        g_gl.BindBuffer(kPixelUnpackBuffer, 0);
+        if (g_res.wheelDepth)
+            g_gl.DeleteTextures(1, &g_res.wheelDepth);
+        g_res.wheelDepth = NewTexture(kDepthComponent24, w, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, GL_NEAREST);
+        g_gl.TexParameteri(GL_TEXTURE_2D, kTextureCompareMode, GL_NONE);
+        g_gl.BindTexture(GL_TEXTURE_2D, bound);
+        g_gl.ActiveTexture(active);
+        g_gl.BindBuffer(kPixelUnpackBuffer, unpack);
+        if (!g_res.wheelFbo)
+            g_gl.GenFramebuffers(1, &g_res.wheelFbo);
+        g_gl.BindFramebuffer(kDrawFramebuffer, g_res.wheelFbo);
+        g_gl.FramebufferTexture2D(kDrawFramebuffer, kDepthAttachment, GL_TEXTURE_2D, g_res.wheelDepth, 0);
+        g_gl.DrawBuffer(GL_NONE);
+        const bool ok = g_gl.CheckFramebufferStatus(kDrawFramebuffer) == kFramebufferComplete;
+        g_gl.BindFramebuffer(kDrawFramebuffer, s.drawFb);
+        g_res.wheelWidth = w;
+        g_res.wheelHeight = h;
+        if (!ok) {
+            Log("postfx: tire dirt: your wheels' mask could not be made; tire dirt stays off");
+            g_gl.DeleteTextures(1, &g_res.wheelDepth);
+            g_res.wheelDepth = 0;
+        }
+    }
+    if (!g_res.wheelDepth)
+        return false;
+    g_gl.GetIntegerv(GL_DEPTH_FUNC, &s.depthFunc);
+    g_gl.GetBooleanv(GL_DEPTH_WRITEMASK, &s.depthMask);
+    s.depthTest = g_gl.IsEnabled(GL_DEPTH_TEST) != GL_FALSE;
+    s.scissor = g_gl.IsEnabled(GL_SCISSOR_TEST) != GL_FALSE;
+    s.stencil = g_gl.IsEnabled(GL_STENCIL_TEST) != GL_FALSE;
+    s.cull = g_gl.IsEnabled(GL_CULL_FACE) != GL_FALSE;
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.wheelFbo);
+    g_gl.Enable(GL_DEPTH_TEST);
+    g_gl.DepthFunc(GL_LESS);
+    g_gl.DepthMask(GL_TRUE);
+    g_gl.Disable(GL_SCISSOR_TEST);
+    g_gl.Disable(GL_STENCIL_TEST);
+    if (!s.cleared) {
+        GLfloat clearDepth = 1.0f;
+        g_gl.GetFloatv(GL_DEPTH_CLEAR_VALUE, &clearDepth);
+        g_gl.ClearDepth(1.0);
+        g_gl.Clear(GL_DEPTH_BUFFER_BIT);
+        g_gl.ClearDepth(clearDepth);
+        s.cleared = true;
+    }
+    s.drawn = true;
+    return true;
+}
+
+void EndWheelMask()
+{
+    const WheelMaskState& s = g_wheelMask;
+    g_gl.BindFramebuffer(kDrawFramebuffer, s.drawFb);
+    g_gl.DepthFunc(s.depthFunc);
+    g_gl.DepthMask(s.depthMask);
+    SetCapability(GL_DEPTH_TEST, s.depthTest);
+    SetCapability(GL_SCISSOR_TEST, s.scissor);
+    SetCapability(GL_STENCIL_TEST, s.stencil);
+    SetCapability(GL_CULL_FACE, s.cull);
+}
+
+int ShadowCascades()
+{
+    return kCascades;
+}
+
+void UseShadowCascade(int i, float projection[16])
+{
+    const int tile = g_res.shadowSize / 2;
+    g_gl.Viewport((i % 2) * tile, (i / 2) * tile, tile, tile);
+    std::copy(g_shadow.cascadeProjection[i], g_shadow.cascadeProjection[i] + 16, projection);
 }
 
 bool BeginShadowDraw()
@@ -2980,7 +3817,8 @@ bool BeginShadowDraw()
         g_shadow.cleared = true;
         if (!g_loggedShadowCasters) {
             g_loggedShadowCasters = true;
-            Log("postfx: objects cast shadow-map shadows (%.0f m around the camera)", g_shadow.half);
+            Log("postfx: objects cast shadow-map shadows (%.0f m around the camera, %dx%d)", g_shadow.half / g_unitsPerMetre,
+                g_res.shadowSize, g_res.shadowSize);
         }
     }
     g_shadow.drawn = true;
@@ -3112,6 +3950,7 @@ void NoteSkeleton(unsigned program, const float* centres, const float* positions
     std::copy(modelview, modelview + 16, rec.viewModel);
     std::copy(positions, positions + bones * 3, rec.position);
     std::copy(rotations, rotations + bones * 9, rec.rotation);
+    std::copy(centres, centres + bones * 3, rec.centre);
     // A rider: bones off the body's midline (arms, legs) and the highest one on it, the torso.
     double halfSpan = 0;
     for (int b = 0; b < bones; ++b)
@@ -3161,12 +4000,16 @@ WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16])
     }
     // Only a wheel placed from your bike this frame (where it sits on it, learnt over seconds and
     // checked), close to your rider.
-    if (!w.on || !w.fromBike || w.partLocalAxis < 0 || !g_bikeNow.found || !WheelPlausibleOnBike(i, w.onBike) ||
+    if (!w.on || !w.fromBike || !g_bikeNow.found || !WheelPlausibleOnBike(i, w.onBike) ||
         Length(w.axle - g_rider.position) > 2.0 * g_unitsPerMetre)
+        return WheelCast::None;
+    // Never drawn this session: a shape of our own stands in for it (DrawStandIns).
+    const Wheel& shape = w;
+    if (shape.partLocalAxis < 0)
         return WheelCast::None;
     // Its own model put on that axle: the axis it turns about along the axle, turned as far as it
     // has rolled, its own axle point on the axle.
-    const int k = w.partLocalAxis;
+    const int k = shape.partLocalAxis;
     const Vec3 columns[3] = { w.axes[0], w.axes[1], w.axes[2] };  // the axle, then across it (rolling)
     Vec3 axes[3];
     axes[k] = columns[0];
@@ -3174,16 +4017,58 @@ WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16])
     axes[(k + 2) % 3] = columns[2];
     double model[16] = { axes[0].x, axes[0].y, axes[0].z, 0, axes[1].x, axes[1].y, axes[1].z, 0,
                          axes[2].x, axes[2].y, axes[2].z, 0, 0, 0, 0, 1 };
-    const Vec3 at = w.axle - TransformDirection(model, w.partAxleLocal);
+    const Vec3 at = w.axle - TransformDirection(model, shape.partAxleLocal);
     model[12] = at.x;
     model[13] = at.y;
     model[14] = at.z;
     // In the eye space the frame is drawn from (like an uploaded u_modelview).
     double eyeModel[16];
     MatMul(g_frame.rendered, model, eyeModel);
-    *program = w.partProgram;
+    *program = shape.partProgram;
     ToFloat(eyeModel, viewModel, 16);
     return WheelCast::Missing;
+}
+
+const char* WheelTraceText()
+{
+    static char text[256];
+    double inv[16];
+    const bool bike = g_bikeNow.found && AffineInverse(g_bikeNow.model, inv);
+    int n = 0;
+    for (int i = 0; i < 2; ++i) {
+        const Wheel& w = g_wheels[i];
+        const Vec3 local = bike ? TransformPoint(inv, w.axle) : Vec3{};
+        n += snprintf(text + n, sizeof text - n, "%d,%d,%d,%.3f,%.3f,%.3f,", w.on ? 1 : 0, w.on && !w.fromBike ? 1 : 0,
+                      w.farOff ? 1 : 0, local.x, local.y, local.z);
+    }
+    snprintf(text + n, sizeof text - n, "%.3f,%d", g_wheels[1].stretch, bike ? 1 : 0);
+    return text;
+}
+
+void NoteRiderPartCast(bool piece)
+{
+    (piece ? g_riderPieceCast : g_riderPartCast) = true;
+}
+
+bool GetOwnAnchors(OwnAnchors& out)
+{
+    out = OwnAnchors{};
+    if (!g_frame.haveView || !g_rider.seen)
+        return false;
+    out.bike = g_bikeNow.found;
+    if (out.bike)
+        std::copy(g_bikeNow.model, g_bikeNow.model + 16, out.bikeWorld);
+    out.torso = g_rider.haveTorso;
+    if (out.torso)
+        std::copy(g_rider.torsoWorld, g_rider.torsoWorld + 16, out.torsoWorld);
+    out.riderPosition[0] = g_rider.position.x;
+    out.riderPosition[1] = g_rider.position.y;
+    out.riderPosition[2] = g_rider.position.z;
+    std::copy(g_frame.raw, g_frame.raw + 16, out.raw);
+    std::copy(g_frame.rendered, g_frame.rendered + 16, out.rendered);
+    out.unitsPerMetre = g_unitsPerMetre;
+    out.thirdPerson = g_thirdPerson;
+    return out.bike || out.torso;
 }
 
 const char* TireStatusText()

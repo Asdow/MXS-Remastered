@@ -17,6 +17,17 @@
 //     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
 //     tireshidden  the same at 5 m/s for ~3.5 s, its wheels no longer drawn after 1.4 s (as the game
 //               doesn't draw them out of view in first person): they must not be lost (mxcam.log)
+//     rival     another bike and rider 1 m beside yours (nearer the camera) at your speed, your rear wheel not drawn after 1.5 s: no marks of yours on its track
+//     wheeldrift  both wheels in view, learnt; the rear drawn 6 cm low after 1 s: what's learnt stays put
+//     backshadow  the bike standing still mid-view, rear wheel never drawn: the back of the bike's
+//               stand-in shapes, to look at in frame.bmp
+//     gatebox   standing still beside a box (like the start gate) that then isn't drawn: it never casts as yours
+//     longshadow  shadow distance 150 m at 8192: a tall tower 30 m behind still shades the ground in view
+//     longsharp   150 m at 2048: a thin shadow near the camera still dark and sharp (cascades)
+//     oldshadow   an old ini (ShadowDistance=60, ShadowMapSize=4096): read as 18 m at 4096, as before
+//     headshadow  first person, no helmet drawn: your head still casts a shadow (a stand-in ball)
+//     rearhidden  first person from the start: the rear wheel never drawn, a helmet drawn for 1.4 s
+//               only: both still cast shadows (the rear wheel with the front one's model)
 //     defaults  the shipped defaults (no ini): no GL errors, GL state left alone
 //   Every mode checks that the HUD is drawn after the effects (untouched) and that the GL state
 //   the scene had is restored. A .bmp of the frame is saved next to the DLL copy.
@@ -93,6 +104,55 @@ struct Api {
     PFN_Uniform1i Uniform1i; PFN_UniformMatrix3fv UniformMatrix3fv;
 };
 Api gl{};
+
+// MX Simulator's bike shaders, cut down: the lines the mod changes them by (tire dirt) as the game has
+// them, so the test goes through the same change.
+const char* const kBikeVertex =
+    "#version 300 es\n"
+    "in vec3 vattr_position;\n"
+    "in vec2 vattr_texcoord;\n"
+    "uniform int u_nbones;\n"
+    "uniform vec3 u_bone_c[32];\n"
+    "uniform vec3 u_bone_t[32];\n"
+    "uniform mat3 u_bone_r[32];\n"
+    "uniform mat4 u_projection;\n"
+    "uniform mat4 u_modelview;\n"
+    "out vec3 interp_normal, interp_tangent, interp_viewer;\n"
+    "out vec2 interp_texcoord;\n"
+    "void main()\n"
+    "{\n"
+    "\tinterp_texcoord = vattr_texcoord;\n"
+    "\tinterp_normal = vec3(0.0, 0.0, 1.0);\n"
+    "\tinterp_tangent = vec3(1.0, 0.0, 0.0);\n"
+    "\tinterp_viewer = vec3(0.0);\n"
+    "\tgl_Position = u_projection * (u_modelview * vec4(vattr_position, 1.0)) + vec4(u_bone_t[0] * 0.0, 0.0) * float(u_nbones);\n"
+    "}\n";
+const char* const kBikeFragment =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec3 interp_normal, interp_tangent, interp_viewer;\n"
+    "in vec2 interp_texcoord;\n"
+    "uniform sampler2D u_tex, u_nmap, u_smap;\n"
+    "uniform vec3 u_light_position;\n"
+    "uniform vec4 u_ambient;\n"
+    "uniform vec3 u_diffuse;\n"
+    "out vec4 f_fragcolor;\n"
+    "void main()\n"
+    "{\n"
+    "\tvec4 color;\n"
+    "\tvec3 n, light;\n"
+    "\tfloat ndl, z;\n"
+    "\tlight = u_light_position;\n"
+    "\tcolor = u_ambient;\n"
+    "\tn = normalize(interp_normal);\n"
+    "\tndl = dot(n, light);\n"
+    "\tif (ndl < 0.0)\n"
+    "\t\tndl = 0.0;\n"
+    "\tcolor.rgb += u_diffuse.rgb * ndl;\n"
+    "\tcolor *= texture(u_tex, interp_texcoord);\n"
+    "\tz = gl_FragCoord.z / gl_FragCoord.w;\n"
+    "\tf_fragcolor = color;\n"
+    "}\n";
 
 GLuint Build(const char* vertex, const char* fragment, const char* attribute)
 {
@@ -218,8 +278,18 @@ int main(int argc, char** argv)
     else if (mode == "shadowperf" || mode == "shadowperf0")  // timing: 800 objects cast shadow-map shadows
         settings = base.replace(base.find("Shadows=0"), 9, mode == "shadowperf" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
                                                                                 : "Shadows=1\nShadowMap=1\nShadowBatch=0");
-    else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
-        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1");
+    else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden" || mode == "rearhidden" ||
+             mode == "gatebox" || mode == "backshadow" || mode == "wheeldrift" || mode == "rival")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
+        // (tires: the dirt at 0.75, a player's setting: patchy mud, not a tire covered in it)
+        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : "TireMarks=1\nTireDirt=1");
+    else if (mode == "longshadow")  // shadow distance far out (150 m, 8192): a tall tower far behind still casts
+        settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistanceM=150\nShadowResolution=2");
+    else if (mode == "longsharp")  // 150 m at the lowest resolution: near you the shadows must stay sharp (cascades)
+        settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistanceM=150\nShadowResolution=0");
+    else if (mode == "oldshadow")  // an ini from before: ShadowDistance in feet (said m), ShadowMapSize
+        settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistance=60\nShadowMapSize=4096");
+    else if (mode == "headshadow")  // first person: your helmet isn't drawn, a ball stands in for it in the shadow map
+        settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
     else if (mode == "hidehud")  // the HUD hidden while riding, once the mouse has been left alone
         settings = base + "[Other]\nHideHud=1\n";
     else if (mode == "dof")
@@ -234,6 +304,12 @@ int main(int argc, char** argv)
         settings = settings.replace(settings.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
         // A rear wheel learnt at a bad moment (a real one: a metre off to the side): thrown away.
         settings += "[Learned]\nRearWheelOnBike=4.200,-1.950,-6.730\n";
+    }
+    if (mode == "rearhidden" || mode == "gatebox" || mode == "backshadow" || mode == "wheeldrift" || mode == "rival") {  // first person from the start: the wheels learnt in an earlier session
+        if (mode != "rival")  // (rival: no shadows, they'd darken the other bike's track like ruts)
+            settings = settings.replace(settings.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
+        settings += "[Learned]\nRearWheelOnBike=0.000,6.102,-0.820\nFrontWheelOnBike=0.000,6.102,-5.676\n"
+                    "BikeRider=0.000,7.874,-2.789\n";  // where your rider sits on the test bike
     }
     if (!settings.empty()) {
         FILE* out = nullptr;
@@ -321,11 +397,12 @@ int main(int argc, char** argv)
     // Skinned meshes, like the game's riders and bikes: v = u_bone_r (p - u_bone_c) + u_bone_t.
     // Only their uniforms matter here (nothing is drawn on screen).
     const GLuint rider = Build(
-        "attribute vec3 a_pos; uniform mat4 u_modelview; uniform mat4 u_projection; uniform int u_nbones;\n"
+        "attribute vec3 a_pos; uniform mat4 u_modelview; uniform mat4 u_projection; uniform int u_nbones; uniform float u_solid;\n"
         "uniform vec3 u_bone_c[10]; uniform vec3 u_bone_t[10]; uniform mat3 u_bone_r[10];\n"
         "void main() {\n"
         "  vec3 p = u_bone_r[9] * (a_pos - u_bone_c[9]) + u_bone_t[9] + u_bone_r[0] * u_bone_c[0] + u_bone_t[0];\n"
-        "  gl_Position = u_nbones < 0 ? u_projection * u_modelview * vec4(p, 1.0) : vec4(2.0, 2.0, 2.0, 1.0); }",
+        "  gl_Position = u_nbones < 0 ? u_projection * u_modelview * vec4(p, 1.0)\n"
+        "              : u_nbones == 0 && u_solid > 0.5 ? u_projection * u_modelview * vec4(a_pos, 1.0) : vec4(2.0, 2.0, 2.0, 1.0); }",
         "void main() { gl_FragColor = vec4(1.0); }", "a_pos");
     const GLint rMv = rider ? gl.GetUniformLocation(rider, "u_modelview") : -1;
     const GLint rProj = rider ? gl.GetUniformLocation(rider, "u_projection") : -1;
@@ -333,14 +410,29 @@ int main(int argc, char** argv)
     const GLint rCentres = rider ? gl.GetUniformLocation(rider, "u_bone_c") : -1;
     const GLint rBones = rider ? gl.GetUniformLocation(rider, "u_bone_t") : -1;
     const GLint rRotations = rider ? gl.GetUniformLocation(rider, "u_bone_r") : -1;
+    const GLint rSolid = rider ? gl.GetUniformLocation(rider, "u_solid") : -1;
+    // Your bike's wheels (and the brake disc): drawn by the game's bike shader, which carries the tire dirt.
+    const GLuint bike = Build(kBikeVertex, kBikeFragment, "vattr_position");
+    Check(bike != 0, "the bike shader (with the tire dirt the mod puts in it) compiles and links");
+    const GLint bMv = bike ? gl.GetUniformLocation(bike, "u_modelview") : -1;
+    const GLint bProj = bike ? gl.GetUniformLocation(bike, "u_projection") : -1;
+    const GLint bCount = bike ? gl.GetUniformLocation(bike, "u_nbones") : -1;
+    if (bike) {  // (looked up like the game does: the mod knows its programs by them)
+        gl.GetUniformLocation(bike, "u_bone_c");
+        gl.GetUniformLocation(bike, "u_bone_t");
+        gl.GetUniformLocation(bike, "u_bone_r");
+    }
+    const GLint bAmbient = bike ? gl.GetUniformLocation(bike, "u_ambient") : -1;
+    const GLint bDiffuse = bike ? gl.GetUniformLocation(bike, "u_diffuse") : -1;
+    const GLint bTex = bike ? gl.GetUniformLocation(bike, "u_tex") : -1;
     const GLint oMv = gl.GetUniformLocation(object, "u_modelview");
     const GLint oProj = gl.GetUniformLocation(object, "u_projection");
     const GLint oLight = gl.GetUniformLocation(object, "u_light_position");
     const GLint oColor = gl.GetUniformLocation(object, "u_color");
 
     // Meshes: the unit patch (indices in a buffer, like the game's) and a 1 m cube, and a quad.
-    GLuint arrays[6] = {};
-    gl.GenVertexArrays(6, arrays);
+    GLuint arrays[8] = {};
+    gl.GenVertexArrays(8, arrays);
     const auto mesh = [&](GLuint array, const float* vertices, size_t vertexBytes, int components,
                           const unsigned short* indices, size_t indexBytes) {
         GLuint buffers[2] = {};
@@ -374,6 +466,10 @@ int main(int argc, char** argv)
     const float ft = 3.2808f;
     const float wheelQuadFeet[12] = { 0, 0.5f * ft, -ft,  0, 2.5f * ft, -ft,  0, 0.5f * ft, ft,  0, 2.5f * ft, ft };
     mesh(arrays[5], wheelQuadFeet, sizeof wheelQuadFeet, 3, patchIndices, sizeof patchIndices);
+    // A brake disc: a small square on the wheel's axle (12 cm each way), 8 cm to its side, its model
+    // like the wheel's (origin 1.5 m off the axle).
+    const float discQuad[12] = { 0.08f, 1.38f, -0.12f,  0.08f, 1.62f, -0.12f,  0.08f, 1.38f, 0.12f,  0.08f, 1.62f, 0.12f };
+    mesh(arrays[6], discQuad, sizeof discQuad, 3, patchIndices, sizeof patchIndices);
     gl.BindVertexArray(0);
 
     // A texture the game would filter smoothly (for texture filtering), bound on unit 2 as
@@ -384,30 +480,70 @@ int main(int argc, char** argv)
     const unsigned char texel[4] = { 255, 255, 255, 255 };
     p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texel);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
+    // The tire's dark rubber and the disc's steel (as the bike shader samples them).
+    GLuint rubberTex = 0, steelTex = 0;
+    for (GLuint* tex : { &rubberTex, &steelTex }) {
+        p_glGenTextures(1, tex);
+        p_glBindTexture(GL_TEXTURE_2D, *tex);
+        const unsigned char rubber[4] = { 77, 77, 77, 255 }, steel[4] = { 200, 200, 206, 255 };
+        p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex == &rubberTex ? rubber : steel);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
 
     // 60 degrees vertical field of view, near 0.1, far 1000.
     const float n = 0.1f, f = 1000.0f, cot = 1.0f / std::tan(30.0f * 3.14159265f / 180.0f);
     const float projection[16] = { cot * H / W, 0, 0, 0, 0, cot, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0 };
     float view[16];
-    MakeView(0, 1.6f, 0, 12.0f, 0.0f, view);
+    if (mode == "backshadow")  // looking down at the bike from above, to see its shadow
+        MakeView(0, 26.0f, 0, 58.0f, 0.0f, view);
+    else
+        MakeView(0, 1.6f, 0, 12.0f, 0.0f, view);
     // What the game sends (eye space, toward the sun). For the shadow check: from the right, so
     // the box's shadow falls on the ground to its left.
     // For the shadow map check: low, from behind, so a tower behind the camera (never on screen)
     // throws its shadow forward onto the visible ground.
-    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "offscreen" ? 0.0f : 0.3f,
-                              mode == "shadows" ? 0.6f : mode == "offscreen" ? 0.15f : 0.8f,
-                              mode == "shadows" ? 0.0f : mode == "offscreen" ? 0.99f : 0.5f };
+    const bool headShadow = mode == "headshadow";
+    const bool farTower = mode == "longshadow" || mode == "oldshadow" || mode == "longsharp";
+    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "backshadow" ? 0.25f : mode == "offscreen" || farTower ? 0.0f : headShadow ? -0.5f : 0.3f,
+                              mode == "shadows" ? 0.6f : mode == "backshadow" ? 0.95f : mode == "offscreen" || farTower ? 0.15f : headShadow ? 0.17f : 0.8f,
+                              mode == "shadows" ? 0.0f : mode == "offscreen" || farTower ? 0.99f : headShadow ? 0.83f : 0.5f };
     const float hud[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0.3f, -1, 1 };  // scaled: the HUD
     const float flare[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, -0.3f, 0.3f, -1, 1 };  // the game's lens flare
     const int flareX = static_cast<int>((1.0f - projection[0] * 0.3f) * 0.5f * W);
 
     std::vector<unsigned char> rgb(static_cast<size_t>(W) * H * 3);
+    std::vector<unsigned char> rgbBefore(static_cast<size_t>(W) * H * 3);  // tires: the frame before, for flicker
+    std::vector<unsigned char> rgbEach(static_cast<size_t>(W) * H * 3);    // tires: every frame, for the mud's coverage
+    double tireCover[16] = {};                                                // tires: muddy share of the rear tire, frames 3-11
     GLint programAfter = 0, activeAfter = 0, unit2After = 0, drawFbAfter = -1, viewportAfter[4] = {};
     bool depthAfter = true, blendAfter = false, cullAfter = true;
     GLenum errorAfter = GL_NO_ERROR;
     // A skinned draw: n bones (centres, positions, rotations) drawn with modelview.
+    // Ready to draw with the bike shader: no bones, lit flat (its colour is its texture's), texture on unit 0.
+    const auto UseBike = [&](GLuint tex) {
+        gl.UseProgram(bike);
+        gl.UniformMatrix4fv(bProj, 1, GL_FALSE, projection);
+        gl.Uniform1i(bCount, 0);
+        const float ambient[4] = { 1, 1, 1, 1 };
+        p_wglGetProcAddress ? (void)0 : (void)0;
+        using PFN_Uniform4fv = void(APIENTRY*)(GLint, GLsizei, const GLfloat*);
+        static const auto uniform4 = reinterpret_cast<PFN_Uniform4fv>(p_wglGetProcAddress("glUniform4fv"));
+        if (uniform4)
+            uniform4(bAmbient, 1, ambient);
+        const float none[3] = { 0, 0, 0 };
+        gl.Uniform3fv(bDiffuse, 1, none);
+        gl.Uniform1i(bTex, 0);
+        gl.ActiveTexture(0x84C0);
+        p_glBindTexture(GL_TEXTURE_2D, tex);
+    };
+    int lastBones = -1;
+    float lastBone0[3] = {};
     const auto Skinned = [&](const float* modelview, int n, const float* centres, const float* positions,
-                             const float* rotations) {
+                             const float* rotations, int indexCount = 6) {
+        lastBones = n;
+        if (n > 0)
+            std::copy(positions, positions + 3, lastBone0);
         gl.UseProgram(rider);
         gl.UniformMatrix4fv(rProj, 1, GL_FALSE, projection);
         gl.UniformMatrix4fv(rMv, 1, GL_FALSE, modelview);
@@ -416,12 +552,12 @@ int main(int argc, char** argv)
         gl.Uniform3fv(rBones, n, positions);
         gl.UniformMatrix3fv(rRotations, n, GL_FALSE, rotations);
         gl.BindVertexArray(arrays[2]);
-        p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        p_glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_SHORT, nullptr);
     };
     // A rider with 10 bones (torso and hips on the midline, arms and legs out to the sides),
     // facing along rotation's -Z, the middle of its bones at (x, y, z). Drawn with the bare view:
     // its bones are world positions.
-    const auto Rider = [&](const float rotation[9], float x, float y, float z, float scale = 1.0f) {
+    const auto Rider = [&](const float rotation[9], float x, float y, float z, float scale = 1.0f, bool torsoPiece = false) {
         const float centres[30] = { 0, 1.3f, 0,  0, 0.95f, 0,  0.25f, 1.2f, -0.1f,  -0.25f, 1.2f, -0.1f,
                                     0.3f, 1.0f, -0.35f,  -0.3f, 1.0f, -0.35f,  0.15f, 0.8f, -0.25f,  -0.15f, 0.8f, -0.25f,
                                     0.18f, 0.45f, -0.3f,  -0.18f, 0.45f, -0.3f };
@@ -440,12 +576,41 @@ int main(int argc, char** argv)
                 rotations[b * 9 + k] = rotation[k];
         }
         Skinned(view, 10, centres, positions, rotations);
+        // torsoPiece: a second piece of the rider (its torso), with bones of its own in its own order
+        // (an arm, the torso, the other arm), drawn with a draw call of its own.
+        if (torsoPiece) {
+            const int pick[3] = { 2, 0, 3 };
+            float c3[9], p3[9], r3[27];
+            for (int i = 0; i < 3; ++i) {
+                for (int k = 0; k < 3; ++k) {
+                    c3[i * 3 + k] = centres[pick[i] * 3 + k];
+                    p3[i * 3 + k] = positions[pick[i] * 3 + k];
+                }
+                for (int k = 0; k < 9; ++k)
+                    r3[i * 9 + k] = rotations[pick[i] * 9 + k];
+            }
+            Skinned(view, 3, c3, p3, r3, 3);
+        }
     };
 
     const bool timing = mode == "shadowperf" || mode == "shadowperf0";
     const bool hiddenWheels = mode == "tireshidden";
+    // gatebox: the same bike, standing still for 3.4 s beside a box the game then stops drawing (like
+    // the start gate): the box must not be taken for part of your bike.
+    const bool gateBox = mode == "gatebox";
+    // backshadow: the same bike standing still in the middle of the view, its rear wheel never drawn,
+    // the sun from the side: the shapes standing in for the back of the bike, for a look at them.
+    const bool backShadow = mode == "backshadow";
+    const bool rearHidden = mode == "rearhidden" || gateBox || backShadow;
+    // wheeldrift: both wheels in view, where they sit already learnt; after 1 s the rear one is drawn
+    // 6 cm lower for good (a long bad moment). What's learnt must not creep after it.
+    const bool wheelDrift = mode == "wheeldrift";
+    // rival: your bike (where its wheels sit learnt) with another bike 1 m beside it at your speed,
+    // its wheels spinning too; after 1.5 s your rear wheel isn't drawn (as in first person). Your
+    // tire marks must stay yours: none in the other bike's track.
+    const bool rival = mode == "rival";
     const bool hideHud = mode == "hidehud";
-    const int frames = timing ? 160 : hiddenWheels ? 200 : hideHud ? 260 : 12;  // hidehud: ~4 s, past the mouse's 3
+    const int frames = timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 260 : headShadow ? 40 : 12;  // hidehud: ~4 s, past the mouse's 3
     LARGE_INTEGER frequency, frameStart, frameEnd, runStart;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&runStart);
@@ -455,6 +620,10 @@ int main(int argc, char** argv)
         QueryPerformanceCounter(&frameStart);
         if (mode == "motion")  // the head turning quickly from side to side
             MakeView(0, 1.6f, 0, 12.0f, frameIndex % 2 ? 1.0f : -1.0f, view);
+        // headshadow: for a while the game's camera sits 1.5 m behind your head (a replay, another
+        // view), then comes back. Your head's shadow must stay on your shoulders.
+        if (headShadow)
+            MakeView(0, 1.6f, frameIndex >= 5 && frameIndex < 35 ? 1.5f : 0.0f, 12.0f, 0.0f, view);
         p_glViewport(0, 0, W, H);
         p_glClearColor(0.40f, 0.60f, 0.85f, 1.0f);
         p_glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -474,6 +643,13 @@ int main(int argc, char** argv)
                 gl.Uniform1f(tScale, 25.0f);
                 p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
             }
+        }
+
+        // First person: your rider with the camera in its head (its torso bone 0.65 m under the eye).
+        // Its body isn't drawn on screen here (only its bones matter), and no helmet is drawn at all.
+        if (headShadow && rider) {
+            const float facing[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
+            Rider(facing, 0.0f, 0.565f, -0.2f);
         }
 
         // Third person: your rider a few metres ahead of the camera, riding away from it.
@@ -501,8 +677,8 @@ int main(int argc, char** argv)
         // Tires: your bike crossing the view from left to right, 4.5 m ahead, on spinning wheels,
         // with your rider on it. The bike model faces its own -Z (here: world +X), its origin
         // sits below the ground and its wheels are models of their own, like MX Simulator's.
-        if ((mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || hiddenWheels) && rider) {
-            const float u = mode == "tiresfeet" ? 3.2808f : 1.0f;  // game units per metre
+        if ((mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || hiddenWheels || rearHidden || wheelDrift || rival) && rider) {
+            const float u = mode == "tiresfeet" || rearHidden || wheelDrift || rival ? 3.2808f : 1.0f;  // game units per metre
             const float lift = mode == "tiresair" ? 1.2f : 0.0f;    // in the air: no ruts
             // tireshidden: on the clock at 5 m/s; after 1.4 s the wheels aren't drawn any more (the
             // frame and your rider still are).
@@ -510,7 +686,7 @@ int main(int argc, char** argv)
             QueryPerformanceCounter(&nowCount);
             const float elapsed = static_cast<float>(double(nowCount.QuadPart - runStart.QuadPart) / double(frequency.QuadPart));
             const bool wheelsDrawn = !hiddenWheels || elapsed < 1.4f;
-            const float travelled = hiddenWheels ? 5.0f * elapsed : frameIndex * 0.45f;
+            const float travelled = hiddenWheels ? 5.0f * elapsed : gateBox ? 0.0f : backShadow ? 4.5f : rearHidden || wheelDrift || rival ? 3.0f * elapsed : frameIndex * 0.45f;
             // First, like a real track: lots of other skinned objects drawn further away (more than
             // the mod used to keep track of in a frame).
             for (int k = 0; k < 100; ++k) {
@@ -522,7 +698,52 @@ int main(int argc, char** argv)
             }
             const float x0 = (-5.5f + travelled) * u;
             const float facingX[9] = { 0, 0, 1,  0, 1, 0,  -1, 0, 0 };  // its -Z along world +X
-            Rider(facingX, x0 + 0.85f * u, 0.9f * u + lift, -4.5f * u, u);
+            // rearhidden: your rider moves about on the bike (as riding), and wears a helmet: a rigid
+            // draw of the rider's program on its torso bone, drawn for the first 1.4 s only (in first
+            // person the game doesn't draw it).
+            const float bob = rearHidden ? 0.15f * u * std::sin(elapsed * 9.0f) : 0.0f;
+            Rider(facingX, x0 + 0.85f * u, 0.9f * u + lift + bob, -4.5f * u, u, rearHidden && elapsed < 1.4f);
+            if (gateBox && elapsed < 3.4f) {  // the box: 0.6 m beside the bike, standing on the ground
+                const float boxModel[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  x0, 0.0f, -4.5f * u + 0.6f * u, 1 };
+                float boxView[16];
+                Mul(view, boxModel, boxView);
+                gl.UseProgram(rider);
+                gl.Uniform1f(rSolid, 1.0f);
+                gl.UniformMatrix4fv(rProj, 1, GL_FALSE, projection);
+                gl.UniformMatrix4fv(rMv, 1, GL_FALSE, boxView);
+                gl.Uniform1i(rCount, 0);
+                gl.BindVertexArray(arrays[1]);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+            if (rearHidden && !gateBox && !backShadow && elapsed < 1.4f) {
+                // Someone alongside at your speed (off the start gate): a box riding next to your bike,
+                // drawn by the riders' program. It must never be taken for part of your bike.
+                const float alongside[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  x0 + 0.3f * u, 0.3f * u, -4.5f * u + 0.55f * u, 1 };
+                float alongsideView[16];
+                Mul(view, alongside, alongsideView);
+                gl.UseProgram(rider);
+                gl.Uniform1f(rSolid, 1.0f);
+                gl.UniformMatrix4fv(rProj, 1, GL_FALSE, projection);
+                gl.UniformMatrix4fv(rMv, 1, GL_FALSE, alongsideView);
+                gl.Uniform1i(rCount, 0);
+                gl.BindVertexArray(arrays[1]);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+            if (rearHidden && elapsed < 1.4f) {
+                // The torso bone (the rider's first): 0.37 m above the middle of its bones, turned with it.
+                const float torsoX = x0 + 0.85f * u, torsoY = 0.9f * u + bob + 0.37f * u, torsoZ = -4.5f * u;
+                const float helmet[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  // a unit cube (about 30 cm in feet)
+                                           torsoX, torsoY + 0.45f * u, torsoZ, 1 };
+                float helmetView[16];
+                Mul(view, helmet, helmetView);
+                gl.UseProgram(rider);
+                gl.Uniform1f(rSolid, 1.0f);
+                gl.UniformMatrix4fv(rProj, 1, GL_FALSE, projection);
+                gl.UniformMatrix4fv(rMv, 1, GL_FALSE, helmetView);
+                gl.Uniform1i(rCount, 0);
+                gl.BindVertexArray(arrays[1]);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
             const float angle = -travelled / 0.35f;
             const float c = std::cos(angle), sn = std::sin(angle);
             const float bikeModel[16] = { 0, 0, 1, 0,  0, 1, 0, 0,  -1, 0, 0, 0,  x0, -1.5f * u + lift, -4.5f * u, 1 };
@@ -539,15 +760,30 @@ int main(int argc, char** argv)
                                                   1, 0, 0, 0, c, sn, 0, -sn, c,
                                                   1, 0, 0, 0, c, sn, 0, -sn, c };
                 // tireshidden: only the frame is skinned; the wheels are rigid draws of their own, like the game's.
-                Skinned(bikeView, wheelsDrawn && !hiddenWheels ? 3 : 1, bikeCentres, bikeBones, bikeRotations);
+                Skinned(bikeView, wheelsDrawn && !hiddenWheels && !rearHidden && !wheelDrift && !rival ? 3 : 1, bikeCentres, bikeBones, bikeRotations);
             }
             gl.UseProgram(object);
             gl.UniformMatrix4fv(oProj, 1, GL_FALSE, projection);
             float viewModel[16];
+            // wheeldrift: another upright part of the bike, its origin 1.45 units along it (like the one
+            // the bike was once measured from by mistake: every wheel then 44 cm off), and for three
+            // frames the bike's own body not drawn (the moment that let it latch on).
+            if (wheelDrift) {
+                float partModel[16];
+                std::copy(bikeModel, bikeModel + 16, partModel);
+                partModel[12] += 1.45f;  // the bike faces world +X
+                Mul(view, partModel, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                gl.BindVertexArray(arrays[1]);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+            const bool bodyGone = wheelDrift && frameIndex >= 60 && frameIndex < 63;
             Mul(view, bikeModel, viewModel);
-            gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+            if (!bodyGone)
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
             gl.BindVertexArray(arrays[1]);
-            p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            if (!backShadow && !bodyGone)  // (backshadow: only its place is sent, so the ground under it stays in view)
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             // Something that creeps round now and then, off the centreline between the wheels (like
             // the chain or a brake disc): it must not be taken for a wheel. (Feet only: in metres
             // the test cube would be the size of the bike.)
@@ -561,18 +797,69 @@ int main(int argc, char** argv)
                 p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             }
             const float grey[3] = { 0.3f, 0.3f, 0.3f };
+            if (mode == "tires" && wheelsDrawn) {
+                // tires: the rear wheel's brake disc, drawn first (so it's the part followed as the
+                // wheel): the dirt must still go on the tire, not just on the disc.
+                UseBike(steelTex);
+                // (A model of its own, turned another way round the same axle: not the wheel's transform.)
+                const float discC = std::cos(angle + 0.9f), discS = std::sin(angle + 0.9f);
+                const float onBike[16] = { 1, 0, 0, 0,  0, discC, discS, 0,  0, -discS, discC, 0,  0, 1.86f - 1.5f * discC, -0.25f - 1.5f * discS, 1 };
+                float discModel[16];
+                Mul(bikeModel, onBike, discModel);
+                Mul(view, discModel, viewModel);
+                gl.UniformMatrix4fv(bMv, 1, GL_FALSE, viewModel);
+                gl.BindVertexArray(arrays[6]);
+                p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                gl.UseProgram(object);
+            }
             gl.Uniform3fv(oColor, 1, grey);
-            for (int w = 0; w < 2 && wheelsDrawn; ++w) {
+            // rearhidden: from 1.6 s, two other parts spinning on the bike 0.95 units apart (what once
+            // passed for your wheels and made every size five times too small).
+            if (rearHidden && !gateBox && !backShadow && elapsed > 1.6f) {
+                for (int k = 0; k < 2; ++k) {
+                    const float axleZ = -2.0f * u - k * 0.95f;
+                    const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, 1.86f * u - 0.3f * c, axleZ - 0.3f * sn, 1 };
+                    float partModel[16];
+                    Mul(bikeModel, onBike, partModel);
+                    Mul(view, partModel, viewModel);
+                    gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                    gl.BindVertexArray(arrays[1]);
+                    p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+                }
+            }
+            UseBike(rubberTex);
+            for (int w = rearHidden || (rival && elapsed > 1.5f) ? 1 : 0; w < 2 && wheelsDrawn && !backShadow && !(rival && elapsed > 1.5f); ++w) {
                 // In the bike's space, like MX Simulator's: the rider between the wheels.
                 const float axleZ = (w == 0 ? -0.25f : -1.73f) * u;
                 // bike * translate(axle) * rotateX(angle) * translate(0, -1.5 m, 0): its origin circles the axle
-                const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, (1.86f - 1.5f * c) * u, axleZ - 1.5f * sn * u, 1 };
+                const float drop = wheelDrift && w == 0 && elapsed > 1.0f ? 0.06f * u : 0.0f;
+                const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, (1.86f - 1.5f * c) * u - drop, axleZ - 1.5f * sn * u, 1 };
                 float wheelModel[16];
                 Mul(bikeModel, onBike, wheelModel);
                 Mul(view, wheelModel, viewModel);
-                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                gl.UniformMatrix4fv(bMv, 1, GL_FALSE, viewModel);
                 gl.BindVertexArray(arrays[u > 1.5f ? 5 : 4]);
                 p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+            }
+            gl.UseProgram(object);
+            if (rival) {  // the other bike: 1 m nearer the camera than yours (its rider the nearest to the
+                          // camera: in third person that once made it "your" rider), the same wheels, spinning
+                float rivalModel[16];
+                std::copy(bikeModel, bikeModel + 16, rivalModel);
+                rivalModel[14] += 1.0f * u;
+                Rider(facingX, x0 + 0.85f * u, 0.9f * u, -3.5f * u, u);
+                UseBike(rubberTex);
+                for (int w = 0; w < 2; ++w) {
+                    const float axleZ = (w == 0 ? -0.25f : -1.73f) * u;
+                    const float onBike[16] = { 1, 0, 0, 0,  0, c, sn, 0,  0, -sn, c, 0,  0, (1.86f - 1.5f * c) * u, axleZ - 1.5f * sn * u, 1 };
+                    float wheelModel[16];
+                    Mul(rivalModel, onBike, wheelModel);
+                    Mul(view, wheelModel, viewModel);
+                    gl.UniformMatrix4fv(bMv, 1, GL_FALSE, viewModel);
+                    gl.BindVertexArray(arrays[5]);
+                    p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                }
+                gl.UseProgram(object);
             }
         }
 
@@ -604,6 +891,14 @@ int main(int argc, char** argv)
         gl.Uniform3fv(oColor, 1, red);
         gl.BindVertexArray(arrays[1]);
         p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+        if (farTower) {  // a 40-box tower 100 units behind the camera, 3 right: its shadow reaches far into view
+            for (int level = 0; level < 40; ++level) {
+                const float place[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3.0f, static_cast<float>(level), 100.0f, 1 };
+                Mul(view, place, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+        }
         if (mode == "offscreen") {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
             // Drawn with blending on, as MX Simulator draws its solid objects: it must still cast.
             p_glEnable(GL_BLEND);
@@ -662,7 +957,40 @@ int main(int argc, char** argv)
         if (errorAfter != GL_NO_ERROR)
             printf("    GL error 0x%X on frame %d\n", errorAfter, frameIndex);
 
-        if (frameIndex == (hideHud ? frames - 1 : 11)) {
+        if (mode == "tires" && frameIndex >= 3 && frameIndex <= 11) {
+            // How much of the rear tire is muddy this frame (48 places round it, 29 cm from the axle).
+            p_glFinish();
+            p_glReadBuffer(GL_BACK);
+            p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            p_glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, rgbEach.data());
+            int muddy = 0, places = 0;
+            for (int k = 0; k < 48; ++k) {
+                const float a = k * (6.2831853f / 48.0f), axleX = -5.5f + frameIndex * 0.45f + 0.25f;
+                const float world[4] = { axleX + 0.29f * std::cos(a), 0.36f + 0.29f * std::sin(a), -4.5f, 1 };
+                float eye[4] = {}, clip[4] = {};
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        eye[r] += view[j * 4 + r] * world[j];
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        clip[r] += projection[j * 4 + r] * eye[j];
+                const int x = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+                const int y = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+                if (x < 0 || x >= W || y < 0 || y >= H)
+                    continue;
+                const unsigned char* px = &rgbEach[(static_cast<size_t>(H - 1 - y) * W + x) * 3];
+                muddy += px[0] > px[2] + 20 ? 1 : 0;
+                ++places;
+            }
+            tireCover[frameIndex] = places ? double(muddy) / places : 0.0;
+        }
+        if (mode == "tires" && frameIndex == 10) {
+            p_glFinish();
+            p_glReadBuffer(GL_BACK);
+            p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            p_glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, rgbBefore.data());
+        }
+        if (frameIndex == (hideHud || headShadow || rival || (rearHidden && !gateBox) ? frames - 1 : 11)) {
             p_glFinish();
             p_glReadBuffer(GL_BACK);
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -776,6 +1104,64 @@ int main(int argc, char** argv)
         printf("    %d partly red pixels across the box's edges\n", partial);
         Check(partial >= 8, mode == "dof" ? "the box (out of focus) has soft edges" : "the box is smeared by the turning camera");
         Check(hudPixel.r == 255, "the HUD stays sharp");
+    } else if (farTower) {
+        // The tower's shadow on the ground ahead (3 right), against the same place on the left.
+        int px[2] = {}, py[2] = {};
+        for (int k = 0; k < 2; ++k) {
+            const float world[4] = { k ? -3.0f : 3.0f, 0.0f, -5.0f, 1 };
+            float eye[4] = {}, clip[4] = {};
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    eye[r] += view[j * 4 + r] * world[j];
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    clip[r] += projection[j * 4 + r] * eye[j];
+            px[k] = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+            py[k] = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+        }
+        const Pixel shaded = At(px[0], py[0]), sunny = At(px[1], py[1]);
+        printf("    far tower's shadow: ground right %d %d %d, left %d %d %d\n", shaded.r, shaded.g, shaded.b, sunny.r, sunny.g, sunny.b);
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        const size_t at = log.find("objects cast shadow-map shadows (");
+        printf("    log: %s\n", at == std::string::npos ? "-" : log.substr(at, log.find('\n', at) - at).c_str());
+        if (mode == "longshadow") {
+            Check(log.find("(150 m around the camera, 8192x8192)") != std::string::npos, "shadow distance 150 m at 8192");
+            Check(shaded.r + 25 < sunny.r, "a tall tower far behind you throws its shadow into view");
+        } else if (mode == "longsharp") {
+            // Across the tower's 1-unit-wide shadow, 5 units ahead: dark in the middle and a narrow
+            // edge (one map stretched over 300 m would smear it to a faint grey band).
+            int darkest = 255, soft = 0;
+            for (int k = 0; k <= 60; ++k) {
+                const float world[4] = { 1.5f + k * 0.05f, 0.0f, -5.0f, 1 };
+                float eye[4] = {}, clip[4] = {};
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        eye[r] += view[j * 4 + r] * world[j];
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        clip[r] += projection[j * 4 + r] * eye[j];
+                const int x = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+                const int y = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+                const int red = At(x, y).r;
+                darkest = red < darkest ? red : darkest;
+                soft += red > 82 && red < 108 ? 1 : 0;  // neither in the shadow nor out of it
+            }
+            printf("    across the tower's shadow: darkest %d, %d of 61 places on its soft edge\n", darkest, soft);
+            Check(log.find("(150 m around the camera, 2048x2048)") != std::string::npos, "shadow distance 150 m at 2048");
+            Check(darkest <= 82, "a thin shadow near you is fully dark at 150 m (not smeared out)");
+            Check(soft <= 12, "and its edge is sharp");
+        } else {
+            Check(log.find("(18 m around the camera, 4096x4096)") != std::string::npos,
+                  "an old ini's ShadowDistance=60 (feet) and ShadowMapSize=4096 read as before: 18 m at 4096");
+        }
     } else if (mode == "offscreen") {
         // Ground 3.5 m ahead and 1 m right (in the tower's shadow) against 1 m left (in the sun).
         const Pixel shaded = At(604, 374), sunny = At(356, 374);
@@ -832,7 +1218,54 @@ int main(int argc, char** argv)
             Check(mark.r + 20 < beside.r, "the rear tire leaves a groove behind it");
             Check(Near(beside, drawnGround, 3), "the ground beside the track is untouched");
             Check(tire.r > tire.b + 25, "the tire is caked with mud");
-            Check(std::abs(above.r - above.b) < 8, "higher up the bike stays clean");
+            // (The test wheel is a 2 m square: higher up it is still the wheel's own draw, which the
+            // tire dirt now goes on. On a real bike the wheel model is the wheel.)
+            (void)above;
+            if (mode == "tires") {
+                // The ground right next to the rear tire's contact (12 cm ahead, 6 cm towards the
+                // camera) against the same place 1 m further ahead (as far from the front tire's rut,
+                // away from the rear tire): ground both, not mud painted around the tire.
+                int gx = 0, gy = 0, fx = 0, fy = 0;
+                ToPixel(rearX + 0.12f, 0.0f, -4.5f + 0.06f, gx, gy);
+                ToPixel(rearX + 1.12f, 0.0f, -4.5f + 0.06f, fx, fy);
+                const Pixel next = At(gx, gy), ahead = At(fx, fy);
+                printf("    ground next to the rear tire %d %d %d, the same 1 m ahead %d %d %d\n", next.r, next.g, next.b,
+                       ahead.r, ahead.g, ahead.b);
+                Check(Near(next, ahead, 5), "no square of mud on the ground under the tire");
+            }
+        }
+        if (mode == "tires") {
+            // Flicker: the mud on the rear tire at the same places on the wheel, frame 10 and 11 (at
+            // 27 m/s it turns ~73 degrees a frame). A pattern that jumps changes there; blurred, not.
+            double before = 0, after = 0;
+            int samples = 0;
+            for (int k = 0; k < 48; ++k) {
+                const float a = k * (6.2831853f / 48.0f);
+                int x[2], y[2];
+                for (int fr = 0; fr < 2; ++fr) {
+                    const float axleX = -5.5f + (10 + fr) * 0.45f + 0.25f;
+                    ToPixel(axleX + 0.29f * std::cos(a), 0.36f + 0.29f * std::sin(a), -4.5f, x[fr], y[fr]);
+                }
+                if (x[0] < 0 || x[0] >= W || y[0] < 0 || y[0] >= H || x[1] < 0 || x[1] >= W || y[1] < 0 || y[1] >= H)
+                    continue;
+                before += rgbBefore[(static_cast<size_t>(H - 1 - y[0]) * W + x[0]) * 3];
+                after += At(x[1], y[1]).r;
+                ++samples;
+            }
+            // The mud turns with the tire now (it's on it, like its tread): how much of it there is
+            // round the tire must hold steady from one frame to the next.
+            const double diff = samples > 0 ? std::fabs(before - after) / samples : 99.0;
+            printf("    tire dirt round the tire a frame apart: average red differs by %.1f (%d places)\n", diff, samples);
+            Check(samples > 30 && diff < 4.0, "the mud on a fast-turning tire doesn't flicker from frame to frame");
+            double low = 1.0, high = 0.0;
+            printf("    muddy share of the rear tire, frames 4-11 (from when it's found):");
+            for (int f3 = 4; f3 <= 11; ++f3) {
+                printf(" %.2f", tireCover[f3]);
+                low = std::fmin(low, tireCover[f3]);
+                high = std::fmax(high, tireCover[f3]);
+            }
+            printf("\n");
+            Check(low > 0.2 && high - low < 0.3, "the mud stays on the tire every frame (it doesn't come and go)");
         }
     } else if (hiddenWheels) {
         // What the log says about the wheels: found while drawn, and never lost after.
@@ -868,6 +1301,269 @@ int main(int argc, char** argv)
             Check(log.find(kept) != std::string::npos, (std::string("the ") + wheel + " wheel's draw call is kept while it's drawn").c_str());
             Check(log.find(cast) != std::string::npos, (std::string("the ") + wheel + " wheel still casts a shadow once it isn't drawn").c_str());
         }
+    } else if (headShadow) {
+        // Where the head's shadow lands: from the middle of the head (about the eye) along the sun
+        // down to the ground, onto the screen; and the same spot mirrored to the left (in the sun).
+        float sunWorld[3];
+        for (int r = 0; r < 3; ++r)  // eye space -> world: the view's rotation, transposed
+            sunWorld[r] = view[r * 4] * sunEye[0] + view[r * 4 + 1] * sunEye[1] + view[r * 4 + 2] * sunEye[2];
+        const float t = 1.6f / sunWorld[1];
+        const float spot[2][3] = { { -sunWorld[0] * t, 0.0f, -sunWorld[2] * t }, { sunWorld[0] * t, 0.0f, -sunWorld[2] * t } };
+        int px[2] = {}, py[2] = {};
+        for (int k = 0; k < 2; ++k) {
+            const float world[4] = { spot[k][0], spot[k][1], spot[k][2], 1 };
+            float eye[4] = {}, clip[4] = {};
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    eye[r] += view[j * 4 + r] * world[j];
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    clip[r] += projection[j * 4 + r] * eye[j];
+            px[k] = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+            py[k] = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+        }
+        const Pixel shade = At(px[0], py[0]), sunny = At(px[1], py[1]);
+        printf("    head's shadow at (%.1f, %.1f) m: pixel %d,%d is %d %d %d; mirrored %d,%d is %d %d %d\n", spot[0][0],
+               spot[0][2], px[0], py[0], shade.r, shade.g, shade.b, px[1], py[1], sunny.r, sunny.g, sunny.b);
+        Check(shade.r + 20 < sunny.r, "your head casts a shadow in first person, with no helmet drawn");
+        {
+            // The torso's: from its upper part (1.05 m up, under the eye; lower down it falls off the
+            // bottom of the picture), the same way.
+            const float tt = 1.05f / sunWorld[1];
+            const float torsoSpot[4] = { -sunWorld[0] * tt, 0.0f, -sunWorld[2] * tt, 1 };
+            const float mirrored[4] = { sunWorld[0] * tt, 0.0f, -sunWorld[2] * tt, 1 };
+            int tx[2] = {}, ty[2] = {};
+            for (int k = 0; k < 2; ++k) {
+                const float* world = k == 0 ? torsoSpot : mirrored;
+                float eye[4] = {}, clip[4] = {};
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        eye[r] += view[j * 4 + r] * world[j];
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        clip[r] += projection[j * 4 + r] * eye[j];
+                tx[k] = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+                ty[k] = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+            }
+            const bool onScreen = tx[0] >= 0 && tx[0] < W && ty[0] >= 0 && ty[0] < H && tx[1] >= 0 && tx[1] < W && ty[1] >= 0 && ty[1] < H;
+            const Pixel torsoShade = onScreen ? At(tx[0], ty[0]) : Pixel{}, torsoSunny = onScreen ? At(tx[1], ty[1]) : Pixel{};
+            printf("    torso's shadow at (%.1f, %.1f) m: pixel %d,%d is %d; mirrored %d,%d is %d\n", torsoSpot[0], torsoSpot[2],
+                   tx[0], ty[0], torsoShade.r, tx[1], ty[1], torsoSunny.r);
+            Check(onScreen && torsoShade.r + 20 < torsoSunny.r, "your torso casts a shadow in first person");
+            // From the head down to the torso, every 5 cm: shaded all the way (the head isn't apart).
+            int gaps = 0, lightest = 0;
+            for (float h = 1.6f; h >= 1.05f; h -= 0.05f) {
+                const float th = h / sunWorld[1];
+                const float world[4] = { -sunWorld[0] * th, 0.0f, -sunWorld[2] * th, 1 };
+                float eye[4] = {}, clip[4] = {};
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        eye[r] += view[j * 4 + r] * world[j];
+                for (int r = 0; r < 4; ++r)
+                    for (int j = 0; j < 4; ++j)
+                        clip[r] += projection[j * 4 + r] * eye[j];
+                const int x = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+                const int y = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+                if (x < 0 || x >= W || y < 0 || y >= H)
+                    continue;
+                const int r = At(x, y).r;
+                lightest = r > lightest ? r : lightest;
+                gaps += r + 20 < drawnGround.r ? 0 : 1;
+            }
+            printf("    head to torso: lightest %d (sunny ground %d), %d gap(s)\n", lightest, drawnGround.r, gaps);
+            Check(gaps == 0, "the head's shadow joins the torso's (no gap at the neck)");
+        }
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        Check(log.find("a helmet shape stands in for it") != std::string::npos, "the log says a helmet shape stands in");
+        Check(log.find("a torso shape on your rider's shoulders and hips stands in for it") != std::string::npos,
+              "the log says a torso shape on your rider's own shoulders and hips stands in for your torso");
+        // Where the game's arms start, the shoulder joints (the rider's upper arm bones: 25 cm either
+        // side, 0.85 m up, 10 cm ahead of the camera here): both in the shadow, so the arms join it.
+        for (int k = 0; k < 2; ++k) {
+            const float jx = k ? 0.25f : -0.25f, jy = 0.85f, jz = -0.1f;
+            const float th = jy / sunWorld[1];
+            const float world[4] = { jx - sunWorld[0] * th, 0.0f, jz - sunWorld[2] * th, 1 };
+            float eye[4] = {}, clip[4] = {};
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    eye[r] += view[j * 4 + r] * world[j];
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    clip[r] += projection[j * 4 + r] * eye[j];
+            const int x = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+            const int y = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+            const bool on = x >= 0 && x < W && y >= 0 && y < H;
+            const int r = on ? At(x, y).r : -1;
+            printf("    %s shoulder's shadow at pixel %d,%d: %d\n", k ? "right" : "left", x, y, r);
+            Check(on && r + 20 < drawnGround.r, k ? "the right shoulder (where the arm starts) is in the shadow"
+                                                   : "the left shoulder (where the arm starts) is in the shadow");
+        }
+    } else if (rival) {
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        for (const char* topic : { "tire marks:", "wheel on its own", "found your bike" })
+            for (size_t from = 0; (from = log.find(topic, from)) != std::string::npos;) {
+                const size_t end = log.find('\n', from);
+                printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
+                from = end;
+            }
+        // The other bike's track (1 m further away) behind where it is at the end, against untouched
+        // ground well off both tracks: no ruts of yours in it.
+        const float u = 3.2808f;
+        const auto Project = [&](float x, float z, int& px, int& py) {
+            const float world[4] = { x, 0.0f, z, 1 };
+            float eye[4] = {}, clip[4] = {};
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    eye[r] += view[j * 4 + r] * world[j];
+            for (int r = 0; r < 4; ++r)
+                for (int j = 0; j < 4; ++j)
+                    clip[r] += projection[j * 4 + r] * eye[j];
+            px = static_cast<int>((clip[0] / clip[3] * 0.5f + 0.5f) * W);
+            py = H - 1 - static_cast<int>((clip[1] / clip[3] * 0.5f + 0.5f) * H);
+        };
+        // (At the end, both bikes gone past: their tracks in view.)
+        int dark[2] = {}, places[2] = {};
+        for (int track = 0; track < 2; ++track)
+            for (int k = 0; k < 12; ++k) {
+                int px = 0, py = 0;
+                Project((0.2f + k * 0.3f) * u, (track ? -3.5f : -4.5f) * u, px, py);  // ridden after 1.5 s
+                if (px < 0 || px >= W || py < 0 || py >= H)
+                    continue;
+                const Pixel g = At(px, py);
+                dark[track] += g.r + 20 < drawnGround.r ? 1 : 0;
+                ++places[track];
+            }
+        printf("    your track: %d of %d places pressed in; the other bike's: %d of %d\n", dark[0], places[0], dark[1], places[1]);
+        Check(places[0] >= 6 && dark[0] >= places[0] / 2, "your tire marks are in your own track");
+        Check(places[1] >= 6 && dark[1] == 0, "your tire marks stay yours: none in the other bike's track");
+    } else if (wheelDrift) {
+        std::string log, saved;
+        for (int k = 0; k < 2; ++k) {
+            FILE* in = _wfsopen((dir + (k ? L"mxcam.ini" : L"mxcam.log")).c_str(), L"rb", _SH_DENYNO);
+            if (!in)
+                continue;
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                (k ? saved : log).append(buffer, got);
+            fclose(in);
+        }
+        for (const char* topic : { "tire marks:", "learnt where your", "wheel has been somewhere else" })
+            for (size_t from = 0; (from = log.find(topic, from)) != std::string::npos;) {
+                const size_t end = log.find('\n', from);
+                printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
+                from = end;
+            }
+        const size_t at = saved.find("RearWheelOnBike=");
+        double v[3] = { 0, 0, 0 };
+        if (at != std::string::npos)
+            sscanf_s(saved.c_str() + at + 16, "%lf,%lf,%lf", &v[0], &v[1], &v[2]);
+        printf("    ini: RearWheelOnBike=%.3f,%.3f,%.3f (learnt: 0.000,6.102,-0.820)\n", v[0], v[1], v[2]);
+        Check(log.find("tire marks: your wheels found") != std::string::npos, "the wheels are found");
+        Check(std::fabs(v[1] - 6.102) < 0.02 && log.find("learnt where your rear wheel sits") == std::string::npos,
+              "where the rear wheel sits doesn't creep after a long bad moment");
+        Check(log.find("let go of a part taken for your") == std::string::npos,
+              "your bike isn't measured from another part of it (your wheels stay where they sit)");
+    } else if (backShadow) {
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        Check(log.find("a swingarm shape stands in for the back of your bike") != std::string::npos,
+              "shapes stand in for the back of your bike (see frame.bmp)");
+    } else if (gateBox) {
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        for (size_t from = 0; (from = log.find("shadow map:", from)) != std::string::npos;) {
+            const size_t end = log.find('\n', from);
+            printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
+            from = end;
+        }
+        Check(log.find("shadow map: a part of your bike") == std::string::npos &&
+                  log.find("shadow map: a part of your rider") == std::string::npos,
+              "a box standing beside you while you wait isn't taken for part of your bike");
+    } else if (rearHidden) {
+        std::string log;
+        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        for (const char* topic : { "shadow map:", "wheel on its own", "tire marks:" })
+            for (size_t from = 0; (from = log.find(topic, from)) != std::string::npos;) {
+                const size_t end = log.find('\n', from);
+                printf("    log: %s\n", log.substr(from, end == std::string::npos ? std::string::npos : end - from).c_str());
+                from = end;
+            }
+        Check(log.find("found your bike's front wheel on its own") != std::string::npos,
+              "the front wheel is found on its own (the rear one is never drawn)");
+        Check(log.find("shadow map: kept your front wheel's draw call") == std::string::npos,
+              "a wheel found on its own doesn't have its draw call kept (it could be the sprocket or a brake disc)");
+        Check(log.find("your rear wheel hasn't been drawn by the game yet: a tire and hub stand in for it") != std::string::npos,
+              "the rear wheel, never drawn, has a tire and hub standing in for it in the shadow map");
+        Check(log.find("shadow map: a part of your rider (on the torso: the helmet)") != std::string::npos,
+              "the helmet casts its shadow once the game stops drawing it");
+        Check(log.find("shadow map: a part of your bike") == std::string::npos,
+              "something riding alongside at your speed isn't cast as part of your bike");
+        Check(log.find("a swingarm shape stands in for the back of your bike") != std::string::npos,
+              "a swingarm shape stands in for the back of your bike");
+        Check(log.find("a piece of your rider the game doesn't draw here casts its shadow anyway") != std::string::npos,
+              "the rider's torso piece casts its shadow once the game stops drawing it");
+        Check(log.find("uses bones the game doesn't send here") == std::string::npos, "its bones are all found");
+        bool unitOk = true;
+        for (size_t from = 0; (from = log.find("units to the metre", from)) != std::string::npos; from += 18) {
+            const size_t colon = log.rfind(':', from);
+            const double unit = colon != std::string::npos ? atof(log.c_str() + colon + 1) : 0.0;
+            printf("    log: ...%.2f units to the metre\n", unit);
+            unitOk = unitOk && unit > 2.5;
+        }
+        Check(unitOk, "two other parts spinning close together aren't taken for your wheels (sizes stay right)");
+        using PFN_GetUniformiv = void(APIENTRY*)(GLuint, GLint, GLint*);
+        using PFN_GetUniformfv = void(APIENTRY*)(GLuint, GLint, GLfloat*);
+        const auto getInt = reinterpret_cast<PFN_GetUniformiv>(p_wglGetProcAddress("glGetUniformiv"));
+        const auto getFloat = reinterpret_cast<PFN_GetUniformfv>(p_wglGetProcAddress("glGetUniformfv"));
+        GLint bonesNow = -2;
+        GLfloat bone0[3] = {};
+        if (getInt && getFloat) {
+            getInt(rider, rCount, &bonesNow);
+            getFloat(rider, rBones, bone0);
+        }
+        printf("    rider program: %d bones, bone 0 at %.2f %.2f %.2f (the game last sent %d, %.2f %.2f %.2f)\n", bonesNow,
+               bone0[0], bone0[1], bone0[2], lastBones, lastBone0[0], lastBone0[1], lastBone0[2]);
+        Check(bonesNow == lastBones && std::fabs(bone0[0] - lastBone0[0]) + std::fabs(bone0[1] - lastBone0[1]) +
+                  std::fabs(bone0[2] - lastBone0[2]) < 1e-4f,
+              "the rider program's bones are the game's again");
     } else if (mode == "thirdperson") {
         // The light starts at the rider's bike, not at the camera behind it.
         // (The bike is turned 30 degrees to the right, so its beam is right of the middle.)
