@@ -957,7 +957,11 @@ const RowDef kRows[] = {
         .Help("How big the dirt detail's grains and pebbles are."),
     Slider(1, nullptr,           "Tire marks",           &Config::tireMarks,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Your tires dig ruts in the dirt behind you: packed, darker dirt with the knobs' "
-              "imprint and loose clods along the edges. They stay on the track about 80 m around you."),
+              "imprint and loose clods along the edges. They stay on the track for about 160 m "
+              "around you, and come back exactly as you made them whenever you return to a spot "
+              "you'd ridden (see the mark cache below for how far back that reaches)."),
+    Slider(1, nullptr,           "Mark cache",           &Config::markCacheSegs,    10000.0, 100000.0, 5000.0, 1.0, 0, "", nullptr)
+        .Help("How far back along your ride the tire marks are remembered. A cache of 40 000 is ~11 minutes of riding. "),
     Slider(1, nullptr,           "Tire dirt",            &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Mud caked on your tires, in clumps that turn with the wheels, lit by the sun."),
     Slider(1, "COLOR",           "Brightness",           &Config::exposure,         -2.0,  2.0,   0.05,   1.0,    2, " EV")
@@ -1449,6 +1453,13 @@ void ListenForKey(double now)
 // ===========================================================================
 void FormatValue(const RowDef& def, double value, char* out, size_t size)
 {
+    if (def.number == &Config::markCacheSegs) {
+        // The mark cache: the count it keeps, and the memory it costs (both wheels, kMarkSegBytes
+        // a segment), so the size can be weighed before it's set.
+        const double bytes = value * 2.0 * static_cast<double>(kMarkSegBytes);
+        snprintf(out, size, "%.0f segs: %.1f MB", value, bytes / (1024.0 * 1024.0));
+        return;
+    }
     if (def.zeroText && value <= def.min + def.step * 0.5) {
         snprintf(out, size, "%s", def.zeroText);
     } else if (def.clock) {
@@ -1521,6 +1532,8 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;
+        if (def.number == &Config::markCacheSegs)
+            return cfg.tireMarks <= 0;
         if (def.number == &Config::dofFocus)
             return cfg.depthOfField <= 0;
     }

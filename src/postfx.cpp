@@ -2617,14 +2617,15 @@ constexpr int    kMarkSizeNarrow = 4096;   // if the wide one can't be made
 constexpr double kMarkBlend      = 60.0;   // m: how wide the fade band before the window's
                                            // edge is (the shader's kMarkBlend, kept in step
                                            // with this)
-constexpr int    kMarkCacheCap   = 40000;  // segments per wheel the cache holds at most
-                                           // (a ground contact per frame per wheel while
-                                           // moving: about 11 minutes of riding, ~4 MB)
+constexpr double kMarkCacheMin   = 10000.0;  // segments per wheel the cache keeps at least
+constexpr double kMarkCacheMax   = 100000.0; // ...and at most: the panel's and mxcam.ini's range
+                                             // for MarkCacheSegs ("Mark cache" on the GRAPHICS
+                                             // tab, which also shows the memory it costs)
 struct MarkSeg {
     double au, av, bu, bv;  // the two contacts, in the map's own (unwrapped) texels
     double halfWidth = 0;   // m: the rut's half width (its true world width)
     double strength  = 0;   // how deep: rear 1, front 0.7
-};
+};                          // six doubles each: config.h's kMarkSegBytes, what the panel shows
 std::deque<MarkSeg> g_markCache[2];  // each wheel's ruts this session, oldest first
 struct MarkLevel {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
@@ -2633,6 +2634,13 @@ struct MarkLevel {
     bool      set = false;    // the window has an origin
 };
 MarkLevel g_mark;  // the map
+
+// How many segments per wheel the cache keeps: the setting's (the panel's "Mark cache",
+// mxcam.ini's MarkCacheSegs), inside the range offered there.
+size_t MarkCacheCap()
+{
+    return static_cast<size_t>(Clamp(GetConfig().markCacheSegs, kMarkCacheMin, kMarkCacheMax));
+}
 
 void PlaneAxes(Vec3& u, Vec3& v)
 {
@@ -2674,8 +2682,10 @@ bool EnsureMarks()
     g_mark.set = false;
     g_mark.texel = 0.04 * g_unitsPerMetre;
     const double reach = g_mark.size * g_mark.texel / 2.0 / g_unitsPerMetre;
-    Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; the whole session's ruts are kept in a cache of %d segments per wheel and re-pressed wherever ground is reused",
-        g_mark.size, g_mark.size, ok ? "ready" : "could not be made", reach, kMarkBlend, kMarkCacheCap);
+    const size_t cap = MarkCacheCap();
+    Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; the whole session's ruts are kept in a cache of %d segments per wheel (%.1f MB) and re-pressed wherever ground is reused",
+        g_mark.size, g_mark.size, ok ? "ready" : "could not be made", reach, kMarkBlend,
+        static_cast<int>(cap), static_cast<double>(cap) * 2.0 * static_cast<double>(kMarkSegBytes) / (1024.0 * 1024.0));
     return ok;
 }
 
@@ -2891,7 +2901,7 @@ bool UpdateMarks(double dt)
                 // be no rut to re-press. Oldest segments go only once the cap is reached.
                 if (!g_air.airborne) {
                     g_markCache[i].push_back({ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
-                    if (g_markCache[i].size() > static_cast<size_t>(kMarkCacheCap))
+                    if (g_markCache[i].size() > MarkCacheCap())
                         g_markCache[i].pop_front();
                 }
             }
