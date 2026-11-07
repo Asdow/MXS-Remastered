@@ -13,6 +13,8 @@
 //     night     TimeOfDay=0: dark ground, a night sky, the HUD untouched, the sun turned
 //     shadows   screen-space sun shadows only: the object shades the ground beside it
 //     offscreen shadow maps: a tower behind the camera shades the ground in view
+//     stadium   the same under a roof 120 m across: the roof is left out, the ground stays sunny
+//     stadiumswap  the roof made in a deleted box's place (another track loaded): still left out
 //     headlight TimeOfDay=0 and the headlight: a lit pool ahead, the rest night
 //     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
 //     tireshidden  the same at 5 m/s for ~3.5 s, its wheels no longer drawn after 1.4 s (as the game
@@ -86,6 +88,7 @@ using PFN_Uniform1i          = void(APIENTRY*)(GLint, GLint);
 using PFN_UniformMatrix3fv   = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
 using PFN_BindAttribLocation = void(APIENTRY*)(GLuint, GLuint, const char*);
 using PFN_GenObjects         = void(APIENTRY*)(GLsizei, GLuint*);
+using PFN_DeleteObjects      = void(APIENTRY*)(GLsizei, const GLuint*);
 using PFN_BindObject         = void(APIENTRY*)(GLuint);
 using PFN_BindBuffer         = void(APIENTRY*)(GLenum, GLuint);
 using PFN_BufferData         = void(APIENTRY*)(GLenum, ptrdiff_t, const void*, GLenum);
@@ -102,6 +105,7 @@ struct Api {
     PFN_BufferData BufferData; PFN_VertexAttribPointer VertexAttribPointer;
     PFN_BindObject EnableVertexAttribArray; PFN_ActiveTexture ActiveTexture;
     PFN_Uniform1i Uniform1i; PFN_UniformMatrix3fv UniformMatrix3fv;
+    PFN_DeleteObjects DeleteBuffers; PFN_DeleteObjects DeleteVertexArrays;
 };
 Api gl{};
 
@@ -238,6 +242,15 @@ int main(int argc, char** argv)
     }
     setvbuf(stdout, nullptr, _IONBF, 0);
     const std::string mode = argv[2];
+    // tireslate: the tires scene with the tire dirt off, turned on while riding (frame 6): it must come.
+    const bool tiresLate = mode == "tireslate";
+    // stadium: the offscreen scene under a roof 120 m across, 3.7 m up (a stadium's stands and roof):
+    // left out of the shadow map, the track stays sunny and the tower still casts.
+    // stadiumswap: another track loaded mid-run. A small box is drawn first, then its arrays and
+    // buffers are deleted and the roof made in their place (the names are given out again): the
+    // roof must still be measured as the roof and left out.
+    const bool stadiumSwap = mode == "stadiumswap";
+    const bool stadium = mode == "stadium" || stadiumSwap;
 
     // A folder of our own with the DLL and an ini for the mode.
     wchar_t temp[MAX_PATH];
@@ -268,7 +281,7 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
     else if (mode == "shadows")  // screen-space shadows alone
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=0");
-    else if (mode == "offscreen")  // shadow maps alone (the screen-space ones as short as they go)
+    else if (mode == "offscreen" || stadium)  // shadow maps alone (the screen-space ones as short as they go)
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowLength=1");
     else if (mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson") {
         base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
@@ -278,10 +291,10 @@ int main(int argc, char** argv)
     else if (mode == "shadowperf" || mode == "shadowperf0")  // timing: 800 objects cast shadow-map shadows
         settings = base.replace(base.find("Shadows=0"), 9, mode == "shadowperf" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
                                                                                 : "Shadows=1\nShadowMap=1\nShadowBatch=0");
-    else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden" || mode == "rearhidden" ||
+    else if (mode == "tires" || tiresLate || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden" || mode == "rearhidden" ||
              mode == "gatebox" || mode == "backshadow" || mode == "wheeldrift" || mode == "rival")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
         // (tires: the dirt at 0.75, a player's setting: patchy mud, not a tire covered in it)
-        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : "TireMarks=1\nTireDirt=1");
+        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : tiresLate ? "TireMarks=1\nTireDirt=0" : "TireMarks=1\nTireDirt=1");
     else if (mode == "longshadow")  // shadow distance far out (150 m, 8192): a tall tower far behind still casts
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistanceM=150\nShadowResolution=2");
     else if (mode == "longsharp")  // 150 m at the lowest resolution: near you the shadows must stay sharp (cascades)
@@ -290,7 +303,7 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistance=60\nShadowMapSize=4096");
     else if (mode == "headshadow")  // first person: your helmet isn't drawn, a ball stands in for it in the shadow map
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
-    else if (mode == "hidehud")  // the HUD hidden while riding, once the mouse has been left alone
+    else if (mode == "hidehud")  // the HUD hidden while riding at once, shown with the game's menu (Esc)
         settings = base + "[Other]\nHideHud=1\n";
     else if (mode == "dof")
         settings = base.replace(base.find("DepthOfField=0"), 14, "DepthOfField=1\nDofFocus=60");
@@ -321,6 +334,8 @@ int main(int argc, char** argv)
 
     // Whoever is at the desk moving the mouse mustn't count as using the game's menus.
     SetEnvironmentVariableA("MXCAM_TEST_MOUSE_IDLE", "1");
+    if (tiresLate)
+        SetEnvironmentVariableA("MXCAM_TEST_RELOAD_FRAME", "6");  // the ini read again then (changed at frame 3)
     HMODULE proxy = LoadLibraryW(dll.c_str());
     if (!proxy) {
         printf("could not load the DLL (error %lu)\n", GetLastError());
@@ -365,6 +380,7 @@ int main(int argc, char** argv)
     PROC(GenVertexArrays, "glGenVertexArrays") PROC(BindVertexArray, "glBindVertexArray") PROC(GenBuffers, "glGenBuffers")
     PROC(BindBuffer, "glBindBuffer") PROC(BufferData, "glBufferData") PROC(VertexAttribPointer, "glVertexAttribPointer")
     PROC(EnableVertexAttribArray, "glEnableVertexAttribArray") PROC(ActiveTexture, "glActiveTexture")
+    PROC(DeleteBuffers, "glDeleteBuffers") PROC(DeleteVertexArrays, "glDeleteVertexArrays")
 #undef PROC
 
     printf("postfx test, mode '%s'\n", mode.c_str());
@@ -434,8 +450,9 @@ int main(int argc, char** argv)
     GLuint arrays[8] = {};
     gl.GenVertexArrays(8, arrays);
     const auto mesh = [&](GLuint array, const float* vertices, size_t vertexBytes, int components,
-                          const unsigned short* indices, size_t indexBytes) {
-        GLuint buffers[2] = {};
+                          const unsigned short* indices, size_t indexBytes, GLuint* made = nullptr) {
+        GLuint local[2] = {};
+        GLuint* buffers = made ? made : local;
         gl.BindVertexArray(array);
         gl.GenBuffers(2, buffers);
         gl.BindBuffer(0x8892, buffers[0]);
@@ -453,6 +470,16 @@ int main(int argc, char** argv)
     const unsigned short cubeIndices[36] = { 0, 2, 1, 1, 2, 3,  4, 5, 6, 5, 7, 6,  0, 4, 2, 4, 6, 2,
                                              1, 3, 5, 5, 3, 7,  2, 6, 3, 3, 6, 7,  0, 1, 4, 4, 1, 5 };
     mesh(arrays[1], cube, sizeof cube, 3, cubeIndices, sizeof cubeIndices);
+    // A roof (stadium): the cube made 400 units across in its own vertices (a big model, not a
+    // scaled matrix: that's how the HUD is told apart).
+    float roofVertices[24];
+    for (int k = 0; k < 24; ++k)
+        roofVertices[k] = (k % 3 == 1) ? cube[k] : cube[k] * 400.0f;
+    GLuint roofBuffers[2] = {};
+    if (stadiumSwap)  // (the small box first: the roof takes its place at frame 10)
+        mesh(arrays[7], cube, sizeof cube, 3, cubeIndices, sizeof cubeIndices, roofBuffers);
+    else
+        mesh(arrays[7], roofVertices, sizeof roofVertices, 3, cubeIndices, sizeof cubeIndices, roofBuffers);
     const float quad[12] = { -1, -1, 0, 1, -1, 0, -1, 1, 0, 1, 1, 0 };
     mesh(arrays[2], quad, sizeof quad, 3, patchIndices, sizeof patchIndices);
     // A wheel: a 2 m square across its axle (its own x), standing in for the rim and tire.
@@ -505,9 +532,9 @@ int main(int argc, char** argv)
     // throws its shadow forward onto the visible ground.
     const bool headShadow = mode == "headshadow";
     const bool farTower = mode == "longshadow" || mode == "oldshadow" || mode == "longsharp";
-    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "backshadow" ? 0.25f : mode == "offscreen" || farTower ? 0.0f : headShadow ? -0.5f : 0.3f,
-                              mode == "shadows" ? 0.6f : mode == "backshadow" ? 0.95f : mode == "offscreen" || farTower ? 0.15f : headShadow ? 0.17f : 0.8f,
-                              mode == "shadows" ? 0.0f : mode == "offscreen" || farTower ? 0.99f : headShadow ? 0.83f : 0.5f };
+    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "backshadow" ? 0.25f : (mode == "offscreen" || stadium) || farTower ? 0.0f : headShadow ? -0.5f : 0.3f,
+                              mode == "shadows" ? 0.6f : mode == "backshadow" ? 0.95f : (mode == "offscreen" || stadium) || farTower ? 0.15f : headShadow ? 0.17f : 0.8f,
+                              mode == "shadows" ? 0.0f : (mode == "offscreen" || stadium) || farTower ? 0.99f : headShadow ? 0.83f : 0.5f };
     const float hud[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0.3f, -1, 1 };  // scaled: the HUD
     const float flare[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, -0.3f, 0.3f, -1, 1 };  // the game's lens flare
     const int flareX = static_cast<int>((1.0f - projection[0] * 0.3f) * 0.5f * W);
@@ -610,14 +637,44 @@ int main(int argc, char** argv)
     // tire marks must stay yours: none in the other bike's track.
     const bool rival = mode == "rival";
     const bool hideHud = mode == "hidehud";
-    const int frames = timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 260 : headShadow ? 40 : 12;  // hidehud: ~4 s, past the mouse's 3
+    const int frames = timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 330 : headShadow ? 40 : stadiumSwap ? 40 : 12;
+    // hidehud: the game's menu over the race, a draw of its own (another texture) right of the HUD.
+    // Esc opens it (frames 100-199), Esc closes it; then it's opened and closed without Esc (frames
+    // 230-299: a click in it). The HUD and the menu are sampled on the frames below.
+    const int hudFrames[5] = { 3, 180, 220, 290, 325 };
+    const bool hudShownAt[5] = { false, true, false, true, false };
+    Pixel hudAt[5] = {}, menuAt[5] = {};
+    GLuint menuTextures[3] = {};  // the menu: three draws of its own (a panel, its text, a button)
+    if (hideHud)
+        p_glGenTextures(3, menuTextures);
+    const int menuX = static_cast<int>((1.0f + projection[0] * 0.3f) * 0.5f * W);
     LARGE_INTEGER frequency, frameStart, frameEnd, runStart;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&runStart);
     double timedMs = 0;
     int timedFrames = 0;
     for (int frameIndex = 0; frameIndex < frames; ++frameIndex) {
+        if (stadiumSwap && frameIndex == 10) {  // another track: the box's arrays and buffers go, the roof comes
+            const GLuint before[3] = { arrays[7], roofBuffers[0], roofBuffers[1] };
+            gl.DeleteVertexArrays(1, &arrays[7]);
+            gl.DeleteBuffers(2, roofBuffers);
+            gl.GenVertexArrays(1, &arrays[7]);
+            mesh(arrays[7], roofVertices, sizeof roofVertices, 3, cubeIndices, sizeof cubeIndices, roofBuffers);
+            gl.BindVertexArray(0);
+            printf("    the roof made in the box's place: arrays %u -> %u, buffers %u %u -> %u %u (%s)\n", before[0], arrays[7],
+                   before[1], before[2], roofBuffers[0], roofBuffers[1],
+                   before[0] == arrays[7] && before[1] == roofBuffers[0] ? "the same names" : "other names");
+        }
         QueryPerformanceCounter(&frameStart);
+        if (tiresLate && frameIndex == 3) {  // the tire dirt turned on in the menu (read again at frame 6)
+            std::string on = settings;
+            on.replace(on.find("TireDirt=0"), 10, "TireDirt=0.75");
+            FILE* out = nullptr;
+            if (_wfopen_s(&out, ini.c_str(), L"wb") == 0 && out) {
+                fputs(on.c_str(), out);
+                fclose(out);
+            }
+        }
         if (mode == "motion")  // the head turning quickly from side to side
             MakeView(0, 1.6f, 0, 12.0f, frameIndex % 2 ? 1.0f : -1.0f, view);
         // headshadow: for a while the game's camera sits 1.5 m behind your head (a replay, another
@@ -677,7 +734,7 @@ int main(int argc, char** argv)
         // Tires: your bike crossing the view from left to right, 4.5 m ahead, on spinning wheels,
         // with your rider on it. The bike model faces its own -Z (here: world +X), its origin
         // sits below the ground and its wheels are models of their own, like MX Simulator's.
-        if ((mode == "tires" || mode == "tiresfeet" || mode == "tiresair" || hiddenWheels || rearHidden || wheelDrift || rival) && rider) {
+        if ((mode == "tires" || tiresLate || mode == "tiresfeet" || mode == "tiresair" || hiddenWheels || rearHidden || wheelDrift || rival) && rider) {
             const float u = mode == "tiresfeet" || rearHidden || wheelDrift || rival ? 3.2808f : 1.0f;  // game units per metre
             const float lift = mode == "tiresair" ? 1.2f : 0.0f;    // in the air: no ruts
             // tireshidden: on the clock at 5 m/s; after 1.4 s the wheels aren't drawn any more (the
@@ -797,7 +854,7 @@ int main(int argc, char** argv)
                 p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             }
             const float grey[3] = { 0.3f, 0.3f, 0.3f };
-            if (mode == "tires" && wheelsDrawn) {
+            if ((mode == "tires" || tiresLate) && wheelsDrawn) {
                 // tires: the rear wheel's brake disc, drawn first (so it's the part followed as the
                 // wheel): the dirt must still go on the tire, not just on the disc.
                 UseBike(steelTex);
@@ -899,7 +956,16 @@ int main(int argc, char** argv)
                 p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
             }
         }
-        if (mode == "offscreen") {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
+        if (stadium) {  // the roof: one object 400 units across, 12 up
+            const float roof[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.0f, 12.0f, 0.0f, 1 };
+            Mul(view, roof, viewModel);
+            gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+            gl.BindVertexArray(arrays[7]);
+            // (stadiumswap: the box drawn as another draw call, 30 indices: the roof's is one never measured)
+            p_glDrawElements(GL_TRIANGLES, stadiumSwap && frameIndex < 10 ? 30 : 36, GL_UNSIGNED_SHORT, nullptr);
+            gl.BindVertexArray(arrays[1]);
+        }
+        if (mode == "offscreen" || stadium) {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
             // Drawn with blending on, as MX Simulator draws its solid objects: it must still cast.
             p_glEnable(GL_BLEND);
             p_glBlendFunc(GL_ONE, GL_ZERO);
@@ -944,6 +1010,45 @@ int main(int argc, char** argv)
         gl.Uniform3fv(oColor, 1, purple);
         p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         p_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        if (hideHud) {
+            if (frameIndex == 100 || frameIndex == 200)
+                SendMessageA(window, WM_KEYDOWN, VK_ESCAPE, 1);
+            // A HUD text that changed while the menu was open (a timer, a position: a new draw then),
+            // drawn again during the race after: it's learnt with the menu's page, but alone it must
+            // not count as the menu being open (that once kept the HUD and cursor up all the time).
+            if ((frameIndex >= 100 && frameIndex < 230) || frameIndex >= 300) {
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, hud);
+                gl.Uniform3fv(oColor, 1, white);
+                p_glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, nullptr);
+            }
+            if ((frameIndex >= 100 && frameIndex < 200) || (frameIndex >= 230 && frameIndex < 300)) {
+                const float menuMv[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, 0.3f, 0.3f, -1, 1 };
+                const float green[3] = { 0.1f, 0.9f, 0.1f };
+                GLint wasBound = 0;
+                gl.ActiveTexture(0x84C0);
+                p_glGetIntegerv(GL_TEXTURE_BINDING_2D, &wasBound);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, menuMv);
+                gl.Uniform3fv(oColor, 1, green);
+                for (GLuint t : menuTextures) {
+                    p_glBindTexture(GL_TEXTURE_2D, t);
+                    p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+                }
+                p_glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(wasBound));
+                gl.ActiveTexture(0x84C0 + 2);
+            }
+            for (int k = 0; k < 5; ++k) {
+                if (frameIndex != hudFrames[k])
+                    continue;
+                unsigned char px[3];
+                p_glFinish();
+                p_glReadBuffer(GL_BACK);
+                p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                p_glReadPixels(W / 2, H - 1 - 130, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+                hudAt[k] = Pixel{ px[0], px[1], px[2] };
+                p_glReadPixels(menuX, H - 1 - 130, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+                menuAt[k] = Pixel{ px[0], px[1], px[2] };
+            }
+        }
 
         p_glGetIntegerv(0x8B8D, &programAfter);
         p_glGetIntegerv(0x84E0, &activeAfter);
@@ -957,7 +1062,7 @@ int main(int argc, char** argv)
         if (errorAfter != GL_NO_ERROR)
             printf("    GL error 0x%X on frame %d\n", errorAfter, frameIndex);
 
-        if (mode == "tires" && frameIndex >= 3 && frameIndex <= 11) {
+        if ((mode == "tires" || tiresLate) && frameIndex >= 3 && frameIndex <= 11) {
             // How much of the rear tire is muddy this frame (48 places round it, 29 cm from the axle).
             p_glFinish();
             p_glReadBuffer(GL_BACK);
@@ -990,7 +1095,7 @@ int main(int argc, char** argv)
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
             p_glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, rgbBefore.data());
         }
-        if (frameIndex == (hideHud || headShadow || rival || (rearHidden && !gateBox) ? frames - 1 : 11)) {
+        if (frameIndex == (hideHud || headShadow || rival || stadiumSwap || (rearHidden && !gateBox) ? frames - 1 : 11)) {
             p_glFinish();
             p_glReadBuffer(GL_BACK);
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -1036,6 +1141,17 @@ int main(int argc, char** argv)
     const Pixel drawnSky{ 102, 153, 217 }, drawnGround{ 115, 92, 69 }, drawnBox{ 204, 26, 26 };
     if (hideHud) {
         Check(Near(hudPixel, drawnSky, 12), "the HUD is hidden while riding (the sky shows where it was)");
+        static const char* const kWhen[5] = { "from the start", "with the game's menu open (Esc)", "once Esc closed the menu",
+                                              "with the menu open again (no Esc)", "once the menu closed (no Esc)" };
+        for (int k = 0; k < 5; ++k) {
+            printf("    frame %d: HUD %d %d %d, menu %d %d %d\n", hudFrames[k], hudAt[k].r, hudAt[k].g, hudAt[k].b, menuAt[k].r,
+                   menuAt[k].g, menuAt[k].b);
+            const bool white = hudAt[k].r == 255 && hudAt[k].g == 255 && hudAt[k].b == 255;
+            Check(hudShownAt[k] ? white : Near(hudAt[k], drawnSky, 12),
+                  (std::string("the HUD is ") + (hudShownAt[k] ? "shown " : "hidden ") + kWhen[k]).c_str());
+            if (hudShownAt[k])
+                Check(menuAt[k].g > 200 && menuAt[k].r < 60, (std::string("the game's menu is drawn ") + kWhen[k]).c_str());
+        }
         std::string log;
         FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
@@ -1162,7 +1278,7 @@ int main(int argc, char** argv)
             Check(log.find("(18 m around the camera, 4096x4096)") != std::string::npos,
                   "an old ini's ShadowDistance=60 (feet) and ShadowMapSize=4096 read as before: 18 m at 4096");
         }
-    } else if (mode == "offscreen") {
+    } else if (mode == "offscreen" || stadium) {
         // Ground 3.5 m ahead and 1 m right (in the tower's shadow) against 1 m left (in the sun).
         const Pixel shaded = At(604, 374), sunny = At(356, 374);
         printf("    ground right %d %d %d (tower's shadow), left %d %d %d\n", shaded.r, shaded.g, shaded.b, sunny.r, sunny.g, sunny.b);
@@ -1267,6 +1383,14 @@ int main(int argc, char** argv)
             printf("\n");
             Check(low > 0.2 && high - low < 0.3, "the mud stays on the tire every frame (it doesn't come and go)");
         }
+    } else if (tiresLate) {
+        printf("    muddy share of the rear tire, frames 3-11 (turned on at frame 6):");
+        for (int f3 = 3; f3 <= 11; ++f3)
+            printf(" %.2f", tireCover[f3]);
+        printf("\n");
+        Check(tireCover[3] < 0.05 && tireCover[5] < 0.05, "with the tire dirt off, no mud on the tire");
+        Check(std::fmin(tireCover[9], std::fmin(tireCover[10], tireCover[11])) > 0.2,
+              "turned on while riding, the mud comes on the tire");
     } else if (hiddenWheels) {
         // What the log says about the wheels: found while drawn, and never lost after.
         std::string log;
@@ -1297,7 +1421,7 @@ int main(int argc, char** argv)
               "wheels the game stops drawing stay on your bike (not lost)");
         for (const char* wheel : { "rear", "front" }) {
             const std::string kept = std::string("shadow map: kept your ") + wheel + " wheel's draw call";
-            const std::string cast = std::string("shadow map: your ") + wheel + " wheel isn't drawn by the game here";
+            const std::string cast = std::string("shadow map: your ") + wheel + " wheel isn't drawn by the game here: a tire and hub";
             Check(log.find(kept) != std::string::npos, (std::string("the ") + wheel + " wheel's draw call is kept while it's drawn").c_str());
             Check(log.find(cast) != std::string::npos, (std::string("the ") + wheel + " wheel still casts a shadow once it isn't drawn").c_str());
         }
@@ -1530,7 +1654,7 @@ int main(int argc, char** argv)
               "the front wheel is found on its own (the rear one is never drawn)");
         Check(log.find("shadow map: kept your front wheel's draw call") == std::string::npos,
               "a wheel found on its own doesn't have its draw call kept (it could be the sprocket or a brake disc)");
-        Check(log.find("your rear wheel hasn't been drawn by the game yet: a tire and hub stand in for it") != std::string::npos,
+        Check(log.find("your rear wheel isn't drawn by the game here: a tire and hub stand in for it") != std::string::npos,
               "the rear wheel, never drawn, has a tire and hub standing in for it in the shadow map");
         Check(log.find("shadow map: a part of your rider (on the torso: the helmet)") != std::string::npos,
               "the helmet casts its shadow once the game stops drawing it");

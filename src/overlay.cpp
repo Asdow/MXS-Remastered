@@ -1027,9 +1027,9 @@ const RowDef kRows[] = {
               "tab's Shaders switch). Click the key, then press the new one. Esc cancels."),
     // ======== OTHER ========
     Toggle(4, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
-        .Help("Hides the game's HUD (timing, positions, chat) while you ride or watch a replay, for a "
-              "clean view. Move or click the mouse (or press Esc) and it shows again for a few "
-              "seconds, so the game's menus still work. Never hidden in the game's menus.")
+        .Help("Hides the game's HUD (timing, positions, chat) while you ride, spectate or watch a "
+              "replay, for a clean view. Open the game's menu (Esc) and it's all there as usual; "
+              "close it and the HUD goes again. Never hidden in the game's menus.")
         .Col(0),
     Toggle(4, nullptr,          "Hide cursor",               &Config::hideCursor)
         .Help("Hides the game's mouse cursor while you ride or watch a replay. It comes back as soon "
@@ -1077,9 +1077,13 @@ constexpr float  kFadedOpacity = 0.06f;
 constexpr double kAdjustHold   = 0.6;  // s the menu stays faded after the last arrow key step
 
 // ---- The game's HUD and cursor while riding (Config::hideHud / hideCursor) -----------------
-// Activity is the mouse moving or a button / Esc going down; it shows them for a few seconds.
+// The cursor: activity is the mouse moving or a button / Esc going down; it shows it for a few
+// seconds. The HUD: hidden all the while you ride, shown with the game's menu (GameMenuOverScene),
+// which Esc opens: Esc presses to the game are counted for it (TakeGameEscapes).
 constexpr ULONGLONG kRevealMs = 3000;
 std::atomic<ULONGLONG> g_lastMouseActivity{ 0 };
+std::atomic<int>       g_gameEscapes{ 0 };       // Esc presses that reached the game
+std::atomic<bool>      g_keyMessages{ false };   // the game gets its keys as window messages
 std::atomic<long long> g_lastMousePos{ 0 };   // (x << 32) | y, screen pixels
 std::atomic<HWND>      g_gameWindow{ nullptr };
 
@@ -1230,6 +1234,13 @@ bool    g_windowUnicode  = true;
 
 LRESULT CALLBACK PanelWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
+    // Esc going down for the game (not held, not to this panel, which keeps presses to itself): the
+    // game's menu opens or closes (Config::hideHud shows the HUD with it).
+    if (message == WM_KEYDOWN) {
+        g_keyMessages = true;
+        if (wParam == VK_ESCAPE && !(lParam & (1 << 30)) && !g_menuOpen.load(std::memory_order_relaxed))
+            ++g_gameEscapes;
+    }
     // The game's cursor while riding (Config::hideCursor), if it's the system's: none over the
     // game while the mouse is left alone. A move sends this first, and shows the game's again.
     if (message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT && !g_menuOpen.load(std::memory_order_relaxed)) {
@@ -1511,7 +1522,9 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return true;
         if (def.flag == &Config::moveSun || def.flag == &Config::hideGameFlare || def.number == &Config::nightBrightness)
             return cfg.timeOfDay < 0;
-        if (def.number == &Config::shadowLength || def.flag == &Config::shadowMap)
+        if (def.number == &Config::shadowLength)  // (screen-space: only without the shadow map)
+            return cfg.shadows <= 0 || cfg.shadowMap;
+        if (def.flag == &Config::shadowMap)
             return cfg.shadows <= 0;
         if (def.number == &Config::shadowDistance || def.option == &Config::shadowResolution)
             return cfg.shadows <= 0 || !cfg.shadowMap;
@@ -1848,7 +1861,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         snprintf(readout, sizeof readout, "CLICK A KEY, THEN PRESS THE NEW ONE   \xB7   ESC CANCELS   \xB7   SAVE TO KEEP THEM");
     } else if (g_panel.tab == kTabOther) {
         const char* status = GameOverlayStatusText();
-        snprintf(readout, sizeof readout, "%s", status[0] ? status : "MOVE THE MOUSE TO BRING A HIDDEN HUD OR CURSOR BACK");
+        snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
     } else if (!cfg.enabled) {
         snprintf(readout, sizeof readout, "FIRST PERSON MOD IS OFF%s",
                  g_panel.tab == kTabReplay ? " - REPLAYS USE THE GAME'S OWN CAMERA" : "");
@@ -2132,9 +2145,19 @@ bool OverlayListeningForKey()
 bool HideGameOverlayNow(bool cursor)
 {
     const Config& cfg = GetConfig();
-    if (!(cursor ? cfg.hideCursor : cfg.hideHud) || !SceneOnScreen() || g_menuOpen.load(std::memory_order_relaxed))
+    if (!(cursor ? cfg.hideCursor : cfg.hideHud) || !SceneOnScreen() || GameMenuOverScene())
+        return false;
+    // The HUD: all the while you ride or watch (this panel open too: turned on, it goes at once).
+    if (!cursor)
+        return true;
+    if (g_menuOpen.load(std::memory_order_relaxed))
         return false;
     return GetTickCount64() - g_lastMouseActivity.load(std::memory_order_relaxed) > kRevealMs;
+}
+
+int TakeGameEscapes()
+{
+    return g_gameEscapes.exchange(0);
 }
 
 bool GameCursorPos(float& x, float& y)
@@ -2181,6 +2204,12 @@ void OverlayFrame(HDC dc)
     // Polled every frame, even while closed, so a key held during the toggle doesn't re-fire.
     const bool menuKey = PollKey(g_keys.menu, cfg.menuKey, false, now);
     const bool escape  = PollKey(g_keys.escape, VK_ESCAPE, false, now);
+    // The game's menu (Config::hideHud): Esc presses are counted by the window procedure; if the
+    // game's window never gets key messages (input read some other way), from the key itself.
+    if (cfg.hideHud && window && g_glAvailable)
+        SubclassWindow(window);
+    if (escape && focus && !g_panel.open && !g_keyMessages.load(std::memory_order_relaxed))
+        ++g_gameEscapes;
 
     // For automated tests: open the panel without a key press.
     static bool testOpenChecked = false;

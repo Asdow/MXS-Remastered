@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <new>
 #include <share.h>
 #include <string>
@@ -215,6 +216,9 @@ bool   g_depthWrites = true;                 // glDepthMask, as the game left it
 bool   g_blending = false;                   // GL_BLEND, as the game left it
 std::unordered_map<GLuint, std::vector<GLuint>> g_vaoArrayBuffers;  // vertex arrays -> their buffers
 struct BufferUpdates { unsigned lastFrame = 0; int frames = 0; };
+struct AttribPointer { GLuint buffer = 0; GLint size = 0; GLenum type = 0; GLsizei stride = 0; uintptr_t offset = 0; };
+std::unordered_map<unsigned long long, AttribPointer> g_vaoAttribs;  // (vertex array << 4 | index) -> its pointer
+int g_loggedBigCasters = 0;  // objects left out of the shadow map logged (this track)
 std::unordered_map<GLuint, BufferUpdates> g_bufferUpdates;          // buffers rewritten while running
 
 struct DeferredCaster {
@@ -959,6 +963,145 @@ void LearnCursor()
     }
 }
 
+// The game's own menu over the race (Esc): it's drawn flat over the 3D scene like the HUD, so it's
+// told apart by what it draws that the HUD doesn't. Esc opens it; while it's open, the flat draws
+// the HUD hasn't drawn lately that keep being drawn are the menu's, learnt for the session. From
+// then on the menu is open while those are drawn (however it was opened or closed), and Esc
+// toggles it in between. Each page of it is learnt as a whole, and it's open only while most of one
+// page is drawn: a page learnt as any two draws once had a couple of HUD texts that changed while it
+// was open (a timer, a position) taken for it, and the HUD and cursor then never went.
+struct GameMenuWatch {
+    std::unordered_map<unsigned long long, unsigned> hudSeen;  // flat draw -> last frame drawn with the menu closed
+    std::unordered_map<unsigned long long, int> candidates;     // while open: frames each one was drawn
+    std::vector<std::unordered_set<unsigned long long>> pages;  // learnt: the menu's pages, each its draws
+    std::vector<unsigned long long> frameDraws;                 // this frame's flat draws
+    int  logs = 0;          // (its opening and closing logged, the first few times)
+    bool open = false;
+    bool sawMenu = false;   // its draws seen since it opened
+    int  window = 0;        // frames learnt over so far (in windows of kMenuLearnFrames)
+    int  absent = 0;        // frames in a row its draws weren't seen, after they were
+    int  unseenOpen = 0;    // frames open without its draws seen (once they're known)
+    bool loggedOpen = false, loggedLearnt = false;
+};
+GameMenuWatch g_gameMenu;
+constexpr int      kMenuLearnFrames = 45;
+constexpr unsigned kHudRecentFrames = 600;  // ~10 s: a HUD draw that recent isn't the menu's
+
+unsigned long long FlatDrawKey(const DrawCall& draw)
+{
+    return (static_cast<unsigned long long>(g_program) * 0x9E3779B97F4A7C15ull) ^
+           (static_cast<unsigned long long>(g_boundTextures[0]) * 0xC2B2AE3D27D4EB4Full) ^
+           (static_cast<unsigned long long>(static_cast<unsigned>(draw.count)) * 0x165667B19E3779F9ull) ^
+           (static_cast<unsigned long long>(draw.mode) << 56) ^ (static_cast<unsigned long long>(draw.kind) << 60);
+}
+
+// Whether most of one of the menu's pages is drawn this frame (60% of it, and two draws at least).
+bool MenuPageDrawn()
+{
+    const std::unordered_set<unsigned long long> drawn(g_gameMenu.frameDraws.begin(), g_gameMenu.frameDraws.end());
+    for (const auto& page : g_gameMenu.pages) {
+        size_t present = 0;
+        for (unsigned long long key : page)
+            present += drawn.count(key);
+        if (present >= 2 && present * 10 >= page.size() * 6)
+            return true;
+    }
+    return false;
+}
+
+void LogGameMenu(const char* what)
+{
+    if (g_gameMenu.logs < 30) {
+        ++g_gameMenu.logs;
+        Log("hud: the game's menu %s", what);
+    }
+}
+
+// At the end of a frame with the HUD or cursor hidden: is the game's menu open?
+void UpdateGameMenu()
+{
+    GameMenuWatch& m = g_gameMenu;
+    const int escapes = TakeGameEscapes();
+    if (!g_shaderViewSet) {  // no race on screen: the game's own menu screens, left alone anyway
+        m.open = m.sawMenu = false;
+        m.candidates.clear();
+        m.window = m.absent = 0;
+        m.frameDraws.clear();
+        return;
+    }
+    for (int k = 0; k < escapes; ++k) {
+        m.open = !m.open;
+        m.sawMenu = false;
+        m.absent = m.unseenOpen = 0;
+        m.candidates.clear();
+        m.window = 0;
+        LogGameMenu(m.open ? "opened (Esc): the HUD and the menu are shown while it's open" : "closed (Esc): the HUD hidden again");
+        if (m.open && !m.loggedOpen)
+            m.loggedOpen = true;
+    }
+    const bool learnt = !m.pages.empty();
+    if (learnt && MenuPageDrawn()) {
+        if (!m.open)
+            LogGameMenu("is open (a page of it is drawn)");
+        m.open = true;
+        m.sawMenu = true;
+        m.absent = m.unseenOpen = 0;
+    } else if (m.open && m.sawMenu && ++m.absent >= 6) {
+        m.open = m.sawMenu = false;  // closed without Esc (a click in it)
+        m.candidates.clear();
+        m.window = 0;
+        LogGameMenu("closed (its pages aren't drawn any more): the HUD hidden again");
+    } else if (m.open && !m.sawMenu && learnt && ++m.unseenOpen >= 2 * kMenuLearnFrames) {
+        // Esc, but none of the menu's pages (nor one learnt meanwhile, a page of it not seen yet): it
+        // was for something else (the chat) and the menu isn't open.
+        m.open = false;
+        m.candidates.clear();
+        m.window = m.unseenOpen = 0;
+        LogGameMenu("isn't open after all (that Esc was for something else): the HUD hidden again");
+    }
+    if (m.open) {
+        // Learning: the draws the HUD hasn't drawn lately, kept for most of a window of frames: a page
+        // (unless it's mostly one already known).
+        std::unordered_set<unsigned long long> counted;
+        for (unsigned long long key : m.frameDraws) {
+            const auto hud = m.hudSeen.find(key);
+            if ((hud != m.hudSeen.end() && g_frameNumber - hud->second < kHudRecentFrames) || !counted.insert(key).second)
+                continue;
+            ++m.candidates[key];
+        }
+        if (++m.window >= kMenuLearnFrames) {
+            std::unordered_set<unsigned long long> page;
+            for (const auto& c : m.candidates)
+                if (c.second * 10 >= m.window * 8)
+                    page.insert(c.first);
+            bool known = page.size() < 2;
+            for (const auto& old : m.pages) {
+                size_t shared = 0;
+                for (unsigned long long key : page)
+                    shared += old.count(key);
+                known = known || shared * 10 >= page.size() * 8;
+            }
+            if (!known && m.pages.size() < 32) {
+                m.pages.push_back(page);
+                if (!m.loggedLearnt || m.logs < 30) {
+                    m.loggedLearnt = true;
+                    Log("hud: learnt a page of the game's menu (%zu draws of its own, %zu page(s) known): shown whenever it's open",
+                        page.size(), m.pages.size());
+                }
+            }
+            m.candidates.clear();
+            m.window = 0;
+        }
+    } else {
+        for (unsigned long long key : m.frameDraws)
+            m.hudSeen[key] = g_frameNumber;
+        if (m.hudSeen.size() > 4096)
+            for (auto it = m.hudSeen.begin(); it != m.hudSeen.end();)
+                it = g_frameNumber - it->second > kHudRecentFrames ? m.hudSeen.erase(it) : std::next(it);
+    }
+    m.frameDraws.clear();
+}
+
 // Whether to leave this draw out: the HUD or the game's cursor, while riding with them hidden.
 bool LeaveOutGameOverlay(const DrawCall& draw)
 {
@@ -975,6 +1118,8 @@ bool LeaveOutGameOverlay(const DrawCall& draw)
         TrackFlatDraw(signature, x, y);
     if (!g_shaderViewSet || !DrawingToScreen() || AddedOntoPicture())
         return false;  // the game's menus (no 3D scene), into a texture of its own, or the lens flare
+    if (g_gameMenu.frameDraws.size() < 4096)
+        g_gameMenu.frameDraws.push_back(FlatDrawKey(draw));
     if (cfg.hideHud && HideGameOverlayNow(false)) {
         ++g_hudSkipped;
         if (!g_loggedHudHidden) {
@@ -1400,6 +1545,7 @@ void NoteTerrainUniform(GLint location, GLsizei count, const GLfloat* value, int
             last[1] = second;
             terrain::ResetMap();
             g_variants.clear();
+            g_loggedBigCasters = 0;  // (another track: log what's left out of it too)
             Log("terrain: %s = %g %g (a new heightmap)", location == u.spacing ? kSpacingUniform : kHeightsDimUniform,
                 value[0], second);
             // The patches are whole numbers of samples; samples apart / 1 over samples across: the
@@ -1800,15 +1946,33 @@ void NoteBufferUpdate(GLenum target)
     }
 }
 
+std::unordered_map<GLuint, unsigned> g_bufferGeneration;  // buffer -> times its contents were given (or it was deleted)
+std::unordered_map<GLuint, unsigned> g_vaoGeneration;     // vertex array -> times it was deleted or re-pointed
+
+void NoteBufferContents(GLenum target)
+{
+    GLuint buffer = 0;
+    if (target == kArrayBufferTarget) {
+        buffer = g_arrayBuffer;
+    } else if (target == kElementArrayBuffer) {
+        const auto found = g_elementBuffers.find(g_vao);
+        buffer = found != g_elementBuffers.end() ? found->second : 0;
+    }
+    if (buffer)
+        ++g_bufferGeneration[buffer];
+}
+
 void APIENTRY Wrap_glBufferData(GLenum target, ptrdiff_t size, const void* data, GLenum usage)
 {
     NoteBufferUpdate(target);
+    NoteBufferContents(target);
     real_glBufferData(target, size, data, usage);
 }
 
 void APIENTRY Wrap_glBufferSubData(GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data)
 {
     NoteBufferUpdate(target);
+    NoteBufferContents(target);
     real_glBufferSubData(target, offset, size, data);
 }
 
@@ -1819,6 +1983,16 @@ void APIENTRY Wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, 
         std::vector<GLuint>& buffers = g_vaoArrayBuffers[g_vao];
         if (std::find(buffers.begin(), buffers.end(), g_arrayBuffer) == buffers.end())
             buffers.push_back(g_arrayBuffer);
+        if (index < 16) {
+            AttribPointer& a = g_vaoAttribs[static_cast<unsigned long long>(g_vao) << 4 | index];
+            if (a.buffer != g_arrayBuffer || a.offset != reinterpret_cast<uintptr_t>(pointer))
+                ++g_vaoGeneration[g_vao];
+            a.buffer = g_arrayBuffer;
+            a.size = size;
+            a.type = type;
+            a.stride = stride;
+            a.offset = reinterpret_cast<uintptr_t>(pointer);
+        }
     }
     real_glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
@@ -1862,12 +2036,22 @@ void DropKeptWheels(GLsizei count, const GLuint* names, bool vertexArrays)
 void APIENTRY Wrap_glDeleteBuffers(GLsizei count, const GLuint* names)
 {
     DropKeptWheels(count, names, false);
+    for (GLsizei n = 0; names && n < count; ++n) {
+        ++g_bufferGeneration[names[n]];  // (its name may be given out again: what was read back from it is old)
+        g_bufferUpdates.erase(names[n]);  // (and filled once more then: not something rewritten while running)
+    }
     real_glDeleteBuffers(count, names);
 }
 
 void APIENTRY Wrap_glDeleteVertexArrays(GLsizei count, const GLuint* names)
 {
     DropKeptWheels(count, names, true);
+    for (GLsizei n = 0; names && n < count; ++n) {
+        ++g_vaoGeneration[names[n]];
+        g_vaoArrayBuffers.erase(names[n]);
+        for (unsigned index = 0; index < 16; ++index)
+            g_vaoAttribs.erase(static_cast<unsigned long long>(names[n]) << 4 | index);
+    }
     real_glDeleteVertexArrays(count, names);
 }
 
@@ -2081,6 +2265,226 @@ DeferredCaster MakeCaster(const DrawCall& draw, GLint modelviewLoc, GLint projec
     return c;
 }
 
+// ---- Too big to cast: the stadium ------------------------------------------------------------
+// In a stadium the stands and the roof are objects too. Drawn into the shadow map whenever the game
+// drew them (in view), with a low sun their shadow covered the whole floor: one step and the track
+// went dark and the rider's shadow was gone, the next it was sunny again, and drawing them four
+// times over cost a lot of frames. Each draw call's size is measured once from its own vertices
+// (read back from its buffers), and what's far bigger than anything on a track (over 80 m across),
+// or all of it well overhead (a roof, the lights), doesn't cast.
+struct DrawBounds {
+    bool     valid = false;          // measured (false: couldn't be: it casts)
+    float    lo[3] = {}, hi[3] = {};  // in its own model's space
+    GLuint   buffers[2] = {};        // vertices, indices
+    unsigned generation[2] = {};     // their contents then
+    bool     logged = false;
+};
+std::unordered_map<unsigned long long, DrawBounds> g_drawBounds;
+struct BufferCopy { unsigned generation = 0; std::vector<unsigned char> data; };
+std::unordered_map<GLuint, BufferCopy> g_bufferCopies;  // read back (only while the contents are still those)
+size_t g_bufferCopyBytes = 0;
+
+using PFN_GetBufferParameteriv = void(APIENTRY*)(GLenum target, GLenum pname, GLint* params);
+using PFN_GetBufferSubData     = void(APIENTRY*)(GLenum target, ptrdiff_t offset, ptrdiff_t size, void* data);
+using PFN_GetAttribLocation    = GLint(APIENTRY*)(GLuint program, const char* name);
+using PFN_GetIntegerv          = void(APIENTRY*)(GLenum pname, GLint* data);
+
+constexpr GLenum kCopyReadBuffer = 0x8F36;  // (also its binding's name)
+constexpr GLenum kBufferSize     = 0x8764;
+
+// A buffer's contents, read back once (null: couldn't).
+const std::vector<unsigned char>* BufferContents(GLuint buffer)
+{
+    const unsigned generation = g_bufferGeneration[buffer];
+    const auto found = g_bufferCopies.find(buffer);
+    if (found != g_bufferCopies.end()) {
+        if (found->second.generation == generation)
+            return &found->second.data;
+        g_bufferCopyBytes -= std::min(g_bufferCopyBytes, found->second.data.size());
+        g_bufferCopies.erase(found);  // (rewritten, or deleted and given out again: another track's)
+    }
+    static PFN_GetBufferParameteriv parameter = nullptr;
+    static PFN_GetBufferSubData read = nullptr;
+    static PFN_GetIntegerv getInteger = nullptr;
+    if (!read) {
+        parameter = reinterpret_cast<PFN_GetBufferParameteriv>(GetRealGLFunction("glGetBufferParameteriv"));
+        read = reinterpret_cast<PFN_GetBufferSubData>(GetRealGLFunction("glGetBufferSubData"));
+        getInteger = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+    }
+    if (!parameter || !read || !getInteger || !real_glBindBuffer || buffer == 0)
+        return nullptr;
+    GLint before = 0;
+    getInteger(kCopyReadBuffer, &before);  // (a binding of its own: the arrays' and the vertex array's stay)
+    real_glBindBuffer(kCopyReadBuffer, buffer);
+    GLint size = 0;
+    parameter(kCopyReadBuffer, kBufferSize, &size);
+    std::vector<unsigned char> data;
+    if (size > 0 && size <= 64 * 1024 * 1024) {
+        data.resize(static_cast<size_t>(size));
+        read(kCopyReadBuffer, 0, size, data.data());
+    }
+    real_glBindBuffer(kCopyReadBuffer, static_cast<GLuint>(before));
+    if (data.empty())
+        return nullptr;
+    if (g_bufferCopyBytes + data.size() > 256u * 1024 * 1024) {  // (kept to a quarter of a gigabyte)
+        g_bufferCopies.clear();
+        g_bufferCopyBytes = 0;
+    }
+    g_bufferCopyBytes += data.size();
+    BufferCopy& copy = g_bufferCopies[buffer];
+    copy.generation = generation;
+    copy.data = std::move(data);
+    return &copy.data;
+}
+
+// The current draw's vertices, in its own model's space (false: not measurable).
+bool MeasureDraw(const DrawCall& draw, DrawBounds& b)
+{
+    static PFN_GetAttribLocation attribLocation = nullptr;
+    if (!attribLocation)
+        attribLocation = reinterpret_cast<PFN_GetAttribLocation>(GetRealGLFunction("glGetAttribLocation"));
+    static std::unordered_map<GLuint, GLint> positionOf;  // program -> its vattr_position
+    auto position = positionOf.find(g_program);
+    if (position == positionOf.end()) {
+        const GLint location = attribLocation ? attribLocation(g_program, "vattr_position") : -1;
+        position = positionOf.emplace(g_program, location >= 0 ? location : 0).first;
+    }
+    const auto pointer = g_vaoAttribs.find(static_cast<unsigned long long>(g_vao) << 4 | static_cast<unsigned>(position->second));
+    if (pointer == g_vaoAttribs.end())
+        return false;
+    const AttribPointer& a = pointer->second;
+    if (a.buffer == 0 || a.type != GL_FLOAT || a.size < 3)
+        return false;
+    const std::vector<unsigned char>* vertices = BufferContents(a.buffer);
+    if (!vertices)
+        return false;
+    const size_t stride = a.stride > 0 ? static_cast<size_t>(a.stride) : static_cast<size_t>(a.size) * 4;
+    bool any = false;
+    const auto Take = [&](size_t index) {
+        const size_t at = a.offset + index * stride;
+        if (at + 12 > vertices->size())
+            return;
+        float v[3];
+        memcpy(v, vertices->data() + at, 12);
+        for (int k = 0; k < 3; ++k) {
+            b.lo[k] = any ? std::fmin(b.lo[k], v[k]) : v[k];
+            b.hi[k] = any ? std::fmax(b.hi[k], v[k]) : v[k];
+        }
+        any = true;
+    };
+    b.buffers[0] = a.buffer;
+    b.generation[0] = g_bufferGeneration[a.buffer];
+    if (draw.kind == DrawCall::Arrays) {
+        for (int i = 0; i < draw.count; ++i)
+            Take(static_cast<size_t>(draw.first) + i);
+    } else {
+        const auto element = g_elementBuffers.find(g_vao);
+        if (element == g_elementBuffers.end() || element->second == 0)
+            return false;
+        const std::vector<unsigned char>* indices = BufferContents(element->second);
+        if (!indices)
+            return false;
+        b.buffers[1] = element->second;
+        b.generation[1] = g_bufferGeneration[element->second];
+        const size_t width = draw.type == GL_UNSIGNED_BYTE ? 1 : draw.type == GL_UNSIGNED_SHORT ? 2 : draw.type == GL_UNSIGNED_INT ? 4 : 0;
+        if (width == 0)
+            return false;
+        const size_t start = reinterpret_cast<uintptr_t>(draw.indices);
+        for (int i = 0; i < draw.count; ++i) {
+            const size_t at = start + static_cast<size_t>(i) * width;
+            if (at + width > indices->size())
+                break;
+            unsigned index = 0;
+            if (width == 1)
+                index = (*indices)[at];
+            else if (width == 2)
+                index = static_cast<unsigned>((*indices)[at]) | static_cast<unsigned>((*indices)[at + 1]) << 8;
+            else
+                memcpy(&index, indices->data() + at, 4);
+            Take(index);
+        }
+    }
+    return any;
+}
+
+// Whether the draw about to be made is far bigger than anything on a track, or all of it well
+// overhead (see DrawBounds): it isn't cast.
+bool TooBigToCast(const DrawCall& draw, const GLfloat uploaded[16])
+{
+    const SkinnedProgram* skin = FindSkinned(g_program);
+    if (skin && skin->bones != 0)
+        return false;  // (a rider: its bones place it)
+    const auto element = g_elementBuffers.find(g_vao);
+    // Geometry the game rewrites while running (dust, streamed pieces) isn't measured: reading it
+    // back every time it changes stalls the frame. It casts as before.
+    if (element != g_elementBuffers.end() && element->second && Streamed(element->second))
+        return false;
+    const auto arrays = g_vaoArrayBuffers.find(g_vao);
+    if (arrays != g_vaoArrayBuffers.end())
+        for (GLuint buffer : arrays->second)
+            if (Streamed(buffer))
+                return false;
+    unsigned long long key = 1469598103934665603ull;
+    const auto Mix = [&key](unsigned long long v) { key ^= v + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2); };
+    Mix(g_program);
+    Mix(g_vao);
+    Mix(g_vaoGeneration[g_vao]);
+    Mix(element != g_elementBuffers.end() ? element->second : 0);
+    Mix(static_cast<unsigned long long>(draw.kind) << 32 | draw.mode);
+    Mix(static_cast<unsigned long long>(static_cast<unsigned>(draw.count)) << 32 | static_cast<unsigned>(draw.first));
+    Mix(reinterpret_cast<uintptr_t>(draw.indices));
+    Mix(draw.type);
+    DrawBounds& b = g_drawBounds[key];
+    const bool stale = b.buffers[0] && (g_bufferGeneration[b.buffers[0]] != b.generation[0] ||
+                                        (b.buffers[1] && g_bufferGeneration[b.buffers[1]] != b.generation[1]));
+    if (stale) {
+        g_bufferCopies.erase(b.buffers[0]);
+        if (b.buffers[1])
+            g_bufferCopies.erase(b.buffers[1]);
+        b = DrawBounds{};
+    }
+    if (!b.buffers[0] && !b.valid) {
+        DrawBounds measured;
+        measured.valid = MeasureDraw(draw, measured);
+        if (!measured.buffers[0])
+            measured.buffers[0] = ~0u;  // (tried: not measurable, not tried again)
+        b = measured;
+    }
+    if (!b.valid)
+        return false;
+    // Its box in eye space (u_modelview as drawn), then across and up in the world.
+    double view[16], up[3];
+    if (!postfx::FrameRenderedView(view, up))
+        return false;
+    const double upEye[3] = { view[0] * up[0] + view[4] * up[1] + view[8] * up[2], view[1] * up[0] + view[5] * up[1] + view[9] * up[2],
+                              view[2] * up[0] + view[6] * up[1] + view[10] * up[2] };
+    double lo[3] = {}, hi[3] = {}, lowest = 0;
+    for (int corner = 0; corner < 8; ++corner) {
+        const float p[3] = { (corner & 1) ? b.hi[0] : b.lo[0], (corner & 2) ? b.hi[1] : b.lo[1], (corner & 4) ? b.hi[2] : b.lo[2] };
+        double e[3];
+        for (int r = 0; r < 3; ++r)
+            e[r] = uploaded[r] * p[0] + uploaded[4 + r] * p[1] + uploaded[8 + r] * p[2] + uploaded[12 + r];
+        const double height = e[0] * upEye[0] + e[1] * upEye[1] + e[2] * upEye[2];  // above the camera
+        for (int r = 0; r < 3; ++r) {
+            lo[r] = corner ? std::fmin(lo[r], e[r]) : e[r];
+            hi[r] = corner ? std::fmax(hi[r], e[r]) : e[r];
+        }
+        lowest = corner ? std::fmin(lowest, height) : height;
+    }
+    const double u = 3.2808;  // (game units: feet)
+    const double across = std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) + (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    const bool tooBig = across > 80.0 * u;
+    const bool overhead = lowest > 12.0 * u;
+    if ((tooBig || overhead) && !b.logged && g_loggedBigCasters < 12) {
+        b.logged = true;
+        ++g_loggedBigCasters;
+        Log("postfx: shadow map: left out an object %s (%.0f m across, its lowest point %.0f m above the camera; program %u, "
+            "%d indices): the stadium's stands or roof would shade the whole track", tooBig ? "far bigger than anything on a track" : "all overhead",
+            across / u, lowest / u, g_program, draw.count);
+    }
+    return tooBig || overhead;
+}
+
 void CastShadow(const DrawCall& draw)
 {
     // See-through draws (kicked-up dirt, dust, smoke) don't write depth: they would cast solid
@@ -2136,6 +2540,8 @@ void CastShadow(const DrawCall& draw)
 
     if (!postfx::WantsShadowCasters())
         return;  // (collected for the tire dirt's mask only)
+    if (TooBigToCast(draw, mv->second.uploaded))
+        return;
     // Riders are skinned: their bones are placed in the world, and the modelview is the bare view.
     float anchor[3];
     const float* anchorEye = nullptr;
@@ -2442,24 +2848,38 @@ double   g_lastWheelWorld[2][16] = {};
 bool     g_haveLastWheel[2] = { false, false };
 unsigned g_memberFrame = 0;
 
-void FindWheelMembers(int i, const NearDraw& main, const double invRaw[16], double unitsPerMetre,
+void FindWheelMembers(int i, const NearDraw& main, const double invRaw[16], const postfx::OwnAnchors& own,
                       std::vector<const NearDraw*>& draws)
 {
+    const double unitsPerMetre = own.unitsPerMetre;
     double vm[16], wheel[16], invWheel[16];
     for (int k = 0; k < 16; ++k)
         vm[k] = main.raw[k];
     Mul4(invRaw, vm, wheel);
     if (!InverseAffine(wheel, invWheel))
         return;
-    // Turning (a part still on a wheel that stands still is still on anything else still too).
+    // Spinning: turned about its axle on your bike since last frame. (Turned in the world isn't
+    // enough: the bike rocking, pitching or turning turns the wheel and everything on the bike
+    // together, and standing still or rolling slowly the frame, the body and your helmet then kept
+    // their place on the wheel and got its mud. Steering turns the front wheel on the bike too, but
+    // about another axis.) A part still on a wheel that spins is on the wheel.
     bool turning = false;
-    if (g_haveLastWheel[i]) {
-        double move = 0, turn = 0;
-        Apart(wheel, g_lastWheelWorld[i], &move, &turn);
-        turning = turn > 0.05;
+    double invBike[16], onBike[16];
+    if (own.bike && InverseAffine(own.bikeWorld, invBike)) {
+        Mul4(invBike, wheel, onBike);
+        double invLast[16], d[16];
+        if (g_haveLastWheel[i] && InverseAffine(g_lastWheelWorld[i], invLast)) {
+            Mul4(onBike, invLast, d);  // the turn since last frame, in the bike's space
+            const double ax = d[6] - d[9], ay = d[8] - d[2], az = d[1] - d[4];  // 2 sin(angle) along its axis
+            const double size = std::sqrt(ax * ax + ay * ay + az * az);
+            const double along = std::fabs(ax * own.bikeAcross[0] + ay * own.bikeAcross[1] + az * own.bikeAcross[2]);
+            turning = along > 0.1 && along > 0.9 * size;
+        }
+        std::copy(onBike, onBike + 16, g_lastWheelWorld[i]);  // (on the bike)
+        g_haveLastWheel[i] = true;
+    } else {
+        g_haveLastWheel[i] = false;
     }
-    std::copy(wheel, wheel + 16, g_lastWheelWorld[i]);
-    g_haveLastWheel[i] = true;
     std::vector<WheelMember>& members = g_wheelMembers[i];
     std::vector<bool> taken(g_nearDraws.size(), false);
     const double reach = 4.0 * unitsPerMetre;
@@ -2683,7 +3103,7 @@ void DrawWheelMasks(const postfx::OwnAnchors* own)
                     draws.push_back(&d);
         }
         if (main && frame)
-            FindWheelMembers(i, *main, invRaw, own->unitsPerMetre, draws);
+            FindWheelMembers(i, *main, invRaw, *own, draws);
         else
             g_haveLastWheel[i] = false;
         // For PaintTireDirt next frame: each of these draws, with the wheel's axle in its own model
@@ -2884,15 +3304,31 @@ void KeepOrCastWheels()
                 }
                 break;
             }
-        } else if (cast == postfx::WheelCast::Missing && kept.valid && g_deferredCasters.size() < 8192) {
-            DeferredCaster c = kept.caster;
-            if (!postfx::ShadowMatrices(viewModel, nullptr, c.lightModelview, &c.cascades))
+        }
+        // (Its kept call is never cast in its place: placed from where it was learnt on your bike it
+        // could sit off the real one, two front tires in your shadow. A stand-in shape of postfx's
+        // covers a wheel the game doesn't draw.)
+        // The game drew that call near you this frame: the wheel is drawn (and casts its own shadow),
+        // whatever the wheel tracker made of it, so no stand-in tire goes beside it. (The tracker
+        // letting go of your front wheel a moment, in first person where the game always draws it,
+        // put a second front tire in your shadow.)
+        if (!kept.valid)
+            continue;
+        postfx::OwnAnchors own;
+        if (!postfx::GetOwnAnchors(own))
+            continue;
+        double eye[3];
+        for (int r = 0; r < 3; ++r)
+            eye[r] = own.raw[r] * own.riderPosition[0] + own.raw[4 + r] * own.riderPosition[1] +
+                     own.raw[8 + r] * own.riderPosition[2] + own.raw[12 + r];
+        const double reach = 3.0 * own.unitsPerMetre;
+        for (const NearDraw& d : g_nearDraws) {
+            if (!SameDrawCall(d.caster, kept.caster))
                 continue;
-            g_deferredCasters.push_back(c);
-            if (!kept.loggedCast) {
-                kept.loggedCast = true;
-                Log("postfx: shadow map: your %s wheel isn't drawn by the game here; its shadow is cast from your bike",
-                    kWheelName[i]);
+            const double dx = d.raw[12] - eye[0], dy = d.raw[13] - eye[1], dz = d.raw[14] - eye[2];
+            if (dx * dx + dy * dy + dz * dz < reach * reach) {
+                postfx::NoteWheelDrawnByGame(i);
+                break;
             }
         }
     }
@@ -3155,6 +3591,10 @@ bool EndShaderFrame()
     // The game's HUD and cursor (LeaveOutGameOverlay): this frame's 3D scene, and the cursor.
     if (IsDumping() && (g_hudSkipped || g_cursorSkipped))
         Log("  hud: %d HUD draw(s) and %d cursor draw(s) left out", g_hudSkipped, g_cursorSkipped);
+    if (GetConfig().hideHud || GetConfig().hideCursor)
+        UpdateGameMenu();
+    else
+        g_gameMenu.open = false;
     g_sceneOnScreen = g_shaderViewSet;
     g_hudSkipped = g_cursorSkipped = 0;
     if (GetConfig().hideCursor)
@@ -3174,17 +3614,24 @@ bool SceneOnScreen()
     return g_sceneOnScreen.load(std::memory_order_relaxed);
 }
 
+bool GameMenuOverScene()
+{
+    return g_gameMenu.open;
+}
+
 const char* GameOverlayStatusText()
 {
     const Config& cfg = GetConfig();
     if (!cfg.hideHud && !cfg.hideCursor)
         return "";
     static char text[200];
-    const char* hud = cfg.hideHud ? (g_loggedHudHidden ? "HUD: HIDDEN WHILE RIDING" : "HUD: HIDDEN ONCE YOU RIDE") : "";
+    const char* hud = !cfg.hideHud ? ""
+                    : g_gameMenu.open ? "HUD: SHOWN WITH THE GAME'S MENU"
+                    : g_loggedHudHidden ? "HUD: HIDDEN WHILE RIDING, SHOWN WITH THE GAME'S MENU" : "HUD: HIDDEN ONCE YOU RIDE";
     const char* cursor = !cfg.hideCursor ? ""
-                       : g_cursorSignature ? "CURSOR: FOUND, HIDDEN WHILE RIDING"
-                                           : "CURSOR: HIDDEN WHILE RIDING";
-    snprintf(text, sizeof text, "%s%s%s   \xB7   MOVE THE MOUSE TO SHOW THEM", hud, hud[0] && cursor[0] ? "   \xB7   " : "", cursor);
+                       : g_cursorSignature ? "CURSOR: FOUND, HIDDEN WHILE RIDING (MOVE THE MOUSE TO SHOW IT)"
+                                           : "CURSOR: HIDDEN WHILE RIDING (MOVE THE MOUSE TO SHOW IT)";
+    snprintf(text, sizeof text, "%s%s%s", hud, hud[0] && cursor[0] ? "   \xB7   " : "", cursor);
     return text;
 }
 

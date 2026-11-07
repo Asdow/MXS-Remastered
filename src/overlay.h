@@ -14,10 +14,14 @@ void OverlayFrame(HDC dc);
 bool OverlayListeningForKey();
 
 // Hiding the game's HUD and cursor while riding (OTHER tab: Config::hideHud / hideCursor).
-// They're hidden while the 3D scene is on screen (riding, or a replay; never the game's menus)
-// and the mouse is left alone: moving or clicking it (or Esc) shows them again for a few seconds,
-// so the game's menus over the race stay usable. cursor: asks about the cursor, else the HUD.
+// They're hidden while the 3D scene is on screen (riding, spectating, a replay; never the game's
+// menus) and the game's menu isn't open over it (GameMenuOverScene). The HUD goes at once; the
+// cursor once the mouse is left alone (moving or clicking it shows it for a few seconds).
+// cursor: asks about the cursor, else the HUD.
 bool HideGameOverlayNow(bool cursor);
+
+// Esc presses that went to the game since last asked (it opens and closes the game's menu).
+int TakeGameEscapes();
 
 // The mouse in the game window's client area (pixels from its top left), false if unknown.
 bool GameCursorPos(float& x, float& y);
