@@ -43,7 +43,7 @@ struct Config {
     double horizonLock          = 0.6;    // 0..1 fraction of roll removed
     double pitchLock            = 0.5;    // 0..1 fraction of the bike's pitch removed (wheelies, jump faces)
     double maxRollCorrectionDeg = 90.0;
-    double steadiness           = 0.6;    // 0..1 how much of the bike's quick jolts (bumps, landings, suspension) the view ignores
+    double steadiness           = 0.6;    // 0..2 how much of the bike's quick jolts (bumps, landings, suspension) the view ignores
 
     // [Air]
     double airLooseness     = 0.6;        // 0..1 how much of the nose's left / right swing in the air the view lets pass
@@ -114,7 +114,8 @@ struct Config {
     double headlightBeamDeg = 22.0;       // the beam's half-angle
     double headlightForward = 0.55;       // m: the front plate, from the rider's eyes along the bike
     double headlightHeight  = -0.45;      // m: the same, up the bike (negative = below the eyes)
-    double headlightPitchDeg = 6.0;       // how far the beam is aimed down
+    double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
+                                          // reaches further ahead; down: nearer)
     double ambientOcclusion = 0.5;        // 0..1
     double aoRadius         = 0.8;        // m
     double sunRays          = 0.35;       // 0..1

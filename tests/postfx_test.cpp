@@ -16,6 +16,7 @@
 //     stadium   the same under a roof 120 m across: the roof is left out, the ground stays sunny
 //     stadiumswap  the roof made in a deleted box's place (another track loaded): still left out
 //     headlight TimeOfDay=0 and the headlight: a lit pool ahead, the rest night
+//     headlightup / headlightdown  the same aimed 15 degrees up / 20 down: it reaches further / not as far
 //     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
 //     tireshidden  the same at 5 m/s for ~3.5 s, its wheels no longer drawn after 1.4 s (as the game
 //               doesn't draw them out of view in first person): they must not be lost (mxcam.log)
@@ -283,10 +284,14 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=0");
     else if (mode == "offscreen" || stadium)  // shadow maps alone (the screen-space ones as short as they go)
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowLength=1");
-    else if (mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson") {
+    else if (mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson" || mode == "headlightup" ||
+             mode == "headlightdown") {
         base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
         settings = base.replace(base.find("Headlight=0"), 11,
-                                mode == "narrowbeam" ? "Headlight=1\nHeadlightBeamDeg=8" : "Headlight=1\nHeadlightBeamDeg=22");
+                                mode == "narrowbeam"      ? "Headlight=1\nHeadlightBeamDeg=8"
+                                : mode == "headlightup"   ? "Headlight=1\nHeadlightBeamDeg=22\nHeadlightAimDeg=15"
+                                : mode == "headlightdown" ? "Headlight=1\nHeadlightBeamDeg=22\nHeadlightAimDeg=-20"
+                                                          : "Headlight=1\nHeadlightBeamDeg=22");
     }
     else if (mode == "shadowperf" || mode == "shadowperf0")  // timing: 800 objects cast shadow-map shadows
         settings = base.replace(base.find("Shadows=0"), 9, mode == "shadowperf" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
@@ -1172,7 +1177,8 @@ int main(int argc, char** argv)
     Check(errorAfter == GL_NO_ERROR, "no GL errors");
     {
         const Pixel flarePixel = At(flareX, 130), beside = At(flareX - 45, 130);
-        const bool timeOfDay = mode == "night" || mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson";
+        const bool timeOfDay = mode == "night" || mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson" ||
+                               mode == "headlightup" || mode == "headlightdown";
         printf("    lens flare %d %d %d, beside it %d %d %d\n", flarePixel.r, flarePixel.g, flarePixel.b, beside.r, beside.g, beside.b);
         if (timeOfDay)
             Check(Near(flarePixel, beside, 6), "the game's lens flare is hidden under a time of day of our own");
@@ -1285,6 +1291,19 @@ int main(int argc, char** argv)
         Check(shaded.r + 25 < sunny.r, "something off screen casts a shadow (shadow map)");
         Check(Near(sunny, drawnGround, 3), "ground in the sun stays as it was (see-through dust casts no block)");
         Check(Near(box, drawnBox, 3), "the object in front isn't shadowed by itself");
+    } else if (mode == "headlightup" || mode == "headlightdown") {
+        // Up the middle of the picture, from the bottom: how far out the beam lights the ground. (Level,
+        // the default: the ground at y 210 is ~28, at y 360 ~157, at y 480 ~120.)
+        printf("    beam up the middle (aim %s):", mode == "headlightup" ? "+15" : "-20");
+        for (int y = H - 10; y >= 200; y -= 10)
+            printf(" %d", At(W / 2, y).r);
+        printf("\n");
+        if (mode == "headlightup") {
+            Check(At(W / 2, 210).r > 60, "aimed up, the headlight lights the ground further ahead");
+        } else {
+            Check(At(W / 2, 360).r < 60, "aimed down, it doesn't reach as far");
+            Check(At(W / 2, 480).r > 90, "and still lights the ground right in front of the bike");
+        }
     } else if (mode == "headlight") {
         const Pixel pool = At(W / 2, 330), side = At(30, 330), corner = At(W - 20, H - 20);
         printf("    headlight pool %d %d %d, beside it %d %d %d, corner %d %d %d\n", pool.r, pool.g, pool.b, side.r, side.g,

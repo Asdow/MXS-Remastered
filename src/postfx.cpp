@@ -3091,13 +3091,15 @@ void Render(int w, int h)
             Vec(p, "u_headUp", upEye);
             // The beam: a round cone seen from the plate, like a real headlight's, from its bottom
             // edge on the ground just in front of the front wheel (65 degrees down) up to its top
-            // edge, HeadlightPitchDeg - 6 degrees below level (0 by default: out to the distance).
-            // Beam width spreads it sideways only.
+            // edge, HeadlightAimDeg above level (0 by default: out to the distance). Beam width
+            // spreads it sideways only. Aimed up it also reaches further ahead (twice as far at
+            // +15 degrees), aimed down not as far.
             constexpr double kBottomDeg = 65.0;
-            const double topDeg = Clamp(cfg.headlightPitchDeg - 6.0, -10.0, 40.0);
+            const double topDeg = Clamp(-cfg.headlightAimDeg, -15.0, 40.0);
             g_gl.Uniform3f(p["u_headBeam"], static_cast<float>(cfg.headlightBeamDeg * kDegToRad),
                            static_cast<float>((kBottomDeg + topDeg) * 0.5 * kDegToRad),
                            static_cast<float>((kBottomDeg - topDeg) * 0.5 * kDegToRad));
+            g_gl.Uniform1f(p["u_headReach"], static_cast<float>(Clamp(1.0 + cfg.headlightAimDeg / 15.0, 0.6, 2.0)));
         }
         // Tire marks: where the map's window is, from the camera, in the map's texels.
         Bind(p, "u_markMap", 6, marksOn ? g_res.marks.tex : 0);

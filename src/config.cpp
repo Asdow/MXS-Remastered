@@ -161,6 +161,7 @@ bool WriteTunables(const Config& c, const wchar_t* presetSection)
         { L"Graphics",  L"ShadowResolution",     static_cast<double>(c.shadowResolution) },
         { L"Graphics",  L"Headlight",            c.headlight },
         { L"Graphics",  L"HeadlightBeamDeg",     c.headlightBeamDeg },
+        { L"Graphics",  L"HeadlightAimDeg",      c.headlightAimDeg },
         { L"Graphics",  L"AmbientOcclusion",     c.ambientOcclusion },
         { L"Graphics",  L"SunRays",              c.sunRays },
         { L"Graphics",  L"Bloom",                c.bloom },
@@ -313,6 +314,7 @@ void CopyTunables(const Config& from, Config& to)
     to.shadowMapSize        = from.shadowMapSize;
     to.headlight            = from.headlight;
     to.headlightBeamDeg     = from.headlightBeamDeg;
+    to.headlightAimDeg      = from.headlightAimDeg;
     to.ambientOcclusion     = from.ambientOcclusion;
     to.sunRays              = from.sunRays;
     to.bloom                = from.bloom;
@@ -515,7 +517,12 @@ Config ParseConfig(const Config& base)
     c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
     c.headlightForward = ReadDouble(L"Graphics", L"HeadlightForward", c.headlightForward);
     c.headlightHeight  = ReadDouble(L"Graphics", L"HeadlightHeight", c.headlightHeight);
-    c.headlightPitchDeg = ReadDouble(L"Graphics", L"HeadlightPitchDeg", c.headlightPitchDeg);
+    {
+        // (Before HeadlightAimDeg: HeadlightPitchDeg, how far it was aimed down, its top edge 6
+        // degrees under that.)
+        const double aim = ReadDouble(L"Graphics", L"HeadlightAimDeg", 1e9);
+        c.headlightAimDeg = aim < 1e8 ? aim : 6.0 - ReadDouble(L"Graphics", L"HeadlightPitchDeg", 6.0 - c.headlightAimDeg);
+    }
     c.ambientOcclusion = ReadDouble(L"Graphics", L"AmbientOcclusion", c.ambientOcclusion);
     c.aoRadius         = ReadDouble(L"Graphics", L"AORadius", c.aoRadius);
     c.sunRays          = ReadDouble(L"Graphics", L"SunRays", c.sunRays);
@@ -556,7 +563,7 @@ Config ParseConfig(const Config& base)
     c.horizonLock          = Clamp(c.horizonLock, 0.0, 1.0);
     c.pitchLock            = Clamp(c.pitchLock, 0.0, 1.0);
     c.maxRollCorrectionDeg = Clamp(c.maxRollCorrectionDeg, 0.0, 180.0);
-    c.steadiness           = Clamp(c.steadiness, 0.0, 1.0);
+    c.steadiness           = Clamp(c.steadiness, 0.0, 2.0);
     c.airLooseness         = Clamp(c.airLooseness, 0.0, 1.0);
     c.whipLock             = Clamp(c.whipLock, 0.0, 1.0);
     c.lookSideDeg          = Clamp(c.lookSideDeg, 10.0, 90.0);
@@ -608,7 +615,7 @@ Config ParseConfig(const Config& base)
     c.headlightBeamDeg     = Clamp(c.headlightBeamDeg, 5.0, 90.0);
     c.headlightForward     = Clamp(c.headlightForward, -3.0, 3.0);
     c.headlightHeight      = Clamp(c.headlightHeight, -3.0, 3.0);
-    c.headlightPitchDeg    = Clamp(c.headlightPitchDeg, -30.0, 45.0);
+    c.headlightAimDeg      = Clamp(c.headlightAimDeg, -20.0, 15.0);
     c.ambientOcclusion     = Clamp(c.ambientOcclusion, 0.0, 1.0);
     c.aoRadius             = Clamp(c.aoRadius, 0.1, 5.0);
     c.sunRays              = Clamp(c.sunRays, 0.0, 1.0);

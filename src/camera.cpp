@@ -164,7 +164,9 @@ constexpr double kApexLeadResponse = 4.0;                 // 1/s
 // Steadiness: the spring that follows the bike's lean and pitch runs at kSteadyFastest (1/s) just
 // above 0% down to kSteadySlowest at 100%, evenly on a log scale. At the default 60% that's ~7.6/s:
 // it trails a lean by about a quarter of a second, while a 5 Hz jolt reaches the view at about a
-// twentieth of its size (the view's own smoothing then halves that again).
+// twentieth of its size (the view's own smoothing then halves that again). The same scale goes on
+// up to 200% for those who want it calmer still: ~0.6/s at 150%, ~0.16/s at 200% (the view hardly
+// leans into a corner at all).
 constexpr double kSteadyFastest = 40.0, kSteadySlowest = 2.5;
 
 struct TravelSample {

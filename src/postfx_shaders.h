@@ -216,6 +216,7 @@ uniform vec3  u_headDir;        // view space: where the beam points
 uniform vec3  u_headRight;      // view space: the beam's own right and up (across the bike)
 uniform vec3  u_headUp;
 uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of it below level, its half-height
+uniform float u_headReach;      // how far it reaches (1 = level; more aimed up, less aimed down)
 
 // 1 = lit, 0 = in the shadow of something the sun's view saw first. 3 x 3 hardware-filtered
 // taps for soft edges; fades out at the edge of the map.
@@ -278,7 +279,8 @@ vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
     float hot = mix(0.3, 1.0, smoothstep(0.8, 0.12, down));
     float own = smoothstep(0.7, 1.3, d);
     float facing = mix(0.35, 1.0, clamp(dot(n, l) * 3.0, 0.0, 1.0)) * step(0.0, dot(n, l));
-    float reach = (1.0 / (1.0 + d * d / 144.0)) * (1.0 - smoothstep(45.0, 70.0, d));
+    float reach = (1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach))) *
+                  (1.0 - smoothstep(45.0 * u_headReach, 70.0 * u_headReach, d));
     return albedo * vec3(1.0, 0.97, 0.92) * (cone * hot * own * facing * reach * u_headlight * 2.6);
 }
 

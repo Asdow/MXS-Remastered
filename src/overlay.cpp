@@ -819,7 +819,7 @@ const RowDef kRows[] = {
     Slider(0, nullptr,           "Pitch lock",           &Config::pitchLock,        0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("How much of the bike's nose up / down tilt (wheelies, jump faces) is removed. 0% tilts "
               "with the bike, 100% keeps the view steady."),
-    Slider(0, nullptr,           "Steadiness",           &Config::steadiness,       0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(0, nullptr,           "Steadiness",           &Config::steadiness,       0.0,   2.0,  0.01, 100.0, 0, "%", "Off")
         .Help("Keeps the view calm: the quick jolts of the bike (bumps, landings, the suspension diving "
               "under braking) don't reach it. It still eases into a corner's lean or a wheelie, as far as "
               "the locks above let it. Off follows every jolt."),
@@ -910,6 +910,9 @@ const RowDef kRows[] = {
     Slider(1, nullptr,           "Beam width",           &Config::headlightBeamDeg, 10.0,  90.0,  1.0,    2.0,    0, "\xB0")
         .Help("How far the headlight's beam spreads to the sides. It always lights the ground from "
               "just in front of the plate out, narrower only makes it skinnier."),
+    Slider(1, nullptr,           "Beam aim",             &Config::headlightAimDeg,  -20.0, 15.0,  0.5,    1.0,    1, "\xB0")
+        .Help("Where the headlight is aimed. Up shows more of what's ahead (the light reaches further "
+              "and lights up jump faces), down keeps it close in front of the bike. 0 is level."),
     Slider(1, "GLOW",            "Sun rays",             &Config::sunRays,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Light shafts from the sun when it's on screen."),
     Slider(1, nullptr,           "Bloom",                &Config::bloom,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
@@ -1530,7 +1533,7 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.shadows <= 0 || !cfg.shadowMap;
         if (def.number == &Config::headlight)
             return cfg.timeOfDay < 0;
-        if (def.number == &Config::headlightBeamDeg)
+        if (def.number == &Config::headlightBeamDeg || def.number == &Config::headlightAimDeg)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;
