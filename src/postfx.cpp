@@ -441,8 +441,8 @@ struct Resources {
     GLuint  captureFbo = 0, color = 0, depth = 0;  // the window's image
     GLuint  terrainFbo = 0, terrainDepth = 0;      // depth when the terrain pass ended
     GLuint  shadowFbo = 0, shadowMap = 0;          // depth seen from the sun
-    Target  marks[1];                              // tire marks: the map of the ground around you (TireMarks)
-    bool    marksCleared[1] = {};
+    Target  marks;                                 // tire marks: the map of the ground around you (TireMarks)
+    bool    marksCleared = false;
     int     shadowSize = 0;
     int     colorMode = 0;  // 0 = untried, 1 = blit, 2 = copy, -1 = nothing works
     int     depthMode = 0;  // 0 = untried, 1 = blit (depth24 + stencil8), 2 = blit (depth24), 3 = copy, -1 = none
@@ -2627,13 +2627,13 @@ struct MarkSeg {
     double strength  = 0;   // how deep: rear 1, front 0.7
 };                          // six doubles each: config.h's kMarkSegBytes, what the panel shows
 std::deque<MarkSeg> g_markCache[2];  // each wheel's ruts this session, oldest first
-struct MarkLevel {
+struct MarkMap {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
     double    texel = 0;      // one texel, in game units
     long long originU = 0, originV = 0;  // where the window's corner is, in unwrapped texels
     bool      set = false;    // the window has an origin
 };
-MarkLevel g_mark;  // the map
+MarkMap g_mark;  // the map
 
 // How many segments per wheel the cache keeps: the setting's (the panel's "Mark cache",
 // mxcam.ini's MarkCacheSegs), inside the range offered there.
@@ -2662,23 +2662,23 @@ bool EnsureMarks()
     // MakeTarget leaves a failed try's texture behind: it goes back before the next try.
     bool ok = false;
     for (const int size : { kMarkSizeWide, kMarkSizeNarrow }) {
-        if (MakeTarget(g_res.marks[0], size, size, kR8, kRed, GL_UNSIGNED_BYTE)) {
+        if (MakeTarget(g_res.marks, size, size, kR8, kRed, GL_UNSIGNED_BYTE)) {
             g_mark.size = size;
             ok = true;
             break;
         }
-        DeleteTarget(g_res.marks[0]);
+        DeleteTarget(g_res.marks);
     }
     // Wrapped sampling: the shader taps (texel coordinate + the window's corner) over the
     // window's size, which goes past 1 where the window's corner is wrapped.
     if (ok) {
-        g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks[0].tex);
+        g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks.tex);
         g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
         g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     }
     g_gl.BindTexture(GL_TEXTURE_2D, bound);
     g_gl.ActiveTexture(active);
-    g_res.marksCleared[0] = false;
+    g_res.marksCleared = false;
     g_mark.set = false;
     g_mark.texel = 0.04 * g_unitsPerMetre;
     const double reach = g_mark.size * g_mark.texel / 2.0 / g_unitsPerMetre;
@@ -2711,7 +2711,7 @@ void ClearMarks(Target& map, int x0, int y0, int w, int h)
 
 // A groove from the last contact to this one, in the map's texels (wrapped), drawn once per
 // wrap-around copy it touches.
-void Groove(Target& map, const MarkLevel& m, double au, double av, double bu, double bv, double halfWidth, double strength)
+void Groove(Target& map, const MarkMap& m, double au, double av, double bu, double bv, double halfWidth, double strength)
 {
     const double pu = MarkWrap(m.originU, m.size), pv = MarkWrap(m.originV, m.size);
     const double ax = au - m.originU + pu, ay = av - m.originV + pv;
@@ -2736,7 +2736,7 @@ void Groove(Target& map, const MarkLevel& m, double au, double av, double bu, do
 }
 
 // Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of one map, wrapped.
-void ClearBand(int axis, Target& map, const MarkLevel& m, long long from, long long count)
+void ClearBand(int axis, Target& map, const MarkMap& m, long long from, long long count)
 {
     if (count >= m.size) {
         ClearMarks(map, 0, 0, m.size, m.size);
@@ -2765,7 +2765,7 @@ void RepressCache(int axis, long long from, long long count)
 {
     if (!g_mark.set)
         return;
-    MarkLevel& m = g_mark;
+    MarkMap& m = g_mark;
     Program& stamp = g_res.programs[kStamp];
     g_gl.Enable(GL_BLEND);
     g_gl.BlendEquationSeparate(kFuncMax, kFuncMax);
@@ -2779,7 +2779,7 @@ void RepressCache(int axis, long long from, long long count)
             const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
             if (hi < static_cast<double>(from) || lo > static_cast<double>(from + count))
                 continue;
-            Groove(g_res.marks[0], m, s.au, s.av, s.bu, s.bv, hw, s.strength);
+            Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw, s.strength);
         }
     }
     g_gl.Disable(GL_BLEND);
@@ -2797,9 +2797,9 @@ bool UpdateMarks(double dt)
     (void)p;
     g_gl.Enable(GL_SCISSOR_TEST);
     g_gl.Disable(GL_BLEND);
-    if (!g_res.marksCleared[0]) {
-        ClearMarks(g_res.marks[0], 0, 0, g_mark.size, g_mark.size);
-        g_res.marksCleared[0] = true;
+    if (!g_res.marksCleared) {
+        ClearMarks(g_res.marks, 0, 0, g_mark.size, g_mark.size);
+        g_res.marksCleared = true;
         g_mark.set = false;
     }
     Vec3 u, v;
@@ -2812,14 +2812,14 @@ bool UpdateMarks(double dt)
         // little every frame, and re-laying on those blips wiped every mark mid-ride. The cache
         // goes with it: its widths are in the unit the map was laid out in.
         g_mark.texel = texel;
-        ClearMarks(g_res.marks[0], 0, 0, g_mark.size, g_mark.size);
+        ClearMarks(g_res.marks, 0, 0, g_mark.size, g_mark.size);
         g_mark.set = false;
         for (Wheel& w : g_wheels)
             w.haveLast = false;
         for (int i = 0; i < 2; ++i)
             g_markCache[i].clear();
     }
-    MarkLevel& m = g_mark;
+    MarkMap& m = g_mark;
     const double uCam = Dot(eye, u), vCam = Dot(eye, v);
     const long long cu = static_cast<long long>(std::floor(uCam / m.texel));
     const long long cv = static_cast<long long>(std::floor(vCam / m.texel));
@@ -2827,7 +2827,7 @@ bool UpdateMarks(double dt)
         m.originU = cu - m.size / 2;
         m.originV = cv - m.size / 2;
         m.set = true;
-        ClearMarks(g_res.marks[0], 0, 0, m.size, m.size);
+        ClearMarks(g_res.marks, 0, 0, m.size, m.size);
     }
     // Stay centred on the camera, and move only as far as that asks, at most a sixteenth of the
     // map at a time (the old snap to the centre at every threshold cleared up to a quarter of
@@ -2840,7 +2840,7 @@ bool UpdateMarks(double dt)
         const long long shift = du > m.size / 2 + slack ? du - (m.size / 2 + slack) : du - (m.size / 2 - slack);
         const long long from = shift > 0 ? m.originU + m.size : m.originU + shift;
         const long long count = shift > 0 ? shift : -shift;
-        ClearBand(0, g_res.marks[0], m, from, count);
+        ClearBand(0, g_res.marks, m, from, count);
         RepressCache(0, from, count);
         m.originU += shift;
     }
@@ -2848,7 +2848,7 @@ bool UpdateMarks(double dt)
         const long long shift = dv > m.size / 2 + slack ? dv - (m.size / 2 + slack) : dv - (m.size / 2 - slack);
         const long long from = shift > 0 ? m.originV + m.size : m.originV + shift;
         const long long count = shift > 0 ? shift : -shift;
-        ClearBand(1, g_res.marks[0], m, from, count);
+        ClearBand(1, g_res.marks, m, from, count);
         RepressCache(1, from, count);
         m.originV += shift;
     }
@@ -2893,7 +2893,7 @@ bool UpdateMarks(double dt)
                 Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, contact));
                 const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
                 const double strength = i == 0 ? 1.0 : 0.7;
-                Groove(g_res.marks[0], m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength);
+                Groove(g_res.marks, m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength);
                 // Into the cache too: when this ground comes back through the window's edge,
                 // the same segment is pressed again, so marks stay wherever you've ridden this
                 // session, however many times the window wrapped around since. Airborne frames
@@ -3101,7 +3101,7 @@ void Render(int w, int h)
                            static_cast<float>((kBottomDeg - topDeg) * 0.5 * kDegToRad));
         }
         // Tire marks: where the map's window is, from the camera, in its own texels.
-        Bind(p, "u_markMap", 6, marksOn ? g_res.marks[0].tex : 0);
+        Bind(p, "u_markMap", 6, marksOn ? g_res.marks.tex : 0);
         Bind(p, "u_wheelMask", 7, g_wheelMask.drawn ? g_res.wheelDepth : 0);
         g_gl.Uniform1f(p["u_wheelMaskOn"], g_wheelMask.drawn ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_marks"], marksOn ? static_cast<float>(cfg.tireMarks) : 0.0f);
