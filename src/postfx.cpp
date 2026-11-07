@@ -2603,29 +2603,29 @@ void UpdateAir(double dt)
 // One map of the ground around you that the tires press grooves into, at 4 cm texels, kept
 // centred on the camera and wrapping as you ride: the strip that leaves on one side comes back
 // cleared on the other. What that clearing forgets, a CPU-side cache of the ruts you pressed
-// remembers: each wheel keeps its recent contact-to-contact segments (world positions and the
-// rut's true width), and when ground re-enters the window the cached segments crossing the
-// cleared strip are pressed into it again - the very same stamps a fresh rut gets, so a mark
-// can never be cut or blurred where ground is reused, and a U-turn brings last lap's ruts back
-// whole. The cache is pruned by distance: segments farther along the trail than the window
-// could ever show again go. What's on the ground reaches one map: half the window to a side,
-// fading out over the last kMarkBlend before its edge; the cache keeps to kMarkCacheHalf
-// farther than that, so whatever re-enters the window is always in it.
+// remembers: each wheel keeps its contact-to-contact segments from the whole session so far
+// (their positions in the map's own texels and the rut's true width), and when ground re-
+// enters the window the cached segments crossing the cleared strip are pressed into it again
+// - the very same stamps a fresh rut gets, so a mark can never be cut or blurred where ground
+// is reused, and whatever you rode past earlier comes back exactly as it was, whenever you
+// return to it. The cache is bounded by count, not by distance: keeping the whole session is
+// what lets the marks survive the far end of a large track, where the bike-anchored window
+// has wrapped around many times since. What's on the ground reaches one map: half the window
+// to a side, fading out over the last kMarkBlend before its edge.
 constexpr int    kMarkSizeWide   = 8192;   // the map, texels to a side (328 m of ground)
 constexpr int    kMarkSizeNarrow = 4096;   // if the wide one can't be made
 constexpr double kMarkBlend      = 60.0;   // m: how wide the fade band before the window's
                                            // edge is (the shader's kMarkBlend, kept in step
                                            // with this)
-constexpr double kMarkCacheHalf  = 200.0;  // m: how far beyond the window's reach the cache
-                                           // keeps ruts (ground re-entering the window was at
-                                           // most this far outside it before it came in)
-constexpr int    kMarkCacheCap   = 6000;   // segments per wheel the cache holds at most
+constexpr int    kMarkCacheCap   = 40000;  // segments per wheel the cache holds at most
+                                           // (a ground contact per frame per wheel while
+                                           // moving: about 11 minutes of riding, ~4 MB)
 struct MarkSeg {
-    Vec3   a, b;            // world: the wheel's contact, one frame to the next
+    double au, av, bu, bv;  // the two contacts, in the map's own (unwrapped) texels
     double halfWidth = 0;   // m: the rut's half width (its true world width)
     double strength  = 0;   // how deep: rear 1, front 0.7
 };
-std::deque<MarkSeg> g_markCache[2];  // each wheel's ruts still near you, oldest first
+std::deque<MarkSeg> g_markCache[2];  // each wheel's ruts this session, oldest first
 struct MarkLevel {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
     double    texel = 0;      // one texel, in game units
@@ -2674,9 +2674,8 @@ bool EnsureMarks()
     g_mark.set = false;
     g_mark.texel = 0.04 * g_unitsPerMetre;
     const double reach = g_mark.size * g_mark.texel / 2.0 / g_unitsPerMetre;
-    Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; ground the window reuses is re-pressed from a cache of the last %.0f m of trail",
-        g_mark.size, g_mark.size, ok ? "ready" : "could not be made", reach, kMarkBlend,
-        reach + kMarkCacheHalf);
+    Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; the whole session's ruts are kept in a cache of %d segments per wheel and re-pressed wherever ground is reused",
+        g_mark.size, g_mark.size, ok ? "ready" : "could not be made", reach, kMarkBlend, kMarkCacheCap);
     return ok;
 }
 
@@ -2750,14 +2749,13 @@ void ClearBand(int axis, Target& map, const MarkLevel& m, long long from, long l
 // of the map's columns (axis 0) or rows (axis 1). The stamps are the ones a fresh rut gets, so
 // the re-pressed mark is identical to what was there before the ground was wiped - no seam, no
 // blur, whatever the turn. Max blend cannot lower what the strip still holds, so a segment
-// sticking out past the strip simply re-lays its own rut where it also lies.
+// sticking out past the strip simply re-lays its own rut where it also lies. The cache holds
+// the whole session, so this is what carries a lap's ruts across many wrap-arounds.
 void RepressCache(int axis, long long from, long long count)
 {
     if (!g_mark.set)
         return;
     MarkLevel& m = g_mark;
-    Vec3 pu, pv;
-    PlaneAxes(pu, pv);
     Program& stamp = g_res.programs[kStamp];
     g_gl.Enable(GL_BLEND);
     g_gl.BlendEquationSeparate(kFuncMax, kFuncMax);
@@ -2766,14 +2764,12 @@ void RepressCache(int axis, long long from, long long count)
     g_gl.Uniform1f(stamp["u_fallback"], 1.0f);
     for (int i = 0; i < 2; ++i) {
         for (const MarkSeg& s : g_markCache[i]) {
-            const double aU = Dot(s.a, pu) / m.texel, aV = Dot(s.a, pv) / m.texel;
-            const double bU = Dot(s.b, pu) / m.texel, bV = Dot(s.b, pv) / m.texel;
             const double hw = s.halfWidth * g_unitsPerMetre / m.texel;
-            const double lo = axis == 0 ? std::fmin(aU, bU) - hw : std::fmin(aV, bV) - hw;
-            const double hi = axis == 0 ? std::fmax(aU, bU) + hw : std::fmax(aV, bV) + hw;
+            const double lo = axis == 0 ? std::fmin(s.au, s.bu) - hw : std::fmin(s.av, s.bv) - hw;
+            const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
             if (hi < static_cast<double>(from) || lo > static_cast<double>(from + count))
                 continue;
-            Groove(g_res.marks[0], m, aU, aV, bU, bV, hw, s.strength);
+            Groove(g_res.marks[0], m, s.au, s.av, s.bu, s.bv, hw, s.strength);
         }
     }
     g_gl.Disable(GL_BLEND);
@@ -2888,11 +2884,13 @@ bool UpdateMarks(double dt)
                 const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
                 const double strength = i == 0 ? 1.0 : 0.7;
                 Groove(g_res.marks[0], m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength);
-                // Into the cache too, in metres: when this ground comes back through the window's
-                // edge, the same segment is pressed again. Airborne frames aren't cached - their
-                // stamps go through the same check off screen, so there'd be no rut to re-press.
+                // Into the cache too: when this ground comes back through the window's edge,
+                // the same segment is pressed again, so marks stay wherever you've ridden this
+                // session, however many times the window wrapped around since. Airborne frames
+                // aren't cached - their stamps go through the same check off screen, so there'd
+                // be no rut to re-press. Oldest segments go only once the cap is reached.
                 if (!g_air.airborne) {
-                    g_markCache[i].push_back({ w.lastContact, contact, i == 0 ? 0.12 : 0.09, strength });
+                    g_markCache[i].push_back({ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
                     if (g_markCache[i].size() > static_cast<size_t>(kMarkCacheCap))
                         g_markCache[i].pop_front();
                 }
@@ -2903,19 +2901,9 @@ bool UpdateMarks(double dt)
         w.lastContact = contact;
         w.haveLast = true;
     }
-    // Forget what the cache can't use any more: its front is the oldest, and once that is
-    // farther from you than the window could ever show again (its reach plus the margin the
-    // cache keeps), it's dropped. A segment a turn brought back near holds on to whatever
-    // led to it, so a U-turn's ruts stay cached the whole way back.
-    const double keep = m.size * m.texel / 2.0 + kMarkCacheHalf * g_unitsPerMetre;
-    for (int i = 0; i < 2; ++i) {
-        while (!g_markCache[i].empty()) {
-            const MarkSeg& s = g_markCache[i].front();
-            if (std::fmin(Length(s.a - eye), Length(s.b - eye)) <= keep)
-                break;
-            g_markCache[i].pop_front();
-        }
-    }
+    // Nothing else is forgotten: the cache keeps the whole session (the cap above trims the
+    // oldest), so riding the far end of a large track and coming back re-presses whatever you
+    // made there, however many times the window wrapped around in between.
     g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
     g_gl.Disable(GL_BLEND);
     g_gl.Disable(GL_SCISSOR_TEST);
