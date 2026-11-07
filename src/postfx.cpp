@@ -440,8 +440,8 @@ struct Resources {
     GLuint  captureFbo = 0, color = 0, depth = 0;  // the window's image
     GLuint  terrainFbo = 0, terrainDepth = 0;      // depth when the terrain pass ended
     GLuint  shadowFbo = 0, shadowMap = 0;          // depth seen from the sun
-    Target  marks;                                 // tire marks on the ground (see TireMarks)
-    bool    marksCleared = false;
+    Target  marks[2];                              // tire marks: the near and the coarse map (TireMarks)
+    bool    marksCleared[2] = {};
     int     shadowSize = 0;
     int     colorMode = 0;  // 0 = untried, 1 = blit, 2 = copy, -1 = nothing works
     int     depthMode = 0;  // 0 = untried, 1 = blit (depth24 + stencil8), 2 = blit (depth24), 3 = copy, -1 = none
@@ -1279,6 +1279,7 @@ struct Wheel {
     Vec3   lastContact;       // world, the last one stamped
     bool   haveLast = false;  // the last contact stamped into the tire marks
     double lastU = 0, lastV = 0;
+    double off = 0.0;         // seconds it has been off the tracker (the rut keeps joining up)
     // Where it sits on your bike (the bike's own space), learnt while its part is seen turning.
     // The game doesn't draw a wheel that is out of view (in first person the rear one, and often
     // the front, are under you), and the part can be lost for other reasons; your bike itself is
@@ -2598,16 +2599,45 @@ void UpdateAir(double dt)
 }
 
 // ---- Tire marks ------------------------------------------------------------------------------
-// A map of the ground around you (4096 x 4096 texels of 4 cm: 164 m across) that the tires
-// press grooves into. It wraps around as you ride: the strip that leaves on one side comes back
-// cleared on the other.
-constexpr int    kMarkSize  = 4096;
-double g_markTexel = 0.04 * 3.2808;  // 4 cm, in game units (set when the map is laid out)
-struct MarkWindow {
-    bool      set = false;
-    long long originU = 0, originV = 0;  // texel coordinates of the window's corner
+// Two maps of the ground around you that the tires press grooves into, kept centred on the
+// same spot: the near one at 4 cm texels for the ruts you can pick out, the coarse one 4 times
+// the texels over 2 times fewer to a side (2 times the ground) for the ruts you left behind and
+// still see from far away. Where the near map's window ends the composite fades into the coarse
+// one, so what you left behind thins out instead of ending on a line. Both wrap as you ride:
+// the strip that leaves on one side comes back cleared on the other, and where that clearing
+// starts is exactly what makes marks survive a lap. Clearing used to happen half a width BEHIND
+// you - but turn around, and what was behind comes ahead: if the cleared ground was nearer than
+// the window reaches ahead, you come back to ground that has just been wiped. That's the marks
+// of a tight U-turn vanishing, with a sharp edge, when you reach the same spot on the next lap.
+// So the maps' centre is kept kMarkBias behind you along your heading: ground gets cleared only
+// from half a width + kMarkBias behind, which is 2 * kMarkBias farther than the window's farthest
+// mark ahead, and can only be seen again by a turn around wider than that.
+constexpr int    kMarkSizeWide   = 8192;   // the near map, texels to a side (328 m of ground)
+constexpr int    kMarkSizeNarrow = 4096;   // if the wide one can't be made
+constexpr int    kMarkFarScale   = 4;      // the coarse map's texels are this many times bigger
+constexpr int    kMarkFarDiv     = 2;      // ...and this many times fewer to a side
+constexpr double kMarkBias       = 0.0;    // m: how far behind you (along your heading) the
+                                           // maps' centre is kept. The bigger this is, the
+                                           // farther behind you the ground a window reuses
+                                           // (clears) starts, and the nearer the window's
+                                           // marks stop ahead: the cleared ground can never
+                                           // be seen again by a turn around of 2 * this
+                                           // across. At 0 the centre sits on the camera:
+                                           // ruts reach 164 m ahead (near) and 328 m (coarse)
+                                           // and re-entered ground after a U-turn can still
+                                           // be caught by the coarse map.
+constexpr double kMarkBlend      = 60.0;   // m: how wide the near/coarse blend band is, where
+                                           // the detailed ruts fade into the coarse ones (the
+                                           // shader's kMarkBlend, kept in step with this)
+struct MarkLevel {
+    int       size = 0;       // texels to a side (0: this map couldn't be made)
+    double    texel = 0;      // one texel, in game units
+    long long originU = 0, originV = 0;  // where the window's corner is, in unwrapped texels
+    bool      set = false;    // the window has an origin
 };
-MarkWindow g_markWindow;
+MarkLevel g_mark[2];  // 0: near, 1: coarse
+Vec3      g_markHeading;      // which way to lean the centres back along (smoothed)
+bool      g_markHeadingSet = false;
 
 void PlaneAxes(Vec3& u, Vec3& v)
 {
@@ -2616,31 +2646,60 @@ void PlaneAxes(Vec3& u, Vec3& v)
     v = Normalize(Cross(u, up));
 }
 
-int MarkWrap(long long t) { return static_cast<int>(((t % kMarkSize) + kMarkSize) % kMarkSize); }
+int MarkWrap(long long t, int size) { return static_cast<int>(((t % size) + size) % size); }
 
 bool EnsureMarks()
 {
-    if (g_res.marks.tex)
+    if (g_mark[0].size)
         return true;
     GLint active = 0, bound = 0;
     g_gl.GetIntegerv(kActiveTexture, &active);
     g_gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
-    const bool ok = MakeTarget(g_res.marks, kMarkSize, kMarkSize, kR8, kRed, GL_UNSIGNED_BYTE);
-    g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks.tex);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // The wide near map first; the narrow one if 64 MB of R8 (or 8192 texels) is refused.
+    // MakeTarget leaves a failed try's texture behind: it goes back before the next try.
+    bool ok = false;
+    for (const int size : { kMarkSizeWide, kMarkSizeNarrow }) {
+        if (MakeTarget(g_res.marks[0], size, size, kR8, kRed, GL_UNSIGNED_BYTE)) {
+            g_mark[0].size = size;
+            ok = true;
+            break;
+        }
+        DeleteTarget(g_res.marks[0]);
+    }
+    // The coarse map costs a quarter of the near one (4 times the texels, 2 times fewer to a
+    // side) and reaches twice as far. If it can't be made, the marks only fade out at the near
+    // window's edge instead of carrying on to twice the distance.
+    if (ok) {
+        g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks[0].tex);
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        const int farSize = g_mark[0].size / kMarkFarDiv;
+        if (MakeTarget(g_res.marks[1], farSize, farSize, kR8, kRed, GL_UNSIGNED_BYTE)) {
+            g_mark[1].size = farSize;
+            g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks[1].tex);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        } else
+            DeleteTarget(g_res.marks[1]);
+    }
     g_gl.BindTexture(GL_TEXTURE_2D, bound);
     g_gl.ActiveTexture(active);
-    g_res.marksCleared = false;
-    Log("postfx: tire marks map %dx%d %s", kMarkSize, kMarkSize, ok ? "ready" : "could not be made");
-    if (!ok)
-        DeleteTarget(g_res.marks);
+    for (int level = 0; level < 2; ++level) {
+        g_res.marksCleared[level] = false;
+        g_mark[level].set = false;
+        g_mark[level].texel = 0.04 * g_unitsPerMetre * (level == 0 ? 1 : kMarkFarScale);
+    }
+    const double nearReach = g_mark[0].size * g_mark[0].texel / 2.0 / g_unitsPerMetre - kMarkBias;
+    const double farReach = g_mark[1].size ? g_mark[1].size * g_mark[1].texel / 2.0 / g_unitsPerMetre - kMarkBias : 0.0;
+    Log("postfx: tire marks maps %dx%d of 4 cm and %dx%d of 16 cm %s: the near one reaches %.0f m, the coarse one reaches %.0f m and recreates the ruts the near one lost, blending over the last %.0f m",
+        g_mark[0].size, g_mark[0].size, g_mark[1].size, g_mark[1].size, ok ? "ready" : "could not be made", nearReach,
+        farReach, kMarkBlend);
     return ok;
 }
 
-// Writes value (blend off) or presses a groove (max blend) between a and b, in the map's own
+// Writes value (blend off) or presses a groove (max blend) between a and b, in one map's own
 // texels (wrapped), over the rectangle x0, y0, w, h.
-void StampRect(int x0, int y0, int w, int h, float ax, float ay, float bx, float by, float halfWidth, float strength)
+void StampRect(Target& map, int x0, int y0, int w, int h, float ax, float ay, float bx, float by, float halfWidth, float strength)
 {
     if (w <= 0 || h <= 0)
         return;
@@ -2650,20 +2709,19 @@ void StampRect(int x0, int y0, int w, int h, float ax, float ay, float bx, float
     g_gl.Uniform1f(p["u_half"], halfWidth);
     g_gl.Uniform1f(p["u_strength"], strength);
     g_gl.Scissor(x0, y0, w, h);
-    Draw(g_res.marks);
+    Draw(map);
 }
 
-void ClearMarks(int x0, int y0, int w, int h)
+void ClearMarks(Target& map, int x0, int y0, int w, int h)
 {
-    StampRect(x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f);
+    StampRect(map, x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f);
 }
 
-// A groove from the last contact to this one (texel coordinates, unwrapped), drawn once per
-// wrap-around copy it touches.
-void Groove(double au, double av, double bu, double bv, double halfWidth, double strength)
+// A groove from the last contact to this one, in one map's texels (the coarse map's texels are
+// the near ones over kMarkFarScale), drawn once per wrap-around copy it touches.
+void Groove(Target& map, const MarkLevel& m, double au, double av, double bu, double bv, double halfWidth, double strength)
 {
-    const MarkWindow& m = g_markWindow;
-    const double pu = MarkWrap(m.originU), pv = MarkWrap(m.originV);
+    const double pu = MarkWrap(m.originU, m.size), pv = MarkWrap(m.originV, m.size);
     const double ax = au - m.originU + pu, ay = av - m.originV + pv;
     const double bx = bu - m.originU + pu, by = bv - m.originV + pv;
     const double pad = halfWidth + 2.0;
@@ -2671,41 +2729,42 @@ void Groove(double au, double av, double bu, double bv, double halfWidth, double
     const double minY = std::fmin(ay, by) - pad, maxY = std::fmax(ay, by) + pad;
     for (int sx = 0; sx < 2; ++sx) {
         for (int sy = 0; sy < 2; ++sy) {
-            const double ox = sx * kMarkSize, oy = sy * kMarkSize;
+            const double ox = sx * m.size, oy = sy * m.size;
             const int x0 = static_cast<int>(std::floor(minX - ox)), x1 = static_cast<int>(std::ceil(maxX - ox));
             const int y0 = static_cast<int>(std::floor(minY - oy)), y1 = static_cast<int>(std::ceil(maxY - oy));
             const int cx0 = std::max(x0, 0), cy0 = std::max(y0, 0);
-            const int cx1 = std::min(x1, kMarkSize), cy1 = std::min(y1, kMarkSize);
+            const int cx1 = std::min(x1, m.size), cy1 = std::min(y1, m.size);
             if (cx1 <= cx0 || cy1 <= cy0)
                 continue;
-            StampRect(cx0, cy0, cx1 - cx0, cy1 - cy0, static_cast<float>(ax - ox), static_cast<float>(ay - oy),
+            StampRect(map, cx0, cy0, cx1 - cx0, cy1 - cy0, static_cast<float>(ax - ox), static_cast<float>(ay - oy),
                       static_cast<float>(bx - ox), static_cast<float>(by - oy), static_cast<float>(halfWidth),
                       static_cast<float>(strength));
         }
     }
 }
 
-// Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of the window, wrapped.
-void ClearBand(int axis, long long from, long long count)
+// Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of one map, wrapped.
+void ClearBand(int axis, Target& map, const MarkLevel& m, long long from, long long count)
 {
-    if (count >= kMarkSize) {
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
+    if (count >= m.size) {
+        ClearMarks(map, 0, 0, m.size, m.size);
         return;
     }
-    const int start = MarkWrap(from);
-    const int first = static_cast<int>(std::min<long long>(count, kMarkSize - start));
+    const int start = MarkWrap(from, m.size);
+    const int first = static_cast<int>(std::min<long long>(count, m.size - start));
     const int second = static_cast<int>(count - first);
     if (axis == 0) {
-        ClearMarks(start, 0, first, kMarkSize);
-        ClearMarks(0, 0, second, kMarkSize);
+        ClearMarks(map, start, 0, first, m.size);
+        ClearMarks(map, 0, 0, second, m.size);
     } else {
-        ClearMarks(0, start, kMarkSize, first);
-        ClearMarks(0, 0, kMarkSize, second);
+        ClearMarks(map, 0, start, m.size, first);
+        ClearMarks(map, 0, 0, m.size, second);
     }
 }
 
-// Moves the window with you and presses this frame's grooves. Returns whether the map is usable.
-bool UpdateMarks()
+// Moves the windows with you and presses this frame's grooves into both. Returns whether the
+// near map is usable.
+bool UpdateMarks(double dt)
 {
     const Config& cfg = GetConfig();
     if (cfg.tireMarks <= 0.0 || !g_frame.haveView || !EnsureMarks())
@@ -2714,42 +2773,77 @@ bool UpdateMarks()
     (void)p;
     g_gl.Enable(GL_SCISSOR_TEST);
     g_gl.Disable(GL_BLEND);
-    if (!g_res.marksCleared) {
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
-        g_res.marksCleared = true;
-        g_markWindow.set = false;
+    for (int level = 0; level < 2; ++level) {
+        if (!g_mark[level].size || g_res.marksCleared[level])
+            continue;
+        ClearMarks(g_res.marks[level], 0, 0, g_mark[level].size, g_mark[level].size);
+        g_res.marksCleared[level] = true;
+        g_mark[level].set = false;
     }
     Vec3 u, v;
     PlaneAxes(u, v);
     const Vec3 eye = CameraPosition(g_frame.raw);
-    MarkWindow& m = g_markWindow;
-    const double texel = 0.04 * g_unitsPerMetre;
-    if (std::fabs(texel - g_markTexel) > 0.1 * texel) {  // the game's unit was measured: start over at 4 cm
-        g_markTexel = texel;
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
-        m.set = false;
+    // Which way to lean the centres: the way you're going, eased so a turn doesn't swing the
+    // windows (an abrupt swing would clear a wide band of ground all at once).
+    Vec3 ahead = EyeToWorld(g_frame.raw, Vec3{ 0, 0, -1 });
+    ahead = ahead - WorldUp() * Dot(ahead, WorldUp());
+    ahead = Length(ahead) < 1e-3 ? (g_markHeadingSet ? g_markHeading : Vec3{ 1, 0, 0 }) : Normalize(ahead);
+    if (!g_markHeadingSet) {
+        g_markHeadingSet = true;
+        g_markHeading = ahead;
+    } else
+        g_markHeading = Normalize(g_markHeading + ahead * (1.0 - std::exp(-dt / 0.25)));
+    const double texel = 0.04 * g_unitsPerMetre;  // where the near map's texels are, game units
+    if (g_unitsLocked && std::fabs(texel - g_mark[0].texel) > 0.1 * texel) {
+        // The unit has settled somewhere other than where the maps were laid out: start over at
+        // 4 cm. Gated on the unit being locked: while it's still being measured it drifts a
+        // little every frame, and re-laying on those blips wiped every mark mid-ride.
+        for (int level = 0; level < 2; ++level) {
+            if (!g_mark[level].size)
+                continue;
+            g_mark[level].texel = texel * (level == 0 ? 1 : kMarkFarScale);
+            ClearMarks(g_res.marks[level], 0, 0, g_mark[level].size, g_mark[level].size);
+            g_mark[level].set = false;
+        }
         for (Wheel& w : g_wheels)
             w.haveLast = false;
     }
-    const long long cu = static_cast<long long>(std::floor(Dot(eye, u) / g_markTexel));
-    const long long cv = static_cast<long long>(std::floor(Dot(eye, v) / g_markTexel));
-    if (!m.set) {
-        m.originU = cu - kMarkSize / 2;
-        m.originV = cv - kMarkSize / 2;
-        m.set = true;
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
-    }
-    // Keep yourself in the middle half of the window.
-    const long long du = cu - m.originU, dv = cv - m.originV;
-    if (du < kMarkSize / 4 || du > 3 * kMarkSize / 4) {
-        const long long shift = du - kMarkSize / 2;
-        ClearBand(0, shift > 0 ? m.originU + kMarkSize : m.originU + shift, shift > 0 ? shift : -shift);
-        m.originU += shift;
-    }
-    if (dv < kMarkSize / 4 || dv > 3 * kMarkSize / 4) {
-        const long long shift = dv - kMarkSize / 2;
-        ClearBand(1, shift > 0 ? m.originV + kMarkSize : m.originV + shift, shift > 0 ? shift : -shift);
-        m.originV += shift;
+    const double uCam = Dot(eye, u), vCam = Dot(eye, v);
+    for (int level = 0; level < 2; ++level) {
+        if (!g_mark[level].size)
+            continue;
+        MarkLevel& m = g_mark[level];
+        const long long cu = static_cast<long long>(std::floor(uCam / m.texel));
+        const long long cv = static_cast<long long>(std::floor(vCam / m.texel));
+        if (!m.set) {
+            m.originU = cu - m.size / 2;
+            m.originV = cv - m.size / 2;
+            m.set = true;
+            ClearMarks(g_res.marks[level], 0, 0, m.size, m.size);
+        }
+        // Keep the camera a little ahead of the centre, along the way you're going, and move
+        // only as far as that asks (the old snap to the centre at every threshold cleared up to
+        // a quarter of the map in one go, of ground that was only a quarter behind you - visible
+        // again straight after a U-turn). With this, the ground a window reuses for its far edge
+        // starts half a width + kMarkBias behind you, and its marks reach only half a width -
+        // kMarkBias ahead: 2 * kMarkBias farther behind than any mark you can still see, so
+        // clearing it can never wipe ground that a turn around (up to 2 * kMarkBias across)
+        // brings back into sight.
+        const long long slack = m.size / 16;
+        const double bias = kMarkBias * g_unitsPerMetre / m.texel;
+        const long long tu = m.size / 2 + static_cast<long long>(std::llround(bias * Dot(g_markHeading, u)));
+        const long long tv = m.size / 2 + static_cast<long long>(std::llround(bias * Dot(g_markHeading, v)));
+        const long long du = cu - m.originU, dv = cv - m.originV;
+        if (du < tu - slack || du > tu + slack) {
+            const long long shift = du > tu + slack ? du - (tu + slack) : du - (tu - slack);
+            ClearBand(0, g_res.marks[level], m, shift > 0 ? m.originU + m.size : m.originU + shift, shift > 0 ? shift : -shift);
+            m.originU += shift;
+        }
+        if (dv < tv - slack || dv > tv + slack) {
+            const long long shift = dv > tv + slack ? dv - (tv + slack) : dv - (tv - slack);
+            ClearBand(1, g_res.marks[level], m, shift > 0 ? m.originV + m.size : m.originV + shift, shift > 0 ? shift : -shift);
+            m.originV += shift;
+        }
     }
     // The grooves: from each wheel's last contact with the ground to this one, only where the tire
     // is down on the ground: checked against the terrain on screen (its depth, taken before anything
@@ -2767,13 +2861,19 @@ bool UpdateMarks()
     for (int i = 0; i < 2; ++i) {
         Wheel& w = g_wheels[i];
         if (!w.on) {
-            w.haveLast = false;
+            // A moment off the tracker (a frame without a heading, a part that went away)
+            // keeps the wheel's last contact: coming back, the rut joins up instead of leaving
+            // a gap. Only a wheel off for over three quarters of a second forgets it.
+            w.off += dt;
+            if (w.off > 0.75)
+                w.haveLast = false;
             continue;
         }
+        w.off = 0.0;
         const Vec3 contact = w.contact;
-        const double tu = Dot(contact, u) / g_markTexel, tv = Dot(contact, v) / g_markTexel;
+        const double tu = Dot(contact, u) / g_mark[0].texel, tv = Dot(contact, v) / g_mark[0].texel;
         if (w.haveLast) {
-            const double step = std::hypot(tu - w.lastU, tv - w.lastV) * g_markTexel;
+            const double step = std::hypot(tu - w.lastU, tv - w.lastV) * g_mark[0].texel;
             if (step > 2.5 * g_unitsPerMetre) {  // a respawn: don't join it up
                 w.haveLast = false;
             } else if (step < 0.01 * g_unitsPerMetre) {
@@ -2782,7 +2882,21 @@ bool UpdateMarks()
                 // Rear: a 240 mm rut (the tire digs and throws dirt aside), front: 180 mm, shallower.
                 Vec(stamp, "u_eyeA", TransformPoint(g_frame.rendered, w.lastContact));
                 Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, contact));
-                Groove(w.lastU, w.lastV, tu, tv, (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre / g_markTexel, i == 0 ? 1.0 : 0.7);
+                const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
+                for (int level = 0; level < 2; ++level) {
+                    if (!g_mark[level].size)
+                        continue;
+                    // The coarse map's texels are kMarkFarScale of the near ones, so its texel
+                    // coordinates are the near ones over that. The rut is under one texel there,
+                    // but the composite recreates it into a smooth line (MarkStatsRecreate), so
+                    // it's kept at the rut's real world width (a hair over a texel at least) -
+                    // wider would draw a low-res halo around the fresh near ruts where the
+                    // recreation takes over, and that reads as fat smeared marks.
+                    const double over = 1.0 / (level == 0 ? 1 : kMarkFarScale);
+                    const double hw = std::fmax(halfWidth / g_mark[level].texel, 0.7);
+                    Groove(g_res.marks[level], g_mark[level], w.lastU * over, w.lastV * over, tu * over, tv * over, hw,
+                           (i == 0 ? 1.0 : 0.7) * (level == 0 ? 1.0 : 0.6));
+                }
             }
         }
         w.lastU = tu;
@@ -2882,7 +2996,7 @@ void Render(int w, int h)
     ToFloat(haveInverse ? invP : P, g_m.invProj, 16);
     g_m.texel[0] = 1.0f / w;
     g_m.texel[1] = 1.0f / h;
-    const bool marksOn = UpdateMarks();  // after the matrices: the grooves check the ground on screen
+    const bool marksOn = UpdateMarks(dt);  // after the matrices: the grooves check the ground on screen
 
     const double* V = g_frame.rendered;
     if (g_frame.haveLight) {
@@ -2976,8 +3090,9 @@ void Render(int w, int h)
                            static_cast<float>((kBottomDeg + topDeg) * 0.5 * kDegToRad),
                            static_cast<float>((kBottomDeg - topDeg) * 0.5 * kDegToRad));
         }
-        // Tire marks: where the map's window is, from the camera, in the map's texels.
-        Bind(p, "u_markMap", 6, marksOn ? g_res.marks.tex : 0);
+        // Tire marks: where each map's window is, from the camera, in its own texels.
+        Bind(p, "u_markMap", 6, marksOn ? g_res.marks[0].tex : 0);
+        Bind(p, "u_markMap2", 8, marksOn ? (g_mark[1].size ? g_res.marks[1].tex : g_res.marks[0].tex) : 0);
         Bind(p, "u_wheelMask", 7, g_wheelMask.drawn ? g_res.wheelDepth : 0);
         g_gl.Uniform1f(p["u_wheelMaskOn"], g_wheelMask.drawn ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_marks"], marksOn ? static_cast<float>(cfg.tireMarks) : 0.0f);
@@ -2985,16 +3100,36 @@ void Render(int w, int h)
             Vec3 mu, mv;
             PlaneAxes(mu, mv);
             const Vec3 camera = CameraPosition(V);
-            g_gl.Uniform2f(p["u_markCam"], static_cast<float>(Dot(camera, mu) / g_markTexel - static_cast<double>(g_markWindow.originU)),
-                           static_cast<float>(Dot(camera, mv) / g_markTexel - static_cast<double>(g_markWindow.originV)));
-            g_gl.Uniform2f(p["u_markPhys"], static_cast<float>(MarkWrap(g_markWindow.originU)),
-                           static_cast<float>(MarkWrap(g_markWindow.originV)));
+            const double camU = Dot(camera, mu), camV = Dot(camera, mv);
+            g_gl.Uniform2f(p["u_markCam"], static_cast<float>(camU / g_mark[0].texel - static_cast<double>(g_mark[0].originU)),
+                           static_cast<float>(camV / g_mark[0].texel - static_cast<double>(g_mark[0].originV)));
+            g_gl.Uniform2f(p["u_markPhys"], static_cast<float>(MarkWrap(g_mark[0].originU, g_mark[0].size)),
+                           static_cast<float>(MarkWrap(g_mark[0].originV, g_mark[0].size)));
             Vec(p, "u_markU", WorldToEye(V, mu));
             Vec(p, "u_markV", WorldToEye(V, mv));
             Vec(p, "u_markUW", mu);
             Vec(p, "u_markVW", mv);
-            g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_markTexel));
-            g_gl.Uniform1f(p["u_markSize"], static_cast<float>(kMarkSize));
+            g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_mark[0].texel));
+            g_gl.Uniform1f(p["u_markSize"], static_cast<float>(g_mark[0].size));
+            // The coarse map over the ground beyond the near one's window; its size is 0 when it
+            // couldn't be made, and then the marks only fade out at the near window's edge.
+            if (g_mark[1].size) {
+                g_gl.Uniform2f(p["u_markCam2"], static_cast<float>(camU / g_mark[1].texel - static_cast<double>(g_mark[1].originU)),
+                               static_cast<float>(camV / g_mark[1].texel - static_cast<double>(g_mark[1].originV)));
+                g_gl.Uniform2f(p["u_markPhys2"], static_cast<float>(MarkWrap(g_mark[1].originU, g_mark[1].size)),
+                               static_cast<float>(MarkWrap(g_mark[1].originV, g_mark[1].size)));
+                g_gl.Uniform1f(p["u_markTexel2"], static_cast<float>(g_mark[1].texel));
+                g_gl.Uniform1f(p["u_markSize2"], static_cast<float>(g_mark[1].size));
+            } else {
+                // No coarse map: its size being 0 keeps the shader off it. Its own uniforms go
+                // back to the near map's so they hold something sensible.
+                g_gl.Uniform2f(p["u_markCam2"], static_cast<float>(camU / g_mark[0].texel - static_cast<double>(g_mark[0].originU)),
+                               static_cast<float>(camV / g_mark[0].texel - static_cast<double>(g_mark[0].originV)));
+                g_gl.Uniform2f(p["u_markPhys2"], static_cast<float>(MarkWrap(g_mark[0].originU, g_mark[0].size)),
+                               static_cast<float>(MarkWrap(g_mark[0].originV, g_mark[0].size)));
+                g_gl.Uniform1f(p["u_markTexel2"], static_cast<float>(g_mark[0].texel));
+                g_gl.Uniform1f(p["u_markSize2"], 0.0f);
+            }
         }
         // Tire dirt: each wheel's own space (its axle along x, turning with it) from the camera's.
         g_gl.Uniform1f(p["u_tireDirt"], static_cast<float>(cfg.tireDirt));
