@@ -179,11 +179,6 @@ uniform vec3  u_markU, u_markV; // the map's axes, view space
 uniform vec3  u_markUW, u_markVW; // and world space
 uniform float u_markTexel;      // m
 uniform float u_markSize;       // texels
-uniform sampler2D u_markMap2;   // the same ruts, 4 times coarser, over 2 times the ground
-uniform vec2  u_markCam2;
-uniform vec2  u_markPhys2;
-uniform float u_markTexel2;
-uniform float u_markSize2;      // 0: the coarse map couldn't be made
 uniform float u_tireDirt;       // 0..1
 uniform float u_metre;          // game units per metre (MX Simulator: feet)
 uniform float u_wheelOn[2];     // 0 rear, 1 front
@@ -351,13 +346,15 @@ float ValueNoise(vec3 p)
     return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
 }
 )GLSL" R"GLSL(
-// How far inside each map's window this is (m), and how much of each map is used there: the near
-// one holds the ruts up to its window's edge and fades out over the last kMarkBlend metres, the
-// coarse one fades in over that same band and holds on to its own edge, where it fades out too.
+// How far inside the map's window this is (m), and how much of the map is used there: the
+// ruts hold on until the window's edge and fade out over the last kMarkBlend metres before
+// it. What the window's wrap-around cleared is not lost: postfx.cpp keeps the ruts you
+// pressed in a cache and re-presses them into the fresh strip the window lets in, with the
+// very same stamps a rut gets when it's first dug - so a mark never ends on a line where
+// ground is reused, and last lap's ruts come back whole after a U-turn.
 const float kMarkBlend = 60.0;
 
 float MarkNear(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
-float MarkFar(vec2 t) { return texture(u_markMap2, (t + u_markPhys2) / u_markSize2).r; }
 
 // How much groove is at t, the fullest of the four texels next to it (its edges come from where
 // a neighbour holds a groove and this one little), and how much more there is to the right and
@@ -371,61 +368,24 @@ vec4 MarkStatsNear(vec2 t)
              MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0)));
 }
 
-// Rebuilding from the coarse map what the near one lost: its texels, linear-filtered, make a
-// smooth hill per rut, and its gradient (how much more there is to the right and above) says
-// where that hill's middle is: sampling at that middle and scaling the hill back up (the
-// coarse map is pressed at 0.6) turns those 16 cm samples back into a continuous line again,
-// centred within half a texel. A recreated rut is read like a near one, up to 8 cm sideways
-// off where the real one was pressed - at the distances where the near map has lost a rut,
-// that's what's left of it anyway.
-vec4 MarkStatsRecreate(vec2 t2)
-{
-    float gxx = MarkFar(t2 + vec2(1.0, 0.0)) - MarkFar(t2 - vec2(1.0, 0.0));
-    float gyy = MarkFar(t2 + vec2(0.0, 1.0)) - MarkFar(t2 - vec2(0.0, 1.0));
-    vec2 c = t2 + clamp(vec2(gxx, gyy), -1.0, 1.0) * 0.5;
-    const float kGain = 1.0 / 0.6;  // the coarse map's stamps, pressed lighter: back to full
-    float m = min(MarkFar(c) * kGain, 1.0);
-    float around = max(max(MarkFar(c + vec2(2.0, 0.0)), MarkFar(c - vec2(2.0, 0.0))),
-                       max(MarkFar(c + vec2(0.0, 2.0)), MarkFar(c - vec2(0.0, 2.0))));
-    around = min(around * kGain, 1.0);
-    return vec4(m, around, gxx, gyy);
-}
-
 // Ruts your tires dug into the ground: a groove of darker, packed and damp dirt with the knobs'
 // blocks pressed into its floor, its sides lit by the sun like any slope, and loose dirt thrown
-// up along both edges. Where the near map's window ends the coarse one takes over, and both fade
-// as they near their own border: what you left behind thins out instead of ending on a line.
+// up along both edges. The map only covers the window around you: its own ruts, and whatever the
+// cache re-pressed into ground the window reused, and what's left thins out over the last kMarkBlend
+// metres before the window's edge instead of ending on a line.
 vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
 {
     vec2 g = vec2(dot(p, u_markU), dot(p, u_markV));  // this pixel on the ground's plane, game units
-    vec2 t = u_markCam + g / u_markTexel;             // in the near map's texels
-    // How far inside each map's window this is, in metres, and how much of each map counts
-    // there: each fades out over the last kMarkBlend metres before its own window's edge.
+    vec2 t = u_markCam + g / u_markTexel;             // in the map's texels
+    // How far inside the window this is (m), and how much of the map counts there: the last
+    // kMarkBlend metres before its edge fade out.
     float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
-    float inFar = 0.0;
-    vec2 t2 = vec2(0.0);
-    if (u_markSize2 > 0.0) {
-        vec2 tf = u_markCam2 + g / u_markTexel2;
-        t2 = tf;
-        inFar = min(min(tf.x, u_markSize2 - tf.x), min(tf.y, u_markSize2 - tf.y)) * (u_markTexel2 / u_metre);
-    }
     float wNear = smoothstep(0.0, kMarkBlend, inNear);
-    float wFar = (u_markSize2 > 0.0) ? smoothstep(0.0, kMarkBlend, inFar) : 0.0;
-    if (wNear < 0.004 && wFar < 0.004)
+    if (wNear < 0.004)
         return c;
-    // Both maps are read, and the fuller one wins: every rut is pressed into both, so where
-    // the near map's window wrapped around and cleared a rut the coarse one still holds, the
-    // recreated coarse one takes over - rebuilt into a continuous near-like line from its
-    // 16 cm samples (see MarkStatsRecreate), not blocky texels. Past the near window only
-    // the coarse one has anything, and past that one's edge both have faded to nothing.
     vec4 sNear = MarkStatsNear(t);
-    vec4 sFar = u_markSize2 > 0.0 ? MarkStatsRecreate(t2) : vec4(0.0);
-    float m, around, gx, gy, texel;
-    if (sFar.x * wFar > sNear.x * wNear) {
-        m = sFar.x * wFar; around = sFar.y * wFar; gx = sFar.z * wFar; gy = sFar.w * wFar; texel = u_markTexel2;
-    } else {
-        m = sNear.x * wNear; around = sNear.y * wNear; gx = sNear.z * wNear; gy = sNear.w * wNear; texel = u_markTexel;
-    }
+    float m = sNear.x * wNear, around = sNear.y * wNear, gx = sNear.z * wNear, gy = sNear.w * wNear;
+    float texel = u_markTexel;
     around = max(around, m);
     if (m < 0.004 && around < 0.004)
         return c;
