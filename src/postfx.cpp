@@ -2617,16 +2617,28 @@ constexpr int    kMarkSizeNarrow = 4096;   // if the wide one can't be made
 constexpr double kMarkBlend      = 60.0;   // m: how wide the fade band before the window's
                                            // edge is (the shader's kMarkBlend, kept in step
                                            // with this)
-constexpr double kMarkCacheMin   = 10000.0;  // segments per wheel the cache keeps at least
-constexpr double kMarkCacheMax   = 100000.0; // ...and at most: the panel's and mxcam.ini's range
-                                             // for MarkCacheSegs ("Mark cache" on the GRAPHICS
-                                             // tab, which also shows the memory it costs)
+constexpr double kMarkCacheMin   = 10000.0;    // segments per wheel the cache keeps at least
+constexpr double kMarkCacheMax   = 1000000.0;  // ...and at most: the range the panel and mxcam.ini
+                                               // offer for MarkCacheSegs ("Mark cache", which
+                                               // shows the memory: kMarkSegBytes a segment times
+                                               // both wheels, so a million is about 92 MB). Big
+                                               // counts stay cheap because the cache is indexed
+                                               // in blocks (below): re-pressing a strip only
+                                               // looks at the blocks whose box touches it
+constexpr size_t kMarkBlockSegs  = 64;         // segments kept in one block, sharing a box: the
+                                               // index the re-press walks, about 2 bytes a
+                                               // segment of boxes
 struct MarkSeg {
     double au, av, bu, bv;  // the two contacts, in the map's own (unwrapped) texels
     double halfWidth = 0;   // m: the rut's half width (its true world width)
     double strength  = 0;   // how deep: rear 1, front 0.7
-};                          // six doubles each: config.h's kMarkSegBytes, what the panel shows
-std::deque<MarkSeg> g_markCache[2];  // each wheel's ruts this session, oldest first
+};
+struct MarkBlock {
+    std::vector<MarkSeg> segs;       // up to kMarkBlockSegs of one wheel's trail, oldest first
+    double minU, maxU, minV, maxV;   // the box those segments cover, in the map's texels
+};
+std::deque<MarkBlock> g_markCache[2];  // each wheel's ruts this session, oldest block first
+size_t                g_markCacheSize[2] = {};  // segments held per wheel (what the cap counts)
 struct MarkMap {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
     double    texel = 0;      // one texel, in game units
@@ -2635,11 +2647,47 @@ struct MarkMap {
 };
 MarkMap g_mark;  // the map
 
-// How many segments per wheel the cache keeps: the setting's (the panel's "Mark cache",
-// mxcam.ini's MarkCacheSegs), inside the range offered there.
+// How many segments per wheel the cache keeps: the setting's, inside the range offered there.
 size_t MarkCacheCap()
 {
     return static_cast<size_t>(Clamp(GetConfig().markCacheSegs, kMarkCacheMin, kMarkCacheMax));
+}
+
+// Nothing the cache holds any more: its segments are placed in the texels the map was laid out
+// with, so a new layout starts them over.
+void ClearMarkCache()
+{
+    for (int i = 0; i < 2; ++i) {
+        g_markCache[i].clear();
+        g_markCacheSize[i] = 0;
+    }
+}
+
+// One rut segment more at the back of a wheel's cache, kept in a block with its neighbours on
+// the trail and with the block's box grown around it. Over the cap the oldest blocks go whole
+// (the block still being filled at the back is never dropped, so a wheel keeps its recent
+// strides whatever the count).
+void PushMark(int i, const MarkSeg& s)
+{
+    std::deque<MarkBlock>& blocks = g_markCache[i];
+    const double loU = std::fmin(s.au, s.bu), hiU = std::fmax(s.au, s.bu);
+    const double loV = std::fmin(s.av, s.bv), hiV = std::fmax(s.av, s.bv);
+    if (blocks.empty() || blocks.back().segs.size() >= kMarkBlockSegs)
+        blocks.push_back(MarkBlock{ { s }, loU, hiU, loV, hiV });
+    else {
+        MarkBlock& b = blocks.back();
+        b.segs.push_back(s);
+        b.minU = std::fmin(b.minU, loU);
+        b.maxU = std::fmax(b.maxU, hiU);
+        b.minV = std::fmin(b.minV, loV);
+        b.maxV = std::fmax(b.maxV, hiV);
+    }
+    ++g_markCacheSize[i];
+    const size_t cap = MarkCacheCap();
+    while (g_markCacheSize[i] > cap && blocks.size() > 1) {
+        g_markCacheSize[i] -= blocks.front().segs.size();
+        blocks.pop_front();
+    }
 }
 
 void PlaneAxes(Vec3& u, Vec3& v)
@@ -2756,11 +2804,13 @@ void ClearBand(int axis, Target& map, const MarkMap& m, long long from, long lon
 
 // After a cleared strip let fresh ground into the window, press back from the cache what was
 // ruted there: every cached segment crossing the strip [from, from + count) (unwrapped texels)
-// of the map's columns (axis 0) or rows (axis 1). The stamps are the ones a fresh rut gets, so
-// the re-pressed mark is identical to what was there before the ground was wiped - no seam, no
-// blur, whatever the turn. Max blend cannot lower what the strip still holds, so a segment
-// sticking out past the strip simply re-lays its own rut where it also lies. The cache holds
-// the whole session, so this is what carries a lap's ruts across many wrap-arounds.
+// of the map's columns (axis 0) or rows (axis 1). The blocks are the index: a block whose box
+// misses the strip is skipped whole, so a whole session's ruts stay cheap to re-press whatever
+// the count. The stamps are the ones a fresh rut gets, so the re-pressed mark is identical to
+// what was there before the ground was wiped - no seam, no blur, whatever the turn. Max blend
+// cannot lower what the strip still holds, so a segment sticking out past the strip simply
+// re-lays its own rut where it also lies. The cache holds the whole session, so this is what
+// carries a lap's ruts across many wrap-arounds.
 void RepressCache(int axis, long long from, long long count)
 {
     if (!g_mark.set)
@@ -2772,14 +2822,25 @@ void RepressCache(int axis, long long from, long long count)
     g_gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
     g_gl.Uniform1f(stamp["u_check"], 0.0f);  // the cache only holds ruts the tires really pressed
     g_gl.Uniform1f(stamp["u_fallback"], 1.0f);
+    const double stripLo = static_cast<double>(from), stripHi = static_cast<double>(from + count);
+    // A block's box holds its segments' contacts only, so the test is widened by the widest
+    // rut's half (the rear's, the wider of the two): a segment reaching into the strip from
+    // outside the box still gets pressed. In the map's texels.
+    const double widest = 0.12 * g_unitsPerMetre / m.texel;
     for (int i = 0; i < 2; ++i) {
-        for (const MarkSeg& s : g_markCache[i]) {
-            const double hw = s.halfWidth * g_unitsPerMetre / m.texel;
-            const double lo = axis == 0 ? std::fmin(s.au, s.bu) - hw : std::fmin(s.av, s.bv) - hw;
-            const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
-            if (hi < static_cast<double>(from) || lo > static_cast<double>(from + count))
-                continue;
-            Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw, s.strength);
+        for (const MarkBlock& b : g_markCache[i]) {
+            const double bLo = axis == 0 ? b.minU - widest : b.minV - widest;
+            const double bHi = axis == 0 ? b.maxU + widest : b.maxV + widest;
+            if (bHi < stripLo || bLo > stripHi)
+                continue;  // the whole block is clear of the strip: its segments can't be in it
+            for (const MarkSeg& s : b.segs) {
+                const double hw = s.halfWidth * g_unitsPerMetre / m.texel;
+                const double lo = axis == 0 ? std::fmin(s.au, s.bu) - hw : std::fmin(s.av, s.bv) - hw;
+                const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
+                if (hi < stripLo || lo > stripHi)
+                    continue;
+                Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw, s.strength);
+            }
         }
     }
     g_gl.Disable(GL_BLEND);
@@ -2816,8 +2877,7 @@ bool UpdateMarks(double dt)
         g_mark.set = false;
         for (Wheel& w : g_wheels)
             w.haveLast = false;
-        for (int i = 0; i < 2; ++i)
-            g_markCache[i].clear();
+        ClearMarkCache();
     }
     MarkMap& m = g_mark;
     const double uCam = Dot(eye, u), vCam = Dot(eye, v);
@@ -2899,11 +2959,8 @@ bool UpdateMarks(double dt)
                 // session, however many times the window wrapped around since. Airborne frames
                 // aren't cached - their stamps go through the same check off screen, so there'd
                 // be no rut to re-press. Oldest segments go only once the cap is reached.
-                if (!g_air.airborne) {
-                    g_markCache[i].push_back({ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
-                    if (g_markCache[i].size() > MarkCacheCap())
-                        g_markCache[i].pop_front();
-                }
+                if (!g_air.airborne)
+                    PushMark(i, MarkSeg{ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
             }
         }
         w.lastU = tu;

@@ -6,7 +6,8 @@
 namespace mxcam {
 
 // What one cached rut segment costs in memory (postfx.cpp's MarkSeg: six doubles), so the
-// settings panel and the log can say what a segment count costs.
+// settings panel and the log can say what a segment count costs. The index that keeps big
+// counts cheap to re-press adds about 2 bytes a segment of boxes on top.
 constexpr unsigned long long kMarkSegBytes = 48;
 
 struct Config {
@@ -136,9 +137,10 @@ struct Config {
     double dirtDetail       = 0.6;        // 0..1 extra fine detail on the ground
     double dirtScale        = 1.0;        // size of the detail (2 = twice as big)
     double tireMarks        = 0.7;        // 0..1 grooves your tires leave in the dirt
-    double markCacheSegs    = 40000.0;    // segments per wheel (10000..100000) of your ruts kept
+    double markCacheSegs    = 40000.0;    // segments per wheel (10000..1000000) of your ruts kept
                                           // in memory: how far back along your ride they come
-                                          // back exactly as they were (the panel shows the memory)
+                                          // back exactly as they were (the panel shows the memory
+                                          // it costs: kMarkSegBytes each, both wheels)
     double tireDirt         = 0.6;        // 0..1 mud caked on your tires
     double motionBlur       = 0.0;        // 0..1 camera motion blur
     double depthOfField     = 0.0;        // 0..1

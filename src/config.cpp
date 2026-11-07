@@ -628,7 +628,7 @@ Config ParseConfig(const Config& base)
     c.dirtDetail           = Clamp(c.dirtDetail, 0.0, 1.0);
     c.dirtScale            = Clamp(c.dirtScale, 0.25, 4.0);
     c.tireMarks            = Clamp(c.tireMarks, 0.0, 1.0);
-    c.markCacheSegs        = Clamp(std::round(c.markCacheSegs), 10000.0, 100000.0);
+    c.markCacheSegs        = Clamp(std::round(c.markCacheSegs), 10000.0, 1000000.0);
     c.tireDirt             = Clamp(c.tireDirt, 0.0, 1.0);
     c.motionBlur           = Clamp(c.motionBlur, 0.0, 1.0);
     c.depthOfField         = Clamp(c.depthOfField, 0.0, 1.0);
