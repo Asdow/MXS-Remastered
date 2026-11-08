@@ -662,12 +662,20 @@ uniform float u_strength;
 uniform vec3  u_eyeA, u_eyeB;   // the two contacts (view space): pressed only where the tire is down
 uniform sampler2D u_ground;     // the terrain's depth, before anything stood on it
 uniform float u_check;          // 1: check against it on screen
-uniform float u_fallback;       // off screen: 1 on the ground, 0 in the air
+uniform float u_fallback;       // this wheel's own answer, from its height in the world: 0 in the
+                                // air, presses nothing anywhere; 1: where the screen can see this
+                                // groove, the terrain's depth decides
 uniform float u_groundTol;      // how far above the ground still counts as down
 uniform vec3  u_upView;
 
+// Both answers must agree. The terrain's depth is the exact one but exists only where the game drew
+// the terrain under this wheel, and as the wheel rises the camera rises with it, so in first person
+// that pixel holds far-ahead ground at about the tire's height and calls a tire that is in the air
+// "down": the world's own answer has to hold as well rather than speak only off screen.
 float OnGround(float t)
 {
+    if (u_fallback < 0.5)
+        return 0.0;
     vec3 c = mix(u_eyeA, u_eyeB, t);
     if (u_check > 0.5 && c.z < -0.05) {
         vec2 uv = Project(c);
