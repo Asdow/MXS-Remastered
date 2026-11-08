@@ -2985,6 +2985,17 @@ constexpr double kGroundKeep       = 0.25;  // how far a fresh sample moves a ce
 double g_markTime = 0;                      // s of riding the marks have seen: a clock to stamp the
                                             // fits' samples with, so their windows are in time and
                                             // not in frames (a hitch keeps the fit's samples honest)
+bool g_airLogging = false;                  // Whether the marks' air test is written to the log at
+                                            // all: it was, the whole time this was being worked on,
+                                            // and the notes below (by kAirFitWindow, kAirScoreGain,
+                                            // kAirLandedDrain and seenClear) are written from what
+                                            // those lines said - a wheel called down with its fall
+                                            // still a whole gravity deep, a hold that flapped back
+                                            // through the lip, and so on. Off in a normal build: a
+                                            // session's worth of them is noise, and nothing in the
+                                            // game reads them. Set it to true to watch the test
+                                            // decide, which is how a wrong call is reported as
+                                            // evidence rather than as a symptom.
 int g_airLogLines = 0;                      // where a wheel's tire is off and back on, written to the
                                             // log with the numbers that decided it, so a wrong call
                                             // can be reported as evidence rather than as a symptom
@@ -3144,7 +3155,7 @@ constexpr double kTerrainFarMetres = 60;  // m from the camera a sample may be a
                                           // hill over the sky, or too coarse to say anything where
                                           // your wheels are
 std::vector<float> g_sample(kSampleWidth * kSampleHeight, 0.0f);
-bool g_sampleLogged = false;              // the first fill logs what it made, once
+bool g_sampleLogged = false;              // the first fill logs what it made, once, with g_airLogging
 bool g_sampleQuiet  = false;              // nothing accepted for a whole spell: stop trying
 int  g_sampleNothing = 0;                 // frames in a row that took no sample at all
 
@@ -3242,7 +3253,7 @@ bool FillTerrainFromDepth()
         return false;
     }
     g_sampleNothing = 0;
-    if (!g_sampleLogged) {
+    if (g_airLogging && !g_sampleLogged) {
         g_sampleLogged = true;
         Log("postfx: the ground is read from what the game drew of the terrain: %d samples a frame", taken);
     }
@@ -3579,7 +3590,7 @@ bool UpdateMarks(double dt)
                 GroundWrite(fcu, fcv, height);
             } else if (w.airScore > w.airPeak)
                 w.airPeak = w.airScore;  // what this flight holds, to be lost by half to land
-            if (w.grounded != wasGrounded && g_airLogLines < kAirLogLinesMax) {
+            if (g_airLogging && w.grounded != wasGrounded && g_airLogLines < kAirLogLinesMax) {
                 ++g_airLogLines;
                 Log("postfx: tire marks: wheel %d %s the ground: it was %+.2f m above the height of "
                     "the ground near here%s, the deeper of its own and your bike's fall was %+.2f g "
@@ -3630,8 +3641,9 @@ bool UpdateMarks(double dt)
     // flight - the first two seconds of riding, and every tenth second while any hold is being read,
     // so the whole of a jump the user has just made is in the log beside the marks it made. The
     // bike's own reading is printed as well: where the two disagree is what the answer came from.
+    // Only with g_airLogging on, the whole of this block being the watching of the test.
     g_airReadTimer += dt;
-    if (g_airReadLines < kAirReadLinesMax && g_airReadTimer >= kAirReadEvery &&
+    if (g_airLogging && g_airReadLines < kAirReadLinesMax && g_airReadTimer >= kAirReadEvery &&
         (g_airReadLines < 20 || g_wheels[0].airScore > 0.0 || g_wheels[1].airScore > 0.0)) {
         g_airReadTimer = 0;
         ++g_airReadLines;
