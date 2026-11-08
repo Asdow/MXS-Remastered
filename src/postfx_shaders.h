@@ -338,6 +338,20 @@ vec3 Dirt(vec3 c, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, float z, float mask)
     return mix(c, c * (shade * cavity * albedo), mask);
 }
 
+// The ground's own detail texel at wp (triplanar, the three faces weighted by the surface's
+// own normal), as Dirt reads it: rg are the bump's xy, b its height and a its albedo. Only the
+// blended texel comes back, which is what the marks want of it: their floor is the same dirt
+// the surface has, so it has to be the same texel, just read closer.
+vec4 DetailAt(vec3 wp, vec3 dwx, vec3 dwy, vec3 n, float s)
+{
+    vec3 w = pow(abs(n), vec3(4.0));
+    w /= (w.x + w.y + w.z);
+    vec4 tx = textureGrad(u_detail, wp.zy * s, dwx.zy * s, dwy.zy * s);
+    vec4 ty = textureGrad(u_detail, wp.xz * s, dwx.xz * s, dwy.xz * s);
+    vec4 tz = textureGrad(u_detail, wp.xy * s, dwx.xy * s, dwy.xy * s);
+    return tx * w.x + ty * w.y + tz * w.z;
+}
+
 float ValueNoise(vec3 p)
 {
     vec3 i = floor(p), f = fract(p);
@@ -359,16 +373,21 @@ const float kMarkBlend = 60.0;
 
 float MarkNear(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
 
-// How much groove is at t, the fullest of the four texels next to it (its edges come from where
-// a neighbour holds a groove and this one little), and how much more there is to the right and
-// above: the groove's sides are lit as slopes from those two differences.
-vec4 MarkStatsNear(vec2 t)
+// How much groove is at t, and the fullest of the four texels two each way of it (the rut's
+// edges are where a neighbour holds a groove and this one little).
+vec2 MarkStatsNear(vec2 t)
 {
-    float m = MarkNear(t);
-    return vec4(m, max(max(MarkNear(t + vec2(2.0, 0.0)), MarkNear(t - vec2(2.0, 0.0))),
-                     max(MarkNear(t + vec2(0.0, 2.0)), MarkNear(t - vec2(0.0, 2.0)))),
-             MarkNear(t + vec2(1.0, 0.0)) - MarkNear(t - vec2(1.0, 0.0)),
-             MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0)));
+    return vec2(MarkNear(t), max(max(MarkNear(t + vec2(2.0, 0.0)), MarkNear(t - vec2(2.0, 0.0))),
+                               max(MarkNear(t + vec2(0.0, 2.0)), MarkNear(t - vec2(0.0, 2.0)))));
+}
+
+// The height field's own slope at t, over texels two each way along the map's axes: the dug
+// walls. Two texels rather than one, because the map holds 8-bit steps and a nearer stencil
+// reads those steps as ridges in the sides.
+vec2 MarkGrad(vec2 t)
+{
+    return vec2(MarkNear(t + vec2(2.0, 0.0)) - MarkNear(t - vec2(2.0, 0.0)),
+                MarkNear(t + vec2(0.0, 2.0)) - MarkNear(t - vec2(0.0, 2.0)));
 }
 
 // Ruts your tires dug into the ground: a channel of darker, packed and damp dirt, deepest on
@@ -378,10 +397,17 @@ vec4 MarkStatsNear(vec2 t)
 // and main pulls the whole look of the surface (the scene's own colour, the ground's detail,
 // and these marks) from that lower point - the whole ground texture moves with the groove,
 // not just the marks. The map only covers the window around you: its own ruts, and whatever
-// the cache re-pressed into ground the window reused,
-// and what's left thins out over the last kMarkBlend metres before the window's edge instead of
-// ending on a line.
-vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
+// the cache re-pressed into ground the window reused, and what's left thins out over the last
+// kMarkBlend metres before the window's edge instead of ending on a line.
+// The look the rut has of the ground it lies in comes from main: n is the surface's own normal
+// where the groove's floor is (not this pixel's, so a rut across a hillside is lit against the
+// ground it really sits on), and lFloor / lHere are the scene's own ambient and sun where that
+// floor was drawn and where this pixel is - their ratio is what carries the rut into the same
+// shade and light the ground around it stands in. relief is how deep this pixel's groove can
+// be at all, as the displacement actually left it: the walls' shading has to lean on the same
+// height the floor was lowered by, or the sides read steeper than the ground they hold.
+vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor, vec2 lHere,
+               float relief)
 {
     vec2 g = vec2(dot(p, u_markU), dot(p, u_markV));  // this pixel on the ground's plane, game units
     vec2 t = u_markCam + g / u_markTexel;             // in the map's texels
@@ -391,38 +417,57 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     float wNear = smoothstep(0.0, kMarkBlend, inNear);
     if (wNear < 0.004)
         return c;
-    vec4 sNear = MarkStatsNear(t);
+    vec2 sNear = MarkStatsNear(t);
     float m = sNear.x * wNear, around = max(sNear.y * wNear, m);
     if (m < 0.004 && around < 0.004)
         return c;
     float k = u_marks;
     float texel = u_markTexel;
-    // The sides, from the height's own differences at the floor: the shading lines up with where
-    // main lowered this pixel. (7 cm deep in the middle.)
-    vec3 slope = (u_markUW * sNear.z + u_markVW * sNear.w) * (wNear * 0.07 * u_metre * k / (2.0 * texel));
-    vec3 nd = normalize(n + slope);
+    // The sides, from the height field's own slope two texels each way and over the height the
+    // floor was really lowered here: the dug walls light as real slopes, and their shading
+    // lines up with where main lowered this pixel.
+    vec2 gr = MarkGrad(t);
+    vec3 nd = normalize(n + (u_markUW * gr.x + u_markVW * gr.y) *
+                            (wNear * relief / (4.0 * texel)));
     float before = max(dot(n, u_lightWorld), 0.0) * 0.75 + 0.35;
     float after = max(dot(nd, u_lightWorld), 0.0) * 0.75 + 0.35;
     float shade = clamp(after / before, 0.45, 1.6);
-    // What the face left in the channel: packed, damp dirt, and not quite even - a little
-    // grit rides on the floor, and it follows the map's own depth rather than a pattern of
-    // the composite's (the groove is the shape the stamp pressed, so anything painted over
-    // it has to agree with that shape).
-    float grit = 0.6 + 0.4 * Hash13(floor(wp * (25.0 / u_metre)));
-    // Packed, damp dirt in the groove: darker and a little warmer.
-    float depth = m * k;
-    vec3 floorTint = mix(vec3(1.0), vec3(0.56, 0.5, 0.46), depth);
+    // The floor's own dirt: the ground's detail texture, read finer than the ground wears it,
+    // so the packed floor is the same dirt the surface has, pressed close - and it agrees with
+    // the ground around it in grain and colour by construction.
+    vec4 tex = vec4(0.5);
+    if (u_dirt > 0.0)
+        tex = DetailAt(wp, dwx, dwy, n, 5.2 / u_dirtScale);
+    // The dirt the tire left is this ground's own dirt, pressed: only the things pressed dirt
+    // does to a colour are done to it - a little less varied, a touch warmer, and darker. Not
+    // one of these is a colour of its own, so the track's own texture comes through and the
+    // rut reads as the surface read through dirt rather than as dirt painted on it.
+    float depth = min(m * k, 1.0);
+    float l = max(Luma(c), 1e-3);
+    vec3 col = mix(c, vec3(l), 0.22 * depth);  // packed earth varies less than the surface
+    col *= vec3(1.04, 1.0, 0.94);              // a breath of warmth, the hue kept
+    col *= mix(1.0, 0.62, depth);              // and darker: the press, not a paint
+    // The ground already wears the detail texture, so the floor wears it again only lightly:
+    // its grain then reads as the same dirt pressed close, not as a second layer of it.
+    col *= 1.0 + (tex.a - 0.5) * 0.25 * depth;
+    col *= 1.0 + (tex.b - 0.5) * 0.3 * depth;
     // Groove floors keep down out of the light: darker where the map's height steps up to a
     // lip around them, and up the walls, where the ground climbs back out of the channel.
     float aoGroove = clamp(sNear.y * wNear - m, 0.0, 1.0);
-    vec3 col = c * floorTint * (1.0 - 0.12 * k * m * grit) * shade * (1.0 - 0.3 * k * aoGroove);
-    // Loose clods thrown up along the edges: lighter, broken up. An edge is where the map's
-    // own height steps: the lips, and where the ray dropped from a lip onto the floor farther
-    // in is the groove's own wall. The band is kept to the rut's shallow flanks, where the
-    // dirt really was pushed aside - not down the floor of the channel.
+    // And lit as the ground that holds it is lit: where its floor was drawn in the sun and this
+    // pixel stands in a shadow (or the other way round), the ratio carries the rut across, the
+    // way the composite itself weighs ao and sun below.
+    float aoR = clamp(lFloor.x / max(lHere.x, 1e-3), 0.35, 2.0);
+    float litR = clamp(mix(0.42, 1.0, lFloor.y) / max(mix(0.42, 1.0, lHere.y), 1e-3), 0.35, 2.2);
+    float relight = mix(1.0, aoR, u_ao) * mix(1.0, litR, u_shadow);
+    col *= shade * relight * (1.0 - 0.3 * k * aoGroove);
+    // Loose dirt thrown up along the lips: this ground's own colour, broken up and catching a
+    // little more of the light. Mixed in rather than added to, so the lips don't leave a pale
+    // ring on pale ground or a dark one on dark. Kept to the rut's shallow flanks: the walls,
+    // where the dirt really was pushed aside, not down the floor of the channel.
     float edge = clamp(around - m, 0.0, 1.0) * k * smoothstep(0.25, 0.1, m);
     float clods = smoothstep(0.35, 0.75, ValueNoise(wp * (30.0 / u_metre)) * 0.6 + Hash13(floor(wp * (40.0 / u_metre))) * 0.4);
-    col *= 1.0 + edge * (0.12 + 0.35 * clods);
+    col = mix(col, c * (0.92 + 0.24 * clods) * relight, edge * (0.3 + 0.45 * clods));
     return col;
 }
 
@@ -438,9 +483,14 @@ float GrooveDepth(vec3 p, vec3 n, vec3 dirW)
     // The groove's full depth, kept under eight texels (32 cm): marching further than that would
     // slide the surface far outside the groove and carry it with the camera.
     float dep = min(u_markDepth * u_metre * u_marks, 8.0 * texel);
-    float vdZ = dot(dirW, n);  // < 0: this pixel's ray goes into the ground; shallower than -0.15
-                               // (9 degrees down onto the surface) shows no depth worth the cost
-    if (dep <= 0.5 * texel || vdZ > -0.15)
+    float vdZ = dot(dirW, n);  // < 0: this pixel's ray goes into the ground; a view shallower
+                               // than this keeps its own shift growing, so the depth eases out
+    if (dep <= 0.5 * texel || vdZ > -0.12)
+        return 0.0;
+    dep *= smoothstep(-0.12, -0.26, vdZ);  // eases out rather than cutting: a hard cut would
+                                          // make whole strips of the rut appear and vanish at
+                                          // once as you walk round it
+    if (dep <= 0.5 * texel)
         return 0.0;
     vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / texel;
     // How far inside the window this is: the depth fades out over the last kMarkBlend metres
@@ -449,22 +499,32 @@ float GrooveDepth(vec3 p, vec3 n, vec3 dirW)
     float wNear = smoothstep(0.0, kMarkBlend, inNear);
     if (wNear < 0.004)
         return 0.0;
-    vec4 sNear = MarkStatsNear(t);
+    vec2 sNear = MarkStatsNear(t);
     float m = sNear.x * wNear, around = max(sNear.y * wNear, m);
     if (m < 0.004 && around < 0.004)
         return 0.0;
     // Where the floor sits at full depth: texels along the ray's own course over the map.
     vec2 shift = vec2(dot(dirW, u_markUW), dot(dirW, u_markVW)) * (dep / max(-vdZ, 1e-3)) / texel;
     shift *= wNear;
-    float phase = Noise(gl_FragCoord.xy);
-    for (int i = 0; i < 6; ++i) {
-        // Down from deepest to the surface, the in-betweens jittered so the stops don't leave
-        // lines.
-        float s = float(6 - i) / 6.0;
-        if (i > 0)
-            s -= phase / 12.0;
-        if (MarkNear(t + shift * s) * wNear >= s)
-            return s * dep;
+    // Down from the deepest stop to the ground itself: the first stop under whose height the
+    // ray's own height there has fallen is where the ray has reached the dirt. The crossing is
+    // then weighed from that stop and the deeper one it missed, so the floor is put where the
+    // two say rather than at a stop: no steps in the depth, and no jitter to grow into noise
+    // the deeper the groove is. The last stop is the ground's own level, which the depth of a
+    // shallow pixel is measured from.
+    float sPrev = 1.0, gPrev = 0.0;
+    for (int i = 0; i <= 5; ++i) {
+        float s = float(5 - i) / 5.0;
+        // The map's own press never goes above 1.0, so this only keeps a texel that did
+        // (strength from the panel rounding up) from asking for a floor below the march.
+        float g = min(MarkNear(t + shift * s) * wNear, 1.0) - s;  // >= 0: the ray is in the dirt
+        if (g >= 0.0) {
+            if (i == 0)
+                return dep;  // the ray is already under the dirt at the groove's full depth
+            return clamp(sPrev - gPrev * (s - sPrev) / max(g - gPrev, 1e-4), 0.0, 1.0) * dep;
+        }
+        sPrev = s;
+        gPrev = g;
     }
     return 0.0;
 }
@@ -607,47 +667,75 @@ void main()
                 ground = 1.0 - smoothstep(0.002 * z + 0.004, 0.006 * z + 0.02, abs(tz - z));
             }
             vec3 nWorld = normalize(u_viewToWorld * nView);
+            // The scene's own ambient and sun here, gathered once: the rut's lighting below is
+            // asked for at the same place the game's picture was, and the two are then weighed
+            // against each other and against these the way the composite weighs them at the end.
+            vec2 lHere = vec2(1.0);
+            if (u_lightOn > 0.5)
+                lHere = LightAt(v_uv, z);
             // Grooves sink the ground itself: where this pixel's ray reaches down into one, the
             // whole look of the surface (the scene's own colour, its detail, the marks) comes
             // from the groove floor the ray sees through this pixel - a point gd below the
             // ground's level, gd / -vdZ further down the ray. That point itself projects back
             // to this very pixel (it's on the ray), so the game's picture is asked at the point
             // of the ground's level right above it, which sits off to the side on screen: the
-            // ground's own texture moves with the groove.
+            // ground's own texture moves with the groove. The floor's own normal and light are
+            // asked there too, so a rut across a hillside or into a shadow is lit as the ground
+            // it really sits on.
             vec3 pD = p, wpD = wp, dwxD = dwx, dwyD = dwy;
+            vec3 nFloor = nWorld;
+            vec2 lFloor = lHere;  // unknown until the floor's own point is asked for: kept equal
+                                  // so the rut's own relighting is neutral where it can't be had
+            // The relief the marks can reach for this pixel's own view: what the slider asks for,
+            // eased out where the ray comes in so shallow that its shift grows faster than it can
+            // buy any more floor. GrooveDepth eases exactly this way, so the height the shading
+            // below weighs the walls against is the height actually dug here.
+            float relief = 0.0;
             if (u_marks > 0.0 && ground > 0.5) {
-                float gd = GrooveDepth(p, nWorld, dir);
                 float vdZ = dot(dir, nWorld);
-                if (gd > 0.5 * u_markTexel && vdZ < -0.15) {
+                relief = min(u_markDepth * u_metre * u_marks, 8.0 * u_markTexel) *
+                         smoothstep(-0.12, -0.26, vdZ);
+                float gd = GrooveDepth(p, nWorld, dir);
+                if (gd > 0.0 && vdZ < -0.12) {
                     float along = gd / max(-vdZ, 1e-3);
                     vec3 pF = p + transpose(u_viewToWorld) * (dir * along);  // the floor point, view space
                     vec2 suv = Project(pF + nView * gd);  // above it, back at the ground's level: where the game drew it
                     if (OnScreen(suv)) {
-                        c = pow(max(texture(u_color, suv).rgb, vec3(0.0)), vec3(2.2));
-                        pD = pF;
-                        wpD = wp + dir * along;
-                        dwxD = dFdx(wpD);
-                        dwyD = dFdy(wpD);
+                        float dS = textureLod(u_depth, suv, 0.0).r;
+                        vec3 cF = pow(max(texture(u_color, suv).rgb, vec3(0.0)), vec3(2.2));
+                        // The lip's last part of the way takes a little of each: the depth
+                        // there is a fraction of what this groove can reach at all, so the
+                        // band stays a band whatever the depth slider says - taking all of
+                        // one or none of the other makes that edge flip as you move.
+                        float wd = smoothstep(0.05 * relief, 0.3 * relief, gd);
+                        c = mix(c, cF, wd);
+                        if (gd > 0.5 * u_markTexel) {
+                            pD = pF;
+                            wpD = wp + dir * along;
+                            dwxD = dFdx(wpD);
+                            dwyD = dFdy(wpD);
+                        }
+                        if (!IsSky(dS)) {
+                            vec3 pv = ViewPos(suv, dS);  // the floor's own view point: its normal and its light
+                            nFloor = NormalAt(u_depth, suv, pv);
+                            if (u_lightOn > 0.5)
+                                lFloor = LightAt(suv, -pv.z);
+                        }
                     }
                 }
             }
             if (u_dirt > 0.0) {
                 float mask = ground * u_dirt * (1.0 - smoothstep(45.0, 60.0, z));
                 if (mask > 0.001)
-                    c = Dirt(c, wpD, dwxD, dwyD, nWorld, z, mask);
+                    c = Dirt(c, wpD, dwxD, dwyD, nFloor, z, mask);
             }
             if (u_marks > 0.0 && ground > 0.5)
-                c = TireMarks(c, pD, wpD, nWorld);
+                c = TireMarks(c, pD, wpD, dwxD, dwyD, nFloor, lFloor, lHere, relief);
             // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
             // tire is in the terrain's depth too and counted as ground, and its mud came and went.
             // TireDirt keeps to the tire around its own axle.)
             // (Tire dirt: drawn by the bike shader itself on your tires, see proc_hooks PaintTireDirt.)
-            float ao = 1.0, lit = 1.0;
-            if (u_lightOn > 0.5) {
-                vec2 l = LightAt(v_uv, z);
-                ao = l.x;
-                lit = l.y;
-            }
+            float ao = lHere.x, lit = lHere.y;  // gathered above, beside the groove itself
             if (u_shadowMapOn > 0.5 && dot(nView, u_lightView) > 0.0)
                 lit = min(lit, MapShadow(p, nView));
             ao = mix(1.0, ao, u_ao);
@@ -771,6 +859,19 @@ float OnGround(float t)
     return u_fallback;
 }
 
+// The ground's own unevenness: the hash read bilinear over a lattice nine texels wide (about
+// 36 cm), so the wobble turns across the ground rather than changing at every texel, and stays
+// a function of this texel alone, which is what makes overlapping stamps and a re-press agree.
+float Wobble(vec2 p)
+{
+    vec2 q = p * (1.0 / 9.0);
+    vec2 i = floor(q), f = q - i;
+    f = f * f * (3.0 - 2.0 * f);
+    float a = Noise(i), b = Noise(i + vec2(1.0, 0.0));
+    float c = Noise(i + vec2(0.0, 1.0)), d = Noise(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
 void main()
 {
     vec2 p = gl_FragCoord.xy;
@@ -791,9 +892,17 @@ void main()
     // A little wider than the deepest section, so the ground eases into the groove over the
     // last texels and its lips hold the faintest press.
     float cover = 1.0 - smoothstep(u_half - 1.5, u_half + 0.5, d);
-    // And nothing on the ground is quite even, so a little jitter rides on the whole depth -
-    // a function of this texel, so overlapping stamps agree on it.
-    float depth = profile * (0.85 + 0.3 * Noise(p * 1.61));
+    // And nothing on the ground is quite even, so a little unevenness rides on the whole depth.
+    // This has to be a wobble over ground about half a metre across rather than texel to texel:
+    // the march answers against this height field, and a field that changes at every texel is a
+    // sawtooth whose crossing jumps per texel, which reads as speckle inside the rut and gives
+    // its walls random normals - and the jump is a share of the depth, so it grows the deeper
+    // you dig. A function of this texel only, so overlapping stamps agree on it and a cache
+    // re-press leaves the very same marks.
+    float depth = profile * (0.85 + 0.15 * Wobble(p));  // never above 1: the map holds the press
+                                                        // as a share of the depth, so going over
+                                                        // it would only be flattened where the ray
+                                                        // keeps to it, a plateau along the rut
     float down = OnGround(t);
     o_color = vec4(cover * depth * u_strength * down);
 }
