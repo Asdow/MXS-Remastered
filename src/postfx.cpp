@@ -3971,6 +3971,9 @@ void Render(int w, int h)
             Vec(p, "u_markVW", mv);
             g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_mark.texel));
             g_gl.Uniform1f(p["u_markSize"], static_cast<float>(g_mark.size));
+            // How deep the map's groove values measure down, in m: the relief the floor is
+            // sampled at (the shader keeps it under eight texels either way).
+            g_gl.Uniform1f(p["u_markDepth"], static_cast<float>(cfg.markDepth * 0.3));
         }
         // Tire dirt: each wheel's own space (its axle along x, turning with it) from the camera's.
         g_gl.Uniform1f(p["u_tireDirt"], static_cast<float>(cfg.tireDirt));

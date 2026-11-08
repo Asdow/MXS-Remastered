@@ -173,6 +173,7 @@ uniform float u_dirtScale;
 uniform float u_haveTerrain;
 uniform sampler2D u_markMap;    // tire marks on the ground (see postfx.cpp: TireMarks)
 uniform float u_marks;          // 0 = off
+uniform float u_markDepth;      // m at the deepest: what the map's groove values measure down
 uniform vec2  u_markCam;        // the camera in the map's window, in texels
 uniform vec2  u_markPhys;       // where the window's corner is in the (wrapping) texture
 uniform vec3  u_markU, u_markV; // the map's axes, view space
@@ -370,11 +371,16 @@ vec4 MarkStatsNear(vec2 t)
              MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0)));
 }
 
-// Ruts your tires dug into the ground: a groove of darker, packed and damp dirt with the knobs'
-// blocks pressed into its floor, its sides lit by the sun like any slope, and loose dirt thrown
-// up along both edges. The map only covers the window around you: its own ruts, and whatever the
-// cache re-pressed into ground the window reused, and what's left thins out over the last kMarkBlend
-// metres before the window's edge instead of ending on a line.
+// Ruts your tires dug into the ground: a channel of darker, packed and damp dirt, deepest on
+// the tire's own line and easing out to the undisturbed ground on either side, its walls lit
+// by the sun like any slope, and loose dirt thrown up along both edges. The ruts sink the
+// ground itself: GrooveDepth below says how far this pixel's ray reaches down into a groove,
+// and main pulls the whole look of the surface (the scene's own colour, the ground's detail,
+// and these marks) from that lower point - the whole ground texture moves with the groove,
+// not just the marks. The map only covers the window around you: its own ruts, and whatever
+// the cache re-pressed into ground the window reused,
+// and what's left thins out over the last kMarkBlend metres before the window's edge instead of
+// ending on a line.
 vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
 {
     vec2 g = vec2(dot(p, u_markU), dot(p, u_markV));  // this pixel on the ground's plane, game units
@@ -386,30 +392,81 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     if (wNear < 0.004)
         return c;
     vec4 sNear = MarkStatsNear(t);
-    float m = sNear.x * wNear, around = sNear.y * wNear, gx = sNear.z * wNear, gy = sNear.w * wNear;
-    float texel = u_markTexel;
-    around = max(around, m);
+    float m = sNear.x * wNear, around = max(sNear.y * wNear, m);
     if (m < 0.004 && around < 0.004)
         return c;
     float k = u_marks;
-    // 7 cm deep in the middle: the normal tips with the groove's sides.
-    vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * u_metre * k / (2.0 * texel));
+    float texel = u_markTexel;
+    // The sides, from the height's own differences at the floor: the shading lines up with where
+    // main lowered this pixel. (7 cm deep in the middle.)
+    vec3 slope = (u_markUW * sNear.z + u_markVW * sNear.w) * (wNear * 0.07 * u_metre * k / (2.0 * texel));
     vec3 nd = normalize(n + slope);
     float before = max(dot(n, u_lightWorld), 0.0) * 0.75 + 0.35;
     float after = max(dot(nd, u_lightWorld), 0.0) * 0.75 + 0.35;
     float shade = clamp(after / before, 0.45, 1.6);
-    // The knobs: blocks about 4 cm, pressed deeper, in rows.
-    vec3 cell = floor(wp * (25.0 / u_metre));
-    float knob = step(0.45, Hash13(cell)) * smoothstep(0.25, 0.6, m);
+    // What the face left in the channel: packed, damp dirt, and not quite even - a little
+    // grit rides on the floor, and it follows the map's own depth rather than a pattern of
+    // the composite's (the groove is the shape the stamp pressed, so anything painted over
+    // it has to agree with that shape).
+    float grit = 0.6 + 0.4 * Hash13(floor(wp * (25.0 / u_metre)));
     // Packed, damp dirt in the groove: darker and a little warmer.
     float depth = m * k;
     vec3 floorTint = mix(vec3(1.0), vec3(0.56, 0.5, 0.46), depth);
-    vec3 col = c * floorTint * (1.0 - 0.28 * knob * k) * shade;
-    // Loose clods thrown up along the edges: lighter, broken up.
-    float edge = clamp(around - m, 0.0, 1.0) * k;
+    // Groove floors keep down out of the light: darker where the map's height steps up to a
+    // lip around them, and up the walls, where the ground climbs back out of the channel.
+    float aoGroove = clamp(sNear.y * wNear - m, 0.0, 1.0);
+    vec3 col = c * floorTint * (1.0 - 0.12 * k * m * grit) * shade * (1.0 - 0.3 * k * aoGroove);
+    // Loose clods thrown up along the edges: lighter, broken up. An edge is where the map's
+    // own height steps: the lips, and where the ray dropped from a lip onto the floor farther
+    // in is the groove's own wall. The band is kept to the rut's shallow flanks, where the
+    // dirt really was pushed aside - not down the floor of the channel.
+    float edge = clamp(around - m, 0.0, 1.0) * k * smoothstep(0.25, 0.1, m);
     float clods = smoothstep(0.35, 0.75, ValueNoise(wp * (30.0 / u_metre)) * 0.6 + Hash13(floor(wp * (40.0 / u_metre))) * 0.4);
     col *= 1.0 + edge * (0.12 + 0.35 * clods);
     return col;
+}
+
+// How far (in game units) this pixel's ray has to go down along the ray to reach the groove's
+// surface, 0 where there's none: the map holds how deep each 4 cm texel is pressed, and the
+// ray is marched against those heights, down from the deepest stop to the surface - where the
+// groove there is deeper than this stop's height, the ray has reached the dirt. main takes the
+// whole look of the surface from that lower point, which is what cuts the grooves into the
+// ground rather than laying them on it.
+float GrooveDepth(vec3 p, vec3 n, vec3 dirW)
+{
+    float texel = u_markTexel;
+    // The groove's full depth, kept under eight texels (32 cm): marching further than that would
+    // slide the surface far outside the groove and carry it with the camera.
+    float dep = min(u_markDepth * u_metre * u_marks, 8.0 * texel);
+    float vdZ = dot(dirW, n);  // < 0: this pixel's ray goes into the ground; shallower than -0.15
+                               // (9 degrees down onto the surface) shows no depth worth the cost
+    if (dep <= 0.5 * texel || vdZ > -0.15)
+        return 0.0;
+    vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / texel;
+    // How far inside the window this is: the depth fades out over the last kMarkBlend metres
+    // with the map, so the floor can't slide past the fade into the strip the window cleared.
+    float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (texel / u_metre);
+    float wNear = smoothstep(0.0, kMarkBlend, inNear);
+    if (wNear < 0.004)
+        return 0.0;
+    vec4 sNear = MarkStatsNear(t);
+    float m = sNear.x * wNear, around = max(sNear.y * wNear, m);
+    if (m < 0.004 && around < 0.004)
+        return 0.0;
+    // Where the floor sits at full depth: texels along the ray's own course over the map.
+    vec2 shift = vec2(dot(dirW, u_markUW), dot(dirW, u_markVW)) * (dep / max(-vdZ, 1e-3)) / texel;
+    shift *= wNear;
+    float phase = Noise(gl_FragCoord.xy);
+    for (int i = 0; i < 6; ++i) {
+        // Down from deepest to the surface, the in-betweens jittered so the stops don't leave
+        // lines.
+        float s = float(6 - i) / 6.0;
+        if (i > 0)
+            s -= phase / 12.0;
+        if (MarkNear(t + shift * s) * wNear >= s)
+            return s * dep;
+    }
+    return 0.0;
 }
 
 // Mud on your tires: clumps caked on the tread and the sidewalls that turn with the wheel, a
@@ -550,13 +607,37 @@ void main()
                 ground = 1.0 - smoothstep(0.002 * z + 0.004, 0.006 * z + 0.02, abs(tz - z));
             }
             vec3 nWorld = normalize(u_viewToWorld * nView);
+            // Grooves sink the ground itself: where this pixel's ray reaches down into one, the
+            // whole look of the surface (the scene's own colour, its detail, the marks) comes
+            // from the groove floor the ray sees through this pixel - a point gd below the
+            // ground's level, gd / -vdZ further down the ray. That point itself projects back
+            // to this very pixel (it's on the ray), so the game's picture is asked at the point
+            // of the ground's level right above it, which sits off to the side on screen: the
+            // ground's own texture moves with the groove.
+            vec3 pD = p, wpD = wp, dwxD = dwx, dwyD = dwy;
+            if (u_marks > 0.0 && ground > 0.5) {
+                float gd = GrooveDepth(p, nWorld, dir);
+                float vdZ = dot(dir, nWorld);
+                if (gd > 0.5 * u_markTexel && vdZ < -0.15) {
+                    float along = gd / max(-vdZ, 1e-3);
+                    vec3 pF = p + transpose(u_viewToWorld) * (dir * along);  // the floor point, view space
+                    vec2 suv = Project(pF + nView * gd);  // above it, back at the ground's level: where the game drew it
+                    if (OnScreen(suv)) {
+                        c = pow(max(texture(u_color, suv).rgb, vec3(0.0)), vec3(2.2));
+                        pD = pF;
+                        wpD = wp + dir * along;
+                        dwxD = dFdx(wpD);
+                        dwyD = dFdy(wpD);
+                    }
+                }
+            }
             if (u_dirt > 0.0) {
                 float mask = ground * u_dirt * (1.0 - smoothstep(45.0, 60.0, z));
                 if (mask > 0.001)
-                    c = Dirt(c, wp, dwx, dwy, nWorld, z, mask);
+                    c = Dirt(c, wpD, dwxD, dwyD, nWorld, z, mask);
             }
             if (u_marks > 0.0 && ground > 0.5)
-                c = TireMarks(c, p, wp, nWorld);
+                c = TireMarks(c, pD, wpD, nWorld);
             // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
             // tire is in the terrain's depth too and counted as ground, and its mud came and went.
             // TireDirt keeps to the tire around its own axle.)
@@ -693,13 +774,28 @@ float OnGround(float t)
 void main()
 {
     vec2 p = gl_FragCoord.xy;
+    // Clearing (the window's wipe) comes through with no strength: write nothing.
+    if (u_strength <= 0.0) {
+        o_color = vec4(0.0);
+        return;
+    }
     vec2 ab = u_b - u_a;
     float t = clamp(dot(p - u_a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
     float d = length(p - (u_a + ab * t));
-    float cover = 1.0 - smoothstep(u_half - 0.75, u_half + 0.75, d);
     float x = clamp(d / max(u_half, 1e-3), 0.0, 1.0);
-    float down = u_strength > 0.0 ? OnGround(t) : 0.0;
-    o_color = vec4(cover * (0.55 + 0.45 * (1.0 - x * x)) * u_strength * down);
+    // The rut's cross-section: it goes down gradually from the undisturbed ground on either
+    // side to the tire's own centre line, where the whole face was pressed deepest and is
+    // deepest still. A rounded section, like a tire's channel in soft ground: the walls curve
+    // in, they don't drop, so nothing here stands above the ground it came out of.
+    float profile = cos(x * 1.5707963 / 2.0);
+    // A little wider than the deepest section, so the ground eases into the groove over the
+    // last texels and its lips hold the faintest press.
+    float cover = 1.0 - smoothstep(u_half - 1.5, u_half + 0.5, d);
+    // And nothing on the ground is quite even, so a little jitter rides on the whole depth -
+    // a function of this texel, so overlapping stamps agree on it.
+    float depth = profile * (0.85 + 0.3 * Noise(p * 1.61));
+    float down = OnGround(t);
+    o_color = vec4(cover * depth * u_strength * down);
 }
 )GLSL";
 

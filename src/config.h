@@ -148,6 +148,11 @@ struct Config {
                                           // in memory: how far back along your ride they come
                                           // back exactly as they were (the panel shows the memory
                                           // it costs: kMarkSegBytes each, both wheels)
+    double markDepth        = 0.5;        // 0..1: how deep the ruts' floors read below the ground:
+                                          // the map doubles as a height, and the mark's floor is
+                                          // sampled where this pixel's ray reaches down into it,
+                                          // so the near lip covers the floor and the far side
+                                          // shows at low angles (0: flat on the ground)
     double tireDirt         = 0.6;        // 0..1 mud caked on your tires
     double motionBlur       = 0.0;        // 0..1 camera motion blur
     double depthOfField     = 0.0;        // 0..1
