@@ -133,6 +133,14 @@ bool HidesGameFlare();
 // tire dirt are off).
 const char* TireStatusText();
 
+// A new track was loaded: the game sent its heightmap a new u_spacing / u_heights_dim_inv (proc_hooks
+// sees it, and terrain.cpp forgets its map of the ground at the same moment). The ground everywhere
+// is another track's, so everything the marks learnt about it is forgotten: the map of the ground
+// around you, the cache of your ruts (it re-presses them wherever ground is reused, so kept, they'd
+// be laid where they were never made), the heights your tires recorded and the terrain read off the
+// screen.
+void MarksNewTrack();
+
 // Cheap: whether draw calls should be checked for the start of the HUD.
 bool WantsSceneEnd();
 

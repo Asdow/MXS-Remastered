@@ -4947,6 +4947,39 @@ bool GetOwnAnchors(OwnAnchors& out)
     return out.bike || out.torso;
 }
 
+// A new track was loaded (proc_hooks.cpp: the game sent its heightmap a new u_spacing / u_heights_dim_inv
+// when one loads, the same moment terrain.cpp forgets its map of the ground). Everything the marks
+// know belongs to the track that was just left: the map of the ground around you, the cache of your
+// ruts - which is what re-presses them wherever ground is reused, so kept, they'd be pressed back
+// where they were never made - the heights your tires recorded, and the terrain read off the screen.
+// Setting the map unset is enough to have it cleared and laid out fresh at the next frame's camera.
+void MarksNewTrack()
+{
+    if (!g_mark.set && g_markCache[0].empty() && g_markCache[1].empty())
+        return;  // nothing was learnt about a ground: the marks are as fresh as the new track's
+    g_mark.set = false;
+    for (Wheel& w : g_wheels) {
+        w.haveLast = false;
+        w.fit.Reset();    // its positions are in the old track's world as well
+        w.heightVel = 0;
+        w.heightAccel = 0;
+        w.fallG = 0;
+        w.airScore = 0;
+        w.airPeak = 0;
+        w.grounded = true;
+        w.gap = 0;
+        w.gapKnown = false;
+    }
+    ClearMarkCache();
+    ClearGroundField();
+    ClearTerrainField();
+    g_bikeAirFit.Reset();
+    g_bikeHave = false;
+    g_bikeFallG = 0;
+    Log("postfx: tire marks: a new track: its ground is empty and the ruts of the one before "
+        "forgotten, as are the heights your tires recorded and the terrain's own");
+}
+
 const char* TireStatusText()
 {
     const Config& cfg = GetConfig();
