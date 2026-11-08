@@ -2245,6 +2245,69 @@ void DrawBatch(int width, int height)
     g_gl.DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_batch.size()));
 }
 
+// ===========================================================================
+// The startup hint: every time the game starts, which key opens this menu (players kept asking).
+// Shown kHintHold seconds from the first frame, then faded out over kHintFade; gone for good once
+// the menu is opened. The key is the menu key as it is now, so a rebind shows on it at once.
+// ===========================================================================
+constexpr double kHintHold = 5.0;
+constexpr double kHintFade = 1.0;
+double g_hintStart = -1;
+bool   g_hintDone  = false;
+
+uint32_t Faded(uint32_t color, float a)
+{
+    const uint32_t alpha = static_cast<uint32_t>((color >> 24) * Clamp(a, 0.0f, 1.0f) + 0.5f);
+    return (color & 0x00FFFFFFu) | (alpha << 24);
+}
+
+void BuildStartupHint(int width, int height, double now)
+{
+    const float s = g_atlasScale;
+    const auto S = [s](float v) { return std::round(v * s); };
+    const double t = now - g_hintStart;
+    const float a = t < kHintHold ? 1.0f : static_cast<float>(1.0 - (t - kHintHold) / kHintFade);
+    const char* lead = "MXS Remastered:";
+    char rest[96];
+    snprintf(rest, sizeof rest, "Press \"%s\" to open menu", KeyName(GetConfig().menuKey));
+    // In the middle of the screen, in the menu's title font, the corners only a little rounded.
+    const float gap = S(14), padX = S(40), padY = S(24);
+    const float leadW = TextWidth(kFontTitle, lead, S(1)), restW = TextWidth(kFontTitle, rest, 0);
+    const float w = padX * 2 + leadW + gap + restW, h = padY * 2 + LineHeight(kFontTitle);
+    const float x = std::round((width - w) * 0.5f), y = std::round((height - h) * 0.5f), r = S(8);
+    RoundedRect(x - S(2), y - S(2), w + S(4), h + S(4), r + S(2), Faded(kBorder, a));
+    RoundedRect(x, y, w, h, r, Faded(kPanelColor, a));
+    Text(kFontTitle, x + padX, y + padY, lead, Faded(kBlueHot, a), S(1));
+    Text(kFontTitle, x + padX + leadW + gap, y + padY, rest, Faded(White(1.0f), a), 0);
+}
+
+// Draws the startup hint over this frame (the menu closed), while it lasts.
+void StartupHintFrame(HWND window, double now)
+{
+    if (g_hintDone)
+        return;
+    if (g_hintStart < 0)
+        g_hintStart = now;
+    if (now - g_hintStart > kHintHold + kHintFade) {
+        g_hintDone = true;
+        return;
+    }
+    RECT client;
+    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
+        return;
+    const int width = client.right, height = client.bottom;
+    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
+    SavedState saved;
+    SaveState(saved);
+    if (EnsureResources(scale)) {
+        g_batch.clear();
+        g_keepRanges.clear();
+        BuildStartupHint(width, height, now);
+        DrawBatch(width, height);
+    }
+    RestoreState(saved);
+}
+
 }  // namespace
 
 bool OverlayListeningForKey()
@@ -2337,8 +2400,13 @@ void OverlayFrame(HDC dc)
     }
 
     if (!g_panel.open) {
-        if (!window || !g_glAvailable || !((menuKey && focus) || testOpen))
+        if (!window || !g_glAvailable)
             return;
+        if (!((menuKey && focus) || testOpen)) {
+            StartupHintFrame(window, now);  // (which key opens the menu, for a few seconds after the start)
+            return;
+        }
+        g_hintDone = true;  // (they've found it)
         OpenPanel(window);
     } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && (menuKey || escape))) {
         ClosePanel();
