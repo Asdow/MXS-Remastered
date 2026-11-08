@@ -1,3 +1,6 @@
 # Written by the mod at runtime
 mxcam.log
 mxcam_trace.csv
+
+# Engine sound previews (tools/engine_sounds writes them next to the packs, to listen to)
+mxcam_sounds/preview_*.wav

@@ -9,6 +9,7 @@ V:\random code\shaders + mxcam\src\postfx.cpp;V:\random code\shaders + mxcam\obj
 V:\random code\shaders + mxcam\src\proc_hooks.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\proc_hooks.obj
 V:\random code\shaders + mxcam\src\proxy.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\proxy.obj
 V:\random code\shaders + mxcam\src\replay.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\replay.obj
+V:\random code\shaders + mxcam\src\sound_packs.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\sound_packs.obj
 V:\random code\shaders + mxcam\src\terrain.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\terrain.obj
 V:\random code\shaders + mxcam\src\texfilter.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\texfilter.obj
 V:\random code\shaders + mxcam\src\timeofday.cpp;V:\random code\shaders + mxcam\obj\Win32\Release\timeofday.obj

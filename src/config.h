@@ -3,6 +3,8 @@
 //   mxcam.ini; see that file for what each value does in practice.
 #pragma once
 
+#include "gamepad.h"
+
 namespace mxcam {
 
 struct Config {
@@ -29,7 +31,6 @@ struct Config {
 
     // [Camera]
     bool   customCamera   = false;        // build the view from the bike, ignoring the game's 1st-person settings
-    bool   keepGameAngle  = false;        // custom camera: keep the game's look-down angle
     double cameraAngleDeg = 8.0;          // custom camera: look-down angle (positive = down)
     double headForward    = 0.0;          // eye offset along the bike, units (+ = forward)
     double headHeight     = 0.0;          // eye offset along the bike's up axis (+ = up)
@@ -49,8 +50,13 @@ struct Config {
     double airLooseness     = 0.6;        // 0..1 how much of the nose's left / right swing in the air the view lets pass
     double whipLock         = 0.0;        // 0..1 in the air: hold the view on the direction of travel, level
 
-    // [Look] the controller's d-pad looks left / right / back (the game has no look keys)
+    // [Look] a controller looks left / right / back (the game has no look keys)
     bool   controllerLook  = true;
+    // ...with these (gamepad::Control: any button, trigger, stick direction or paddle). Keybinds,
+    // like the keys: not part of the presets. In the ini by name: LookLeftControl=DPAD_LEFT.
+    int    lookLeftControl  = gamepad::kDPadLeft;
+    int    lookRightControl = gamepad::kDPadRight;
+    int    lookBackControl  = gamepad::kDPadDown;
     double lookSideDeg     = 90.0;        // how far left / right looks turn the head
     double lookTurnSpeed   = 12.0;        // 1/s how quickly the head turns (12: 90 deg in about 0.25 s)
     double apexLook        = 0.0;         // 0..1 in corners the head turns toward the apex
@@ -145,6 +151,14 @@ struct Config {
     bool   fadeMenu         = true;       // fade this menu while a graphics setting is being adjusted
     bool   fullscreenWindow = false;      // windowed mode: the window made borderless, covering its monitor
                                           // (a display choice: not part of the presets or DEFAULTS)
+
+    // [Other] sound mods: which engine sound packs are installed (see sound_packs.h). What's in the
+    // game folder is what counts: read from it at startup, never from the ini, and not part of the
+    // presets or DEFAULTS.
+    bool   soundPack125     = false;
+    bool   soundPack250     = false;
+    bool   soundPack250f    = false;
+    bool   soundPack450f    = false;
 };
 
 const Config& GetConfig();

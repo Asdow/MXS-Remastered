@@ -13,6 +13,9 @@ void OverlayFrame(HDC dc);
 // True while a KEYBINDS row waits for its new key (the hotkeys stay quiet meanwhile).
 bool OverlayListeningForKey();
 
+// True while the settings panel is open (the controller is read then, for binding its looks).
+bool OverlayPanelOpen();
+
 // Hiding the game's HUD and cursor while riding (OTHER tab: Config::hideHud / hideCursor).
 // They're hidden while the 3D scene is on screen (riding, spectating, a replay; never the game's
 // menus) and the game's menu isn't open over it (GameMenuOverScene). The HUD goes at once; the

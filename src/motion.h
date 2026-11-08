@@ -29,6 +29,17 @@ public:
             ++count_;
     }
 
+    // Moves the newest sample's time by delta (it never goes back past the one before).
+    void ShiftNewest(double delta)
+    {
+        if (!count_)
+            return;
+        double t = time_[head_] + delta;
+        if (count_ > 1)
+            t = std::fmax(t, time_[(head_ - 1 + kMax) % kMax] + 1e-6);
+        time_[head_] = t;
+    }
+
     // Fits the samples of the last `window` seconds (at least 4 when available, never older
     // than kMaxAge). False until there are two samples. With fewer than four, only the
     // velocity is estimated (acceleration 0).

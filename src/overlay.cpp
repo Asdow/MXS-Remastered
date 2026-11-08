@@ -33,6 +33,7 @@
 #include "overlay.h"
 #include "postfx.h"
 #include "replay.h"
+#include "sound_packs.h"
 #include "texfilter.h"
 
 namespace mxcam {
@@ -678,7 +679,7 @@ void Text(FontId font, float x, float y, const char* text, uint32_t color, float
 // ===========================================================================
 // Panel state, input and window subclass
 // ===========================================================================
-enum class RowKind { Slider, Toggle, Choice, Key };
+enum class RowKind { Slider, Toggle, Choice, Key, Pad };
 
 struct RowDef {
     int              tab;
@@ -705,6 +706,7 @@ struct RowDef {
     double Config::* chestNumber = nullptr; // and on the chest mount
     bool             clock = false;          // Slider: hours, shown as a time of day (HH:MM)
     int              column = -1;            // starts this column of its tab (later rows follow it)
+    int Config::*    pad = nullptr;          // Pad: a gamepad::Control, picked by pressing it
 
     RowDef Col(int index) const
     {
@@ -795,6 +797,14 @@ RowDef KeyRow(int tab, const char* section, const char* label, int Config::* key
     return { tab, section, label, RowKind::Key, nullptr, nullptr, 0, 1, 1, 1, 0, "", nullptr, nullptr, nullptr, false, key };
 }
 
+RowDef PadRow(int tab, const char* section, const char* label, int Config::* control)
+{
+    RowDef def = KeyRow(tab, section, label, nullptr);
+    def.kind = RowKind::Pad;
+    def.pad = control;
+    return def;
+}
+
 const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS", "OTHER" };
 constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3, kTabOther = 4;
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
@@ -807,12 +817,12 @@ const RowDef kRows[] = {
               "cameras and replays untouched, and only the shaders stay on.")
         .Col(0),
     Choice(0, nullptr,           "Camera",               &Config::customCamera, "GAME", "CUSTOM")
-        .Help("GAME adjusts the game's own first-person camera. CUSTOM builds the view from your bike "
-              "instead (ride a few metres after loading so it can find the bike)."),
-    Toggle(0, nullptr,           "Keep game angle",      &Config::keepGameAngle, true)
-        .Help("Custom camera: use the game's 1st Person Angle instead of the look-down angle below."),
+        .Help("GAME adjusts the game's own first-person camera (and its 1st Person Angle). CUSTOM builds "
+              "the view from your bike instead. The first time, ride a few metres so it can find your bike; "
+              "after that it knows it as soon as you spawn."),
     Slider(0, nullptr,           "Look-down angle",      &Config::cameraAngleDeg,   -10.0, 30.0, 0.5,  1.0,   1, "\xB0", nullptr, true)
-        .Help("Custom camera: how far the view tilts down. Negative tilts it up."),
+        .Help("Custom camera: how far the view tilts down. Negative tilts it up. (The GAME camera uses "
+              "the game's own 1st Person Angle.)"),
     Slider(0, "STABILIZATION",   "Horizon lock",         &Config::horizonLock,      0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("How much of the bike's lean is removed from the view. 0% leans with the bike, 100% keeps "
               "the horizon level."),
@@ -846,11 +856,12 @@ const RowDef kRows[] = {
               "corner is going, so it turns in sooner as a corner tightens and comes back to straight "
               "ahead sooner as it opens up on the exit.")
         .Locked(),
-    Toggle(0, "LOOKING AROUND",  "D-pad look",           &Config::controllerLook)
-        .Help("Look around with a controller's d-pad: left / right to look sideways, down to look "
-              "behind. Release to look ahead again."),
+    Toggle(0, "LOOKING AROUND",  "Controller look",      &Config::controllerLook)
+        .Help("Look around with a controller: the d-pad's left / right to look sideways and down to "
+              "look behind, unless you bind other buttons, paddles or stick directions on the KEYBINDS "
+              "tab. Release to look ahead again."),
     Slider(0, nullptr,           "Side look angle",      &Config::lookSideDeg,      30.0,   90.0, 1.0, 1.0,   0, "\xB0")
-        .Help("How far the head turns when looking left / right with the d-pad."),
+        .Help("How far the head turns when looking left / right with the controller."),
     Slider(0, nullptr,           "Turn speed",           &Config::lookTurnSpeed,    2.0,   40.0, 1.0, 1.0,   0, "")
         .Help("How quickly the head turns to look left / right / back and ahead again. Higher is "
               "faster: 12 turns 90\xB0 in about a quarter of a second, 40 is nearly instant."),
@@ -1028,6 +1039,19 @@ const RowDef kRows[] = {
     KeyRow(3, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
         .Help("Turns all the shaders on and off in game, for before / after comparisons (the GRAPHICS "
               "tab's Shaders switch). Click the key, then press the new one. Esc cancels."),
+    PadRow(3, "CONTROLLER",     "Look left",                 &Config::lookLeftControl)
+        .Help("Hold to look left (FIRST PERSON tab: Controller look, Side look angle). Click it, then "
+              "press any button, trigger or paddle on your controller, or push a stick the way you want. "
+              "Backspace clears it, Esc cancels."),
+    PadRow(3, nullptr,          "Look right",                &Config::lookRightControl)
+        .Help("Hold to look right. Click it, then press any button, trigger or paddle on your controller, "
+              "or push a stick the way you want. Backspace clears it, Esc cancels."),
+    PadRow(3, nullptr,          "Look back",                 &Config::lookBackControl)
+        .Help("Hold to look behind you (it wins over left and right). Click it, then press any button, "
+              "trigger or paddle on your controller, or push a stick the way you want. Backspace clears "
+              "it, Esc cancels. Paddles: an Xbox Elite controller's paddles work when they aren't mapped "
+              "to another button in the Xbox Accessories app; other controllers' paddles work when they "
+              "show up as buttons of their own."),
     // ======== OTHER ========
     Toggle(4, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
         .Help("Hides the game's HUD (timing, positions, chat) while you ride, spectate or watch a "
@@ -1044,6 +1068,22 @@ const RowDef kRows[] = {
     Toggle(4, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
         .Help("While you drag a GRAPHICS slider (or step it with the arrow keys) the menu fades out, "
               "all but that slider, so you can see the whole picture change."),
+    Toggle(4, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
+        .Help("A fuller engine sound for every bike that uses the game's stock 125 two-stroke engine. "
+              "The stock sounds repeat one recorded engine cycle over and over; this one plays 16 "
+              "cycles in a random order, each firing a little differently, like a real engine. "
+              "Heard from the next time the game starts.")
+        .Col(1),
+    Toggle(4, nullptr,          "250 two-stroke",            &Config::soundPack250)
+        .Help("A fuller engine sound for every bike that uses the game's stock 250 two-stroke engine "
+              "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
+    Toggle(4, nullptr,          "250 four-stroke",           &Config::soundPack250f)
+        .Help("A fuller engine sound for every bike that uses the game's stock 250 four-stroke engine "
+              "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
+    Toggle(4, nullptr,          "450 four-stroke",           &Config::soundPack450f)
+        .Help("A fuller engine sound for every bike that uses the game's stock 450 four-stroke engine "
+              "(16 varied cycles instead of one repeated). Heard from the next time the game starts. "
+              "Bikes with their own custom sounds keep them."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -1089,6 +1129,22 @@ std::atomic<int>       g_gameEscapes{ 0 };       // Esc presses that reached the
 std::atomic<bool>      g_keyMessages{ false };   // the game gets its keys as window messages
 std::atomic<long long> g_lastMousePos{ 0 };   // (x << 32) | y, screen pixels
 std::atomic<HWND>      g_gameWindow{ nullptr };
+
+// ---- Sound mods (Config::soundPack*) ----------------------------------------------------------
+// A switch turned in the panel installs or removes its pack right away (see sound_packs.h).
+void SetStatus(const char* text, double now);
+
+void UpdateSoundPacks(double now)
+{
+    Config& cfg = EditConfig();
+    bool* const switches[soundpacks::kCount] = { &cfg.soundPack125, &cfg.soundPack250, &cfg.soundPack250f, &cfg.soundPack450f };
+    for (int i = 0; i < soundpacks::kCount; ++i) {
+        if (*switches[i] == soundpacks::Installed(i))
+            continue;
+        SetStatus(soundpacks::Set(i, *switches[i]), now);
+        *switches[i] = soundpacks::Installed(i);  // (back off if it couldn't be installed)
+    }
+}
 
 // ---- Fullscreen window (Config::fullscreenWindow) --------------------------------------------
 // The game's window in windowed mode made borderless and stretched over its monitor; what it was
@@ -1391,7 +1447,10 @@ void StartListening(int row)
 {
     g_panel.listening = row;
     PollNewKey();  // keys already held (the Enter that got here) don't count as the answer
+    if (kRows[row].kind == RowKind::Pad)
+        gamepad::StartCapture();  // nor do controls already held
 }
+
 
 void Upper(const char* text, char* out, size_t size)
 {
@@ -1424,11 +1483,57 @@ const char* KeyConflict(int vk, int Config::* field, const Config& cfg)
     return nullptr;
 }
 
+// A controller row is waiting: a control pressed on the controller is taken (unless another look
+// has it); on the keyboard, Backspace / Delete clears the bind and Esc cancels.
+void ListenForPad(double now)
+{
+    const RowDef& def = kRows[g_panel.listening];
+    const int vk = PollNewKey();
+    gamepad::Control control = gamepad::PollCapture();
+    if (!vk && control == gamepad::kNone)
+        return;
+    if (vk && vk != VK_BACK && vk != VK_DELETE && vk != VK_ESCAPE && control == gamepad::kNone)
+        return;  // other keys: still waiting for the controller
+    g_panel.listening = -1;
+    g_panel.listenEnded = now;
+    if (vk == VK_ESCAPE)
+        return;
+    if (vk == VK_BACK || vk == VK_DELETE)
+        control = gamepad::kNone;
+
+    Config& cfg = EditConfig();
+    char text[128], label[64];
+    Upper(def.label, label, sizeof label);
+    const struct { int Config::* field; const char* what; } looks[] = {
+        { &Config::lookLeftControl,  "LOOK LEFT" },
+        { &Config::lookRightControl, "LOOK RIGHT" },
+        { &Config::lookBackControl,  "LOOK BACK" },
+    };
+    for (const auto& l : looks) {
+        if (control != gamepad::kNone && l.field != def.pad && cfg.*l.field == control) {
+            snprintf(text, sizeof text, "%s IS ALREADY %s", gamepad::ControlName(control), l.what);
+            SetStatus(text, now);
+            return;
+        }
+    }
+    int& bound = cfg.*def.pad;
+    if (bound != control) {
+        bound = control;
+        g_panel.dirty = true;
+    }
+    snprintf(text, sizeof text, "%s: %s - NOT SAVED YET", label, gamepad::ControlName(control));
+    SetStatus(text, now);
+}
+
 // A key row is waiting: Esc cancels, any other key is taken (unless it clashes).
 void ListenForKey(double now)
 {
     if (kRows[g_panel.listening].tab != g_panel.tab) {  // switched tabs with the mouse
         g_panel.listening = -1;
+        return;
+    }
+    if (kRows[g_panel.listening].kind == RowKind::Pad) {
+        ListenForPad(now);
         return;
     }
     const int vk = PollNewKey();
@@ -1507,8 +1612,6 @@ bool RowInactive(const RowDef& def, const Config& cfg)
         return true;
     if ((def.tab == kTabFirstPerson || def.tab == kTabReplay) && !cfg.enabled && def.flag != &Config::enabled)
         return true;  // the first person mod is off (it does the replay cameras too)
-    if (def.number == &Config::cameraAngleDeg && cfg.keepGameAngle)
-        return true;
     if (def.tab == kTabReplay && def.number) {  // placement for a replay camera that isn't the one chosen
         const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||
                            def.number == &Config::replayPitchDeg;
@@ -1789,7 +1892,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             const char* onOff = flag ? "ON" : "OFF";
             Text(kFontSmall, cx + cw - sw - S(10) - TextWidth(kFontSmall, onOff, S(2)),
                  y + std::round((rowH - LineHeight(kFontSmall)) * 0.5f), onOff, flag ? valueColor : kDim, S(2));
-        } else if (def.kind == RowKind::Key) {  // the key's name in a box; click it, then press a key
+        } else if (def.kind == RowKind::Key || def.kind == RowKind::Pad) {  // the key's (control's) name in a box; click it, then press one
             const bool listening = g_panel.listening == i;
             if (listening && in.pressed)  // a second click, here or anywhere else, cancels
                 g_panel.listening = -1;
@@ -1797,7 +1900,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 StartListening(i);
             const bool waiting = g_panel.listening == i;
 
-            const char* text = waiting ? "PRESS A KEY" : KeyName(cfg.*def.key);
+            const char* text = def.kind == RowKind::Pad
+                ? (waiting ? "PRESS OR PUSH" : gamepad::ControlName(cfg.*def.pad))
+                : (waiting ? "PRESS A KEY" : KeyName(cfg.*def.key));
             const float boxH = S(28), boxPad = S(14), boxY = std::round(y + (rowH - boxH) * 0.5f);
             const float textW = TextWidth(kFontSmall, text, S(2));
             const float boxW = std::fmax(textW + 2 * boxPad, S(130)), bx = cx + cw - boxW;
@@ -1878,7 +1983,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                      t.pitchExcessDeg, std::fabs(t.rawRollDeg));
         snprintf(readout, sizeof readout, "%s   \xB7   %s   LOOK %+.0f\xB0   %s   \xB7   LAG %.1f\xB0   %.1f G   NECK %+.0f MM",
                  view, t.airborne > 0.5 ? "AIR" : "GROUND", t.lookYawDeg,
-                 cfg.controllerLook ? gamepad::StatusText() : "D-PAD OFF", t.lagDeg, 1.0 + t.verticalAccelG,
+                 cfg.controllerLook ? gamepad::StatusText() : "LOOK OFF", t.lagDeg, 1.0 + t.verticalAccelG,
                  t.neckOffset * 1000.0);
     } else {
         snprintf(readout, sizeof readout, "%s", replay::StatusText());
@@ -2000,7 +2105,10 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         if (g_panel.listening >= 0) {
             char label[64], hint[160];
             Upper(kRows[g_panel.listening].label, label, sizeof label);
-            snprintf(hint, sizeof hint, "PRESS THE NEW KEY FOR %s   \xB7   ESC CANCELS", label);
+            if (kRows[g_panel.listening].kind == RowKind::Pad)
+                snprintf(hint, sizeof hint, "PRESS A BUTTON OR PUSH A STICK FOR %s   \xB7   BACKSPACE CLEARS   \xB7   ESC CANCELS", label);
+            else
+                snprintf(hint, sizeof hint, "PRESS THE NEW KEY FOR %s   \xB7   ESC CANCELS", label);
             Hint(hint, White(1.0f));
         } else if (now < g_panel.statusUntil) {
             Hint(g_panel.status, White(1.0f));
@@ -2145,6 +2253,8 @@ bool OverlayListeningForKey()
     return g_panel.listening >= 0 || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
 }
 
+bool OverlayPanelOpen() { return g_panel.open; }
+
 bool HideGameOverlayNow(bool cursor)
 {
     const Config& cfg = GetConfig();
@@ -2190,6 +2300,7 @@ void OverlayFrame(HDC dc)
     g_gameWindow = window;
     NoteMouseActivity();
     UpdateFullscreenWindow(window, cfg.fullscreenWindow);
+    UpdateSoundPacks(now);
     // The game's cursor while riding (Config::hideCursor): if it's the system's, the window
     // procedure keeps it hidden; it's put away here the moment hiding starts.
     if (cfg.hideCursor && window && g_glAvailable) {

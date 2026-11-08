@@ -2127,7 +2127,7 @@ void StartTrace(double seconds)
                      "cam_x,cam_y,cam_z,eye_dx,eye_dy,eye_dz,bike_x,bike_y,bike_z,"
                      "away_deg,ground_passes,ground_game,ground_filled,ground_open,ground_note,"
                      "rear_on,rear_seen,rear_far,rear_x,rear_y,rear_z,front_on,front_seen,front_far,front_x,front_y,front_z,"
-                     "tire_stretch,bike_found\n");
+                     "tire_stretch,bike_found,whip,game_step_ms,bike_rest,camera_rest\n");
     // Times are relative to the key press: the history before it is negative.
     const double now = camera::ContentTime();
     g_traceFrames = 0;
@@ -2173,7 +2173,7 @@ void TraceFrame(bool captured)
             "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
             "%.3f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,"
             "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,"
-            "%.1f,%d,%d,%d,%d,%s,%s\n",
+            "%.1f,%d,%d,%d,%d,%s,%s,%.3f,%.2f,%.2f,%.2f\n",
             t.rawIntervalMs, t.dtMs, g_camera.previews, g_camera.otherRotations,
             t.cut ? 1 : 0, t.reset ? 1 : 0, t.bikeTracked ? 1 : 0, t.bikeFresh ? 1 : 0, t.customWeight,
             t.rawYaw, t.rawPitch, t.rawRoll, t.bikeYaw, t.bikePitch, t.bikeRoll, t.outYaw, t.outPitch, t.outRoll,
@@ -2181,7 +2181,8 @@ void TraceFrame(bool captured)
             t.rawPos[0], t.rawPos[1], t.rawPos[2], t.eyeOffset[0], t.eyeOffset[1], t.eyeOffset[2],
             pose.worldPosition[0], pose.worldPosition[1], pose.worldPosition[2],
             g_ground.awayDeg, g_ground.passes, g_ground.game, g_ground.filled, g_ground.open,
-            g_ground.note[0] ? g_ground.note : "-", postfx::WheelTraceText());
+            g_ground.note[0] ? g_ground.note : "-", postfx::WheelTraceText(), t.whip, camera::LastStep() * 1000.0,
+            t.bikeRestDeg, t.cameraRestDeg);
     }
 
     if (!g_trace)
@@ -3573,13 +3574,19 @@ bool EndShaderFrame()
     g_ground = GroundStats{};
     replay::EndFrame(camera::ContentTime(), captured);
     camera::FrameTick();
-    // The game has no look keys: the controller's d-pad turns the head for the next frame.
+    // The game has no look keys: the controller (the binds on the KEYBINDS tab, the d-pad unless
+    // changed) turns the head for the next frame. Polled while the menu is open too, for binding.
     camera::Look look = camera::Look::Ahead;
-    if (GetConfig().controllerLook) {
-        const gamepad::DPad pad = gamepad::Read();
-        look = pad.down ? camera::Look::Back
-             : pad.left != pad.right ? (pad.left ? camera::Look::Left : camera::Look::Right)
-             : camera::Look::Ahead;
+    const Config& lookCfg = GetConfig();
+    if (lookCfg.controllerLook || OverlayPanelOpen()) {
+        gamepad::Poll();
+        if (lookCfg.controllerLook) {
+            const bool left = gamepad::IsDown(lookCfg.lookLeftControl);
+            const bool right = gamepad::IsDown(lookCfg.lookRightControl);
+            look = gamepad::IsDown(lookCfg.lookBackControl) ? camera::Look::Back
+                 : left != right ? (left ? camera::Look::Left : camera::Look::Right)
+                 : camera::Look::Ahead;
+        }
     }
     camera::SetLook(look);
 
