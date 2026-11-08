@@ -6,3 +6,6 @@ mxcam_trace.csv
 # and the copies the build puts next to the DLLs. The code that installs them stays in the repo.
 mxcam_sounds/
 bin/*/Release/mxcam_sounds/
+
+# Build intermediates (MSBuild writes them on every build)
+obj/
