@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <limits>
 #include <share.h>
 #include <string>
 #include <unordered_map>
@@ -37,6 +39,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "mathlib.h"
+#include "motion.h"
 #include "postfx.h"
 #include "postfx_shaders.h"
 #include "replay.h"
@@ -168,6 +171,7 @@ struct GLApi {
     void   (APIENTRY* FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
     GLenum (APIENTRY* CheckFramebufferStatus)(GLenum);
     void   (APIENTRY* BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
+    void   (APIENTRY* ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
     void   (APIENTRY* GenerateMipmap)(GLenum);
     void   (APIENTRY* BindSampler)(GLuint, GLuint);  // optional (GL 3.3)
     decltype(&::glScissor)             Scissor;
@@ -256,6 +260,7 @@ bool LoadGL()
     MXCAM_LOAD(FramebufferTexture2D, "glFramebufferTexture2D");
     MXCAM_LOAD(CheckFramebufferStatus, "glCheckFramebufferStatus");
     MXCAM_LOAD(BlitFramebuffer, "glBlitFramebuffer");
+    MXCAM_LOAD(ReadPixels, "glReadPixels");
     MXCAM_LOAD(GenerateMipmap, "glGenerateMipmap");
     MXCAM_LOAD(Scissor, "glScissor");
 #undef MXCAM_LOAD
@@ -439,8 +444,11 @@ struct Resources {
     int     width = 0, height = 0;
     GLuint  captureFbo = 0, color = 0, depth = 0;  // the window's image
     GLuint  terrainFbo = 0, terrainDepth = 0;      // depth when the terrain pass ended
+    GLuint  sampleFbo = 0, sampleDepth = 0;        // that depth, downsampled, to read back
+    int     samplePacking = -1;                    // the depth format it was made in (depthMode's)
+    bool    sampleFailed = false;                  // reading it back didn't work: tried once
     GLuint  shadowFbo = 0, shadowMap = 0;          // depth seen from the sun
-    Target  marks;                                 // tire marks on the ground (see TireMarks)
+    Target  marks;                                 // tire marks: the map of the ground around you (TireMarks)
     bool    marksCleared = false;
     int     shadowSize = 0;
     int     colorMode = 0;  // 0 = untried, 1 = blit, 2 = copy, -1 = nothing works
@@ -1289,6 +1297,27 @@ struct Wheel {
     int    trailSkipped = 0;  // frames on end its contact was off the trail sideways (not stamped)
     bool   haveLast = false;  // the last contact stamped into the tire marks
     double lastU = 0, lastV = 0;
+    double off = 0.0;         // seconds it has been off the tracker (the rut keeps joining up)
+    // Where its tire is on the ground, in the world (see the ground field in the tire marks):
+    // the marks' own test is the terrain's depth, which only exists where the game drew the
+    // wheel, so this answers for the contacts the screen can't see: how fast the contact's path
+    // and, steadier, your bike's own height are falling.
+    double heightVel = 0;     // its contact's velocity and acceleration, game units/s and s^2, from
+    double heightAccel = 0;   // a least-squares fit over kAirFitWindow of its positions: differencing
+    MotionFit fit;            // them twice amplifies the contact's jitter into whole gravities, and
+    double fallG = 0;         // that acceleration along WorldUp, in g (negative falling), and the
+                              // deeper of it and your bike's own - what the fall's score is built
+                              // from, since a bike is rigid and its wheels aren't
+    double airScore = 0;      // how long a free fall has been read, 0 to 1 (0: none at all, 1.0:
+                              // half a second of it at the game's gravity); it gains the fall's
+                              // depth times kAirScoreGain and loses kAirScoreDrain a second, or
+                              // kAirLandedDrain once nothing is falling any more
+    double airPeak = 0;       // the most its hold got in this flight: what's back on the ground has
+                              // to have lost half of it, which is the difference between a landing
+                              // and the state flapping back through the lip it just left
+    bool   grounded = true;   // where this frame says its tire is: what the marks hold to
+    double gap = 0;           // how far this frame's contact sat above the ground near here, and
+    bool   gapKnown = false;  // whether anything was known near there (the air readout below)
     // Where it sits on your bike (the bike's own space), learnt while its part is seen turning.
     // The game doesn't draw a wheel that is out of view (in first person the rear one, and often
     // the front, are under you), and the part can be lost for other reasons; your bike itself is
@@ -2694,16 +2723,99 @@ void UpdateAir(double dt)
 }
 
 // ---- Tire marks ------------------------------------------------------------------------------
-// A map of the ground around you (4096 x 4096 texels of 4 cm: 164 m across) that the tires
-// press grooves into. It wraps around as you ride: the strip that leaves on one side comes back
-// cleared on the other.
-constexpr int    kMarkSize  = 4096;
-double g_markTexel = 0.04 * 3.2808;  // 4 cm, in game units (set when the map is laid out)
-struct MarkWindow {
-    bool      set = false;
-    long long originU = 0, originV = 0;  // texel coordinates of the window's corner
+// One map of the ground around you that the tires press grooves into, at 4 cm texels, kept
+// centred on the camera and wrapping as you ride: the strip that leaves on one side comes back
+// cleared on the other. What that clearing forgets, a CPU-side cache of the ruts you pressed
+// remembers: each wheel keeps its contact-to-contact segments from the whole session so far
+// (their positions in the map's own texels and the rut's true width), and when ground re-
+// enters the window the cached segments crossing the cleared strip are pressed into it again
+// - the very same stamps a fresh rut gets, so a mark can never be cut or blurred where ground
+// is reused, and whatever you rode past earlier comes back exactly as it was, whenever you
+// return to it. The cache is bounded by count, not by distance: keeping the whole session is
+// what lets the marks survive the far end of a large track, where the bike-anchored window
+// has wrapped around many times since. What's on the ground reaches one map: half the window
+// to a side, fading out over the last kMarkBlend before its edge.
+// Where a tire is down on the ground: the terrain's depth where the screen shows that wheel,
+// and otherwise a coarse field of the height of the ground your own tires pressed (below),
+// which is what answers in first person - there your wheels sit behind and under the camera,
+// hardly any of them is drawn, and a screen test has nothing to say about them.
+constexpr int    kMarkSizeWide   = 8192;   // the map, texels to a side (328 m of ground)
+constexpr int    kMarkSizeNarrow = 4096;   // if the wide one can't be made
+constexpr double kMarkBlend      = 60.0;   // m: how wide the fade band before the window's
+                                           // edge is (the shader's kMarkBlend, kept in step
+                                           // with this)
+constexpr double kMarkCacheMin   = 10000.0;    // segments per wheel the cache keeps at least
+constexpr double kMarkCacheMax   = 1000000.0;  // ...and at most: the range the panel and mxcam.ini
+                                               // offer for MarkCacheSegs ("Mark cache", which
+                                               // shows the memory: kMarkSegBytes a segment times
+                                               // both wheels, so a million is about 92 MB). Big
+                                               // counts stay cheap because the cache is indexed
+                                               // in blocks (below): re-pressing a strip only
+                                               // looks at the blocks whose box touches it
+constexpr size_t kMarkBlockSegs  = 64;         // segments kept in one block, sharing a box: the
+                                               // index the re-press walks, about 2 bytes a
+                                               // segment of boxes
+struct MarkSeg {
+    double au, av, bu, bv;  // the two contacts, in the map's own (unwrapped) texels
+    double halfWidth = 0;   // m: the rut's half width (its true world width)
+    double strength  = 0;   // how deep: rear 1, front 0.7
 };
-MarkWindow g_markWindow;
+struct MarkBlock {
+    std::vector<MarkSeg> segs;       // up to kMarkBlockSegs of one wheel's trail, oldest first
+    double minU, maxU, minV, maxV;   // the box those segments cover, in the map's texels
+};
+std::deque<MarkBlock> g_markCache[2];  // each wheel's ruts this session, oldest block first
+size_t                g_markCacheSize[2] = {};  // segments held per wheel (what the cap counts)
+struct MarkMap {
+    int       size = 0;       // texels to a side (0: this map couldn't be made)
+    double    texel = 0;      // one texel, in game units
+    long long originU = 0, originV = 0;  // where the window's corner is, in unwrapped texels
+    bool      set = false;    // the window has an origin
+};
+MarkMap g_mark;  // the map
+
+// How many segments per wheel the cache keeps: the setting's, inside the range offered there.
+size_t MarkCacheCap()
+{
+    return static_cast<size_t>(Clamp(GetConfig().markCacheSegs, kMarkCacheMin, kMarkCacheMax));
+}
+
+// Nothing the cache holds any more: its segments are placed in the texels the map was laid out
+// with, so a new layout starts them over.
+void ClearMarkCache()
+{
+    for (int i = 0; i < 2; ++i) {
+        g_markCache[i].clear();
+        g_markCacheSize[i] = 0;
+    }
+}
+
+// One rut segment more at the back of a wheel's cache, kept in a block with its neighbours on
+// the trail and with the block's box grown around it. Over the cap the oldest blocks go whole
+// (the block still being filled at the back is never dropped, so a wheel keeps its recent
+// strides whatever the count).
+void PushMark(int i, const MarkSeg& s)
+{
+    std::deque<MarkBlock>& blocks = g_markCache[i];
+    const double loU = std::fmin(s.au, s.bu), hiU = std::fmax(s.au, s.bu);
+    const double loV = std::fmin(s.av, s.bv), hiV = std::fmax(s.av, s.bv);
+    if (blocks.empty() || blocks.back().segs.size() >= kMarkBlockSegs)
+        blocks.push_back(MarkBlock{ { s }, loU, hiU, loV, hiV });
+    else {
+        MarkBlock& b = blocks.back();
+        b.segs.push_back(s);
+        b.minU = std::fmin(b.minU, loU);
+        b.maxU = std::fmax(b.maxU, hiU);
+        b.minV = std::fmin(b.minV, loV);
+        b.maxV = std::fmax(b.maxV, hiV);
+    }
+    ++g_markCacheSize[i];
+    const size_t cap = MarkCacheCap();
+    while (g_markCacheSize[i] > cap && blocks.size() > 1) {
+        g_markCacheSize[i] -= blocks.front().segs.size();
+        blocks.pop_front();
+    }
+}
 
 void PlaneAxes(Vec3& u, Vec3& v)
 {
@@ -2712,31 +2824,49 @@ void PlaneAxes(Vec3& u, Vec3& v)
     v = Normalize(Cross(u, up));
 }
 
-int MarkWrap(long long t) { return static_cast<int>(((t % kMarkSize) + kMarkSize) % kMarkSize); }
+int MarkWrap(long long t, int size) { return static_cast<int>(((t % size) + size) % size); }
 
 bool EnsureMarks()
 {
-    if (g_res.marks.tex)
+    if (g_mark.size)
         return true;
     GLint active = 0, bound = 0;
     g_gl.GetIntegerv(kActiveTexture, &active);
     g_gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
-    const bool ok = MakeTarget(g_res.marks, kMarkSize, kMarkSize, kR8, kRed, GL_UNSIGNED_BYTE);
-    g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks.tex);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // The wide map first; the narrow one if 64 MB of R8 (or 8192 texels) is refused.
+    // MakeTarget leaves a failed try's texture behind: it goes back before the next try.
+    bool ok = false;
+    for (const int size : { kMarkSizeWide, kMarkSizeNarrow }) {
+        if (MakeTarget(g_res.marks, size, size, kR8, kRed, GL_UNSIGNED_BYTE)) {
+            g_mark.size = size;
+            ok = true;
+            break;
+        }
+        DeleteTarget(g_res.marks);
+    }
+    // Wrapped sampling: the shader taps (texel coordinate + the window's corner) over the
+    // window's size, which goes past 1 where the window's corner is wrapped.
+    if (ok) {
+        g_gl.BindTexture(GL_TEXTURE_2D, g_res.marks.tex);
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    }
     g_gl.BindTexture(GL_TEXTURE_2D, bound);
     g_gl.ActiveTexture(active);
     g_res.marksCleared = false;
-    Log("postfx: tire marks map %dx%d %s", kMarkSize, kMarkSize, ok ? "ready" : "could not be made");
-    if (!ok)
-        DeleteTarget(g_res.marks);
+    g_mark.set = false;
+    g_mark.texel = 0.04 * g_unitsPerMetre;
+    const double reach = g_mark.size * g_mark.texel / 2.0 / g_unitsPerMetre;
+    const size_t cap = MarkCacheCap();
+    Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; the whole session's ruts are kept in a cache of %d segments per wheel (%.1f MB) and re-pressed wherever ground is reused",
+        g_mark.size, g_mark.size, ok ? "ready" : "could not be made", reach, kMarkBlend,
+        static_cast<int>(cap), static_cast<double>(cap) * 2.0 * static_cast<double>(kMarkSegBytes) / (1024.0 * 1024.0));
     return ok;
 }
 
-// Writes value (blend off) or presses a groove (max blend) between a and b, in the map's own
+// Writes value (blend off) or presses a groove (max blend) between a and b, in one map's own
 // texels (wrapped), over the rectangle x0, y0, w, h.
-void StampRect(int x0, int y0, int w, int h, float ax, float ay, float bx, float by, float halfWidth, float strength)
+void StampRect(Target& map, int x0, int y0, int w, int h, float ax, float ay, float bx, float by, float halfWidth, float strength)
 {
     if (w <= 0 || h <= 0)
         return;
@@ -2746,20 +2876,19 @@ void StampRect(int x0, int y0, int w, int h, float ax, float ay, float bx, float
     g_gl.Uniform1f(p["u_half"], halfWidth);
     g_gl.Uniform1f(p["u_strength"], strength);
     g_gl.Scissor(x0, y0, w, h);
-    Draw(g_res.marks);
+    Draw(map);
 }
 
-void ClearMarks(int x0, int y0, int w, int h)
+void ClearMarks(Target& map, int x0, int y0, int w, int h)
 {
-    StampRect(x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f);
+    StampRect(map, x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f);
 }
 
-// A groove from the last contact to this one (texel coordinates, unwrapped), drawn once per
+// A groove from the last contact to this one, in the map's texels (wrapped), drawn once per
 // wrap-around copy it touches.
-void Groove(double au, double av, double bu, double bv, double halfWidth, double strength)
+void Groove(Target& map, const MarkMap& m, double au, double av, double bu, double bv, double halfWidth, double strength)
 {
-    const MarkWindow& m = g_markWindow;
-    const double pu = MarkWrap(m.originU), pv = MarkWrap(m.originV);
+    const double pu = MarkWrap(m.originU, m.size), pv = MarkWrap(m.originV, m.size);
     const double ax = au - m.originU + pu, ay = av - m.originV + pv;
     const double bx = bu - m.originU + pu, by = bv - m.originV + pv;
     const double pad = halfWidth + 2.0;
@@ -2767,89 +2896,635 @@ void Groove(double au, double av, double bu, double bv, double halfWidth, double
     const double minY = std::fmin(ay, by) - pad, maxY = std::fmax(ay, by) + pad;
     for (int sx = 0; sx < 2; ++sx) {
         for (int sy = 0; sy < 2; ++sy) {
-            const double ox = sx * kMarkSize, oy = sy * kMarkSize;
+            const double ox = sx * m.size, oy = sy * m.size;
             const int x0 = static_cast<int>(std::floor(minX - ox)), x1 = static_cast<int>(std::ceil(maxX - ox));
             const int y0 = static_cast<int>(std::floor(minY - oy)), y1 = static_cast<int>(std::ceil(maxY - oy));
             const int cx0 = std::max(x0, 0), cy0 = std::max(y0, 0);
-            const int cx1 = std::min(x1, kMarkSize), cy1 = std::min(y1, kMarkSize);
+            const int cx1 = std::min(x1, m.size), cy1 = std::min(y1, m.size);
             if (cx1 <= cx0 || cy1 <= cy0)
                 continue;
-            StampRect(cx0, cy0, cx1 - cx0, cy1 - cy0, static_cast<float>(ax - ox), static_cast<float>(ay - oy),
+            StampRect(map, cx0, cy0, cx1 - cx0, cy1 - cy0, static_cast<float>(ax - ox), static_cast<float>(ay - oy),
                       static_cast<float>(bx - ox), static_cast<float>(by - oy), static_cast<float>(halfWidth),
                       static_cast<float>(strength));
         }
     }
 }
 
-// Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of the window, wrapped.
-void ClearBand(int axis, long long from, long long count)
+// Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of one map, wrapped.
+void ClearBand(int axis, Target& map, const MarkMap& m, long long from, long long count)
 {
-    if (count >= kMarkSize) {
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
+    if (count >= m.size) {
+        ClearMarks(map, 0, 0, m.size, m.size);
         return;
     }
-    const int start = MarkWrap(from);
-    const int first = static_cast<int>(std::min<long long>(count, kMarkSize - start));
+    const int start = MarkWrap(from, m.size);
+    const int first = static_cast<int>(std::min<long long>(count, m.size - start));
     const int second = static_cast<int>(count - first);
     if (axis == 0) {
-        ClearMarks(start, 0, first, kMarkSize);
-        ClearMarks(0, 0, second, kMarkSize);
+        ClearMarks(map, start, 0, first, m.size);
+        ClearMarks(map, 0, 0, second, m.size);
     } else {
-        ClearMarks(0, start, kMarkSize, first);
-        ClearMarks(0, 0, kMarkSize, second);
+        ClearMarks(map, 0, start, m.size, first);
+        ClearMarks(map, 0, 0, m.size, second);
     }
 }
 
-// Moves the window with you and presses this frame's grooves. Returns whether the map is usable.
-bool UpdateMarks()
+// The ground your wheels touch, as a height field ------------------------------------------
+// The other half of the on/off-ground answer, and the half that works in every view: a coarse
+// grid of the ground's height along the marks map's own axes, filled with your wheels' contacts
+// as you ride. The terrain doesn't move, so wherever you've ridden keeps its height for the
+// session, and a contact well above the height near here is in the air rather than down. The
+// contacts the screen does show are checked against the terrain's depth in the stamp itself,
+// which is exact, but only there; this answers everywhere, and the two must agree before the rut
+// presses - in first person that's nearly all of them, your wheels sit behind and under the
+// camera and are barely drawn at all, and the one pixel the screen does read of a rising tire
+// holds ground far ahead at the tire's height, which alone would call it down.
+// The state holds rather than flipping on one frame's number: a tire rolling on the ground follows
+// a path whose height barely accelerates (each face of the terrain is a plane, so its height's
+// velocity is steady), while a tire in the air traces a parabola whose height accelerates at the
+// game's gravity, all the way through the flight, from the launch's rise through the drop. That is
+// the whole signal, and it needs nothing from the screen: in first person the terrain's depth only
+// exists where the game drew the wheel, and as the tire rises so does the camera, so the one pixel
+// it does read holds ground far ahead at the tire's height - the old reading called a tire in the
+// air down, and pressed ruts there.
+// Two readings of that fall are kept: the wheel's own contact path and your bike's own height,
+// from the tracker, and a fall is only believed where they both say so. Both are fit as parabolas
+// through a dozen samples rather than differentiated twice, because neither is a clean sample: a
+// wheel stood in from your bike has its contact's height swing as the bike pitches, and the frame
+// to-frame difference of that (or of two eases of it) read +-1.5 g of pure noise while rolling,
+// more than a jump is - which is what took first person's tires off the ground late and put them
+// back in the middle of a flight, so the rut carried on being pressed under a wheel in the air
+// while third person, reading the drawn rider's wheels, got the same jump right. Where the two
+// disagree, your bike's is the answer to trust: a bike is a rigid body, its wheels hang off it.
+// There is a third answer, and where it speaks it's the best one for going up: the terrain's own
+// height everywhere the game drew it (FillTerrainFromDepth unprojects this frame's terrain depth
+// into a world height field, the same reconstruction the shaders do). It knows the ground ahead of
+// you, where no tire has been, so a wheel the game never renders is asked whether its contact, at
+// its radius under its axle, clears the ground there - a question that needs no fit and no drawn
+// wheel, and cuts the rut at the lip rather than a fit's window after it. It's asked that way only:
+// the seen height is the face the camera saw at that column, which isn't the face under a wheel the
+// camera barely draws, and in flight the bare ground ahead is well under a rising tire, so asking it
+// "is this tire on the ground" called tires down in the middle of jumps and pressed their ruts (what
+// the round this was read from did). Going down stays with the readings and with the ridden field,
+// which recorded the face your tire actually pressed - prop or ground - and so still answers for a
+// wheel resting on a ramp or a crate. Its clearance is dropped where the ridden field does know
+// the ground near the wheel, since that nearer face already says how far the tire is from what
+// it's on, and the terrain pass draws no bridge for a tire rolling over one to be clear of. Where
+// neither field knows the ground near this wheel - off screen and never ridden - the fitted fall
+// answers, as above.
+// Down to off the ground: that fall, held to kAirScoreAir - on its own, whatever the ground near
+// there says. Off to down: the fall's hold gone under kAirScoreDown, which a landing does by itself
+// because nothing falling any more drains it at kAirLandedDrain, or the tire back at the ground
+// near here having lost half of whatever its flight reached. The gap to the ground near there is only
+// for coming back: asked of the fall on the way out as well, it held a wheel on the ground for
+// half a second of a jump down out of a ramp, where the only ground known near the rear wheel is
+// the ramp face the tire had just left above it, so the contact read under its own reference
+// forever. Heights are in game units, so a change of the unit clears the field.
+constexpr double kGroundCellMetres = 1.0;   // m to a cell (512 cells over: 512 m, past a track)
+constexpr int    kGroundSize       = 512;   // cells to a side
+constexpr double kAirFitWindow     = 0.12;  // s of contacts to fit the parabola through: their
+                                            // acceleration. The contact isn't a clean sample (a
+                                            // wheel stood in from your bike, its height swinging
+                                            // as the bike pitches), so its own acceleration is
+                                            // mostly jitter: a millimetre or two of it, taken
+                                            // twice over dt squared, is on the order of a whole
+                                            // gravity, and the fall then built up at random times
+                                            // and vanished mid-flight. A fit through a dozen
+                                            // samples averages that out, and this is as quick as a
+                                            // fit of this length can be: it reaches the fall's depth
+                                            // some part of the window after the launch, and that
+                                            // part, at riding speed, is the length of rut pressed
+                                            // past the lip.
+constexpr double kAirFreeFallG     = 0.6;   // g: a reading this deep is a free fall. Shallower is
+                                            // not one (a lip's compression, a wheel that popped
+                                            // over a crest) and counts as nothing at all, so it
+                                            // can neither put a tire in the air nor hold one down;
+                                            // a jump is a whole g deep, so this sits past anything
+                                            // the ground does to a tire that is still on it - and
+                                            // the tire's and your bike's readings both have to be
+                                            // that deep before a fall is a fall at all
+constexpr double kAirBackG         = 0.4;   // g: the fall this shallow at all: the height has gone
+                                            // out of free fall, so the tire is where the ground is
+                                            // again (both the tire's and your bike's must say so,
+                                            // which is what stops one wheel's own fluke ending a
+                                            // flight for both of them)
+constexpr double kAirMaxG          = 6.0;   // g: beyond this the reading is a cut or a respawn
+constexpr double kAirSpikG         = 2.5;   // g: a reading this deep is the terrain turning the
+                                            // path about in one frame (a lip's crest), so that
+                                            // frame is held rather than counted: counted, a wheel
+                                            // would be put in the air halfway down a run of whoops
+constexpr double kAirScoreGain     = 6.0;   // per second, times the fall's depth in g. The rut is cut
+                                            // this far past the lip by whatever the fit's lag is plus
+                                            // the frames this needs to clear kAirScoreAir: at 3 it
+                                            // took eight frames of a whole gravity, some 0.1 s of
+                                            // riding, two or three metres of rut pressed past the
+                                            // takeoff's end, and that lag is most of what made the
+                                            // mark of a jump start beyond its lip rather than at it.
+                                            // The fit's window is what it can be while it beats the
+                                            // contact's jitter, so this is the half that could move.
+constexpr double kAirScoreDrain    = 1.0;   // per second, what the score loses whatever it reads
+constexpr double kAirScoreAir      = 0.2;   // the fall's score this high: off the ground. Nothing
+                                            // else is asked of it: requiring the contact to be above
+                                            // the ground near there as well, as this was first, kept
+                                            // a wheel on the ground for half a second of a jump down
+                                            // out of a ramp - the ground known there was the ramp
+                                            // behind, which the tire had left below, so the contact
+                                            // read under it and the rut went on being pressed.
+constexpr double kAirScoreDown     = 0.02;  // this low: back on it. Two numbers rather than one so
+                                            // the state can't flap through a flight: thresholding the
+                                            // reading, as this was first, put the wheel back on the
+                                            // ground halfway through a jump because the eased reading
+                                            // wandered about -0.5 g, and the ruts carried on there.
+constexpr double kAirGap           = 0.3;   // m of the ground you rode near here: this far under or
+                                            // over it, and the contact is back at it (the only
+                                            // geometric answer for coming down; the seen terrain
+                                            // isn't asked this question, see the note by seenClear,
+                                            // and a landing's hold is gone by the readings anyway)
+constexpr double kAirClearMetres   = 0.4;   // m above the ground near here: clear of it, a launch.
+                                            // Both fields answer this one (the bare terrain the game
+                                            // drew ahead of you, and the ground your tires last
+                                            // pressed) and it's the only geometric answer for going
+                                            // up, which is what cuts the rut at the lip rather than a
+                                            // fit's window past it, and answers for a wheel the game
+                                            // never renders in first person. It has to be a band and
+                                            // not a line because the contact isn't a clean sample:
+                                            // the game's suspension compresses a wheel, and a wheel
+                                            // stood in from your bike reads within tens of centimetres
+                                            // of the face it rolls on whatever its pitch, so a rolling
+                                            // wheel has to be allowed that much of slack or it would
+                                            // be read clear of the ground all along a rough stretch.
+                                            // (Only a launch gets a tire this far above the ground its
+                                            // own cell says is there: MXS's lips and whoops move it by
+                                            // far less over the ground the tire stays on.)
+constexpr double kAirLandedDrain   = 10.0;  // per second the fall's score loses while both readings
+                                            // are out of free fall: the fall is over, so whatever
+                                            // hold it had goes in a tenth of a second. This is how
+                                            // a landing is told, rather than by the slam it makes:
+                                            // the slam was the contact's own acceleration turned
+                                            // about, which a standing wheel does at several g when
+                                            // it's compressed and at a lip's crest at tens of them,
+                                            // so it read a slam in the middle of a flight and put
+                                            // the tire back on the ground there, where the rut
+                                            // carried on being pressed. Out of free fall at all, in
+                                            // both readings, is the landing (a bike is rigid, its
+                                            // wheels aren't, so one wheel's own fluke can't end a
+                                            // flight), and it has to hold for a few frames before
+                                            // it is one: this is what a flight keeps of its hold
+                                            // against those frames, and what it can cost of the
+                                            // rut just after a touchdown
+constexpr double kAirClimbMetres   = 1.5;   // m this far above the ground near here, at once, is air
+                                            // whatever the fall says: more than any MXS hill climbs
+                                            // over a metre travelled, so it can only be a launch
+constexpr double kAirTeleportMetres = 20;   // m the bike moves in one frame, more: that was a cut
+                                            // or a respawn, so the fit of its fall starts over
+constexpr double kGroundKeep       = 0.25;  // how far a fresh sample moves a cell that's known
+double g_markTime = 0;                      // s of riding the marks have seen: a clock to stamp the
+                                            // fits' samples with, so their windows are in time and
+                                            // not in frames (a hitch keeps the fit's samples honest)
+bool g_airLogging = false;                  // Whether the marks' air test is written to the log at
+                                            // all: it was, the whole time this was being worked on,
+                                            // and the notes below (by kAirFitWindow, kAirScoreGain,
+                                            // kAirLandedDrain and seenClear) are written from what
+                                            // those lines said - a wheel called down with its fall
+                                            // still a whole gravity deep, a hold that flapped back
+                                            // through the lip, and so on. Off in a normal build: a
+                                            // session's worth of them is noise, and nothing in the
+                                            // game reads them. Set it to true to watch the test
+                                            // decide, which is how a wrong call is reported as
+                                            // evidence rather than as a symptom.
+int g_airLogLines = 0;                      // where a wheel's tire is off and back on, written to the
+                                            // log with the numbers that decided it, so a wrong call
+                                            // can be reported as evidence rather than as a symptom
+constexpr int    kAirLogLinesMax   = 600;   // (a whole session stays quiet)
+int g_airReadLines = 0;                     // the same numbers, written whatever the state does: the
+                                            // first twenty seconds of riding, and every tenth second
+                                            // while any fall is being read, so the whole of a jump the
+                                            // user has just made is in the log beside the marks it made
+constexpr double kAirReadEvery     = 0.1;   // s between those lines
+constexpr int    kAirReadLinesMax  = 1500;  // (a long session stays quiet; three hundred stopped
+                                            // short of the end of the run this was read from, which
+                                            // is why the half of it after the view went third person
+                                            // had nothing in it to compare against)
+double g_airReadTimer = 0;                  // s since the last such line
+std::vector<double> g_ground(kGroundSize * kGroundSize, std::numeric_limits<double>::quiet_NaN());
+                                            // WorldUp height per cell, game units; not-a-number:
+                                            // never ridden near there. Cells are addressed by the
+                                            // absolute cell wrapped, so the field reaches over the
+                                            // world however big it is: only cells near your wheels
+                                            // are ever read, and two places 512 m apart sharing a
+                                            // cell says nothing about either of them.
+constexpr double kTerrainCellMetres = 0.5;  // m to a cell of the field of ground seen on screen:
+                                            // half the ridden one, because this one answers where
+                                            // a tire that was never here is: a cell of a whole
+                                            // metre on a steep ramp stands half a metre off the
+                                            // face it covers, which is more than the tire's own
+                                            // clearance, and the answer would be wrong on ramps.
+constexpr int kTerrainSize        = 1024;   // cells to a side (512 m over, past a track)
+std::vector<double> g_terrain(kTerrainSize * kTerrainSize, std::numeric_limits<double>::quiet_NaN());
+                                            // The terrain's own WorldUp height per cell, game units
+                                            // - written from what the game drew of the terrain this
+                                            // frame (see FillTerrainFromDepth), so unlike the field
+                                            // above it knows the ground ahead of you, where your
+                                            // tires haven't been: that's what answers for a wheel
+                                            // the game never renders, in first person. Not-a-number:
+                                            // not on screen this frame and never seen since.
+
+size_t GroundSlot(long long i, long long j)
+{
+    return static_cast<size_t>(MarkWrap(i, kGroundSize)) * static_cast<size_t>(kGroundSize) +
+           static_cast<size_t>(MarkWrap(j, kGroundSize));
+}
+
+void ClearGroundField()
+{
+    std::fill(g_ground.begin(), g_ground.end(), std::numeric_limits<double>::quiet_NaN());
+}
+
+// The ground's height along WorldUp at the field's cell coordinates cu, cv: a local average of
+// the known cells around it, nearer ones weighted far more, its window grown until it has any
+// to say (out to 17x17 cells, 17 m). False where nothing was ever ridden that near.
+bool GroundHeightAt(double cu, double cv, double& height)
+{
+    const long long i0 = static_cast<long long>(std::floor(cu));
+    const long long j0 = static_cast<long long>(std::floor(cv));
+    for (int span = 1; span <= 8; span *= 2) {
+        double sum = 0, wsum = 0;
+        for (long long j = j0 - span; j <= j0 + span; ++j) {
+            for (long long i = i0 - span; i <= i0 + span; ++i) {
+                const double known = g_ground[GroundSlot(i, j)];
+                if (std::isnan(known))
+                    continue;
+                const double du = static_cast<double>(i) - cu, dv = static_cast<double>(j) - cv;
+                const double w = std::exp(-0.5 * (du * du + dv * dv));
+                sum += known * w;
+                wsum += w;
+            }
+        }
+        if (wsum > 0.0) {
+            height = sum / wsum;
+            return true;
+        }
+    }
+    return false;
+}
+
+// This frame's contact goes into the cell it sits in, but never far above the ground known all
+// around it: the ground doesn't move, so a sample that high above its neighbours is a tire flying
+// over them, and letting it in would raise the ground there for the rest of the session - and then
+// keep calling that tire down, which is what pressed ruts in the air. Downward steps are let
+// through whatever their steepness (the ground only gets lower as you ride down a drop or into a
+// whoop's underside), so those stay honest.
+void GroundWrite(double cu, double cv, double height)
+{
+    const long long i0 = static_cast<long long>(std::floor(cu));
+    const long long j0 = static_cast<long long>(std::floor(cv));
+    double highest = 0;
+    bool haveNear = false;
+    for (long long j = j0 - 1; j <= j0 + 1; ++j) {
+        for (long long i = i0 - 1; i <= i0 + 1; ++i) {
+            const double knownNear = g_ground[GroundSlot(i, j)];
+            if (std::isnan(knownNear))
+                continue;
+            if (!haveNear || knownNear > highest)
+                highest = knownNear;
+            haveNear = true;
+        }
+    }
+    if (haveNear && height > highest + kAirClimbMetres * g_unitsPerMetre)
+        return;  // too far above the ground around here to be ground: a tire in the air
+    double& cell = g_ground[GroundSlot(i0, j0)];
+    cell = std::isnan(cell) ? height : cell + (height - cell) * kGroundKeep;
+}
+
+// What the game drew of the terrain this frame, turned into world heights (see FillTerrainFromDepth
+// below): the ground your tires haven't been on yet, which is what makes the air test answer for a
+// wheel the game never renders. The window's depth is the terrain as of the end of the terrain pass
+// (before your rider, your bike and the props are drawn over it), so the height it gives is the
+// bare ground, whatever stands on it not asked of it. A wheel resting on a prop is then read above
+// the ground there - which is why the two fields are combined with the higher of the two answers,
+// the ridden one having recorded the prop.
+size_t TerrainSlot(long long i, long long j)
+{
+    return static_cast<size_t>(MarkWrap(i, kTerrainSize)) * static_cast<size_t>(kTerrainSize) +
+           static_cast<size_t>(MarkWrap(j, kTerrainSize));
+}
+
+void ClearTerrainField()
+{
+    std::fill(g_terrain.begin(), g_terrain.end(), std::numeric_limits<double>::quiet_NaN());
+}
+
+// The seen terrain's height at the field's cell coordinates: the highest of the known cells in the
+// 3x3 around it. Highest rather than an average because the question this answers is whether a tire
+// clears the surface: a face that runs past the cell to one side is as much under the tire as the
+// cell itself, and an average of a ramp's two sides would sit above the ground the tire is on and
+// call it down.
+bool TerrainHeightAt(double cu, double cv, double& height)
+{
+    const long long i0 = static_cast<long long>(std::floor(cu));
+    const long long j0 = static_cast<long long>(std::floor(cv));
+    bool known = false;
+    for (long long j = j0 - 1; j <= j0 + 1; ++j) {
+        for (long long i = i0 - 1; i <= i0 + 1; ++i) {
+            const double seen = g_terrain[TerrainSlot(i, j)];
+            if (std::isnan(seen))
+                continue;
+            if (!known || seen > height)
+                height = seen;
+            known = true;
+        }
+    }
+    return known;
+}
+
+// Turns this frame's terrain depth into heights in the world. The depth is downsampled to a small
+// texture and read back once a frame (a few thousand samples: the whole window would be), and each
+// sample is put where it is in the world: the window's depth unprojected through the frame's
+// projection and view, the same reconstruction the shaders do. Samples where the line of sight runs
+// along the ground rather than meeting it are dropped: there a whole metre of height follows from a
+// rounding of the depth, so they'd write ground metres away from where it is.
+constexpr int    kSampleWidth   = 160;    // samples across the window
+constexpr int    kSampleHeight  = 90;     // and down
+constexpr double kTerrainGrazing = 0.12;  // a line of sight this close to the ground: dropped
+constexpr double kTerrainFarMetres = 60;  // m from the camera a sample may be and still be your
+                                          // ground: past it the depth is either the far plane, a
+                                          // hill over the sky, or too coarse to say anything where
+                                          // your wheels are
+std::vector<float> g_sample(kSampleWidth * kSampleHeight, 0.0f);
+bool g_sampleLogged = false;              // the first fill logs what it made, once, with g_airLogging
+bool g_sampleQuiet  = false;              // nothing accepted for a whole spell: stop trying
+int  g_sampleNothing = 0;                 // frames in a row that took no sample at all
+
+bool FillTerrainFromDepth()
+{
+    if (g_res.sampleFailed || g_sampleQuiet || !g_frame.haveView || g_res.terrainFbo == 0 ||
+        g_res.width <= 0 || g_res.height <= 0)
+        return false;
+    // The depth is read in whatever format the depth textures were made in, and remade if that
+    // changed with the window.
+    const int packing = g_res.depthMode <= 1 ? 1 : 0;
+    if (g_res.sampleDepth == 0 || g_res.samplePacking != packing) {
+        if (g_res.sampleDepth)
+            g_gl.DeleteTextures(1, &g_res.sampleDepth);
+        g_res.sampleDepth = packing ? NewTexture(kDepth24Stencil8, kSampleWidth, kSampleHeight, kDepthStencil,
+                                                 kUnsignedInt248, GL_NEAREST)
+                                    : NewTexture(kDepthComponent24, kSampleWidth, kSampleHeight, GL_DEPTH_COMPONENT,
+                                                 GL_UNSIGNED_INT, GL_NEAREST);
+        if (!g_res.sampleFbo)
+            g_gl.GenFramebuffers(1, &g_res.sampleFbo);
+        g_gl.BindFramebuffer(kFramebuffer, g_res.sampleFbo);
+        g_gl.FramebufferTexture2D(kFramebuffer, packing ? kDepthStencilAttachment : kDepthAttachment,
+                                  GL_TEXTURE_2D, g_res.sampleDepth, 0);
+        g_res.samplePacking = packing;
+        if (!g_res.sampleDepth || g_gl.CheckFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
+            g_res.sampleFailed = true;
+            Log("postfx: the ground can't be read from what the game drew of the terrain");
+            return false;
+        }
+    }
+    g_gl.BindFramebuffer(kReadFramebuffer, g_res.terrainFbo);
+    DrainErrors();  // the read below is checked: nothing of its own counted beforehand
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.sampleFbo);
+    g_gl.BlitFramebuffer(0, 0, g_res.width, g_res.height, 0, 0, kSampleWidth, kSampleHeight,
+                         GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    g_gl.BindFramebuffer(kReadFramebuffer, g_res.sampleFbo);
+    g_gl.ReadPixels(0, 0, kSampleWidth, kSampleHeight, GL_DEPTH_COMPONENT, GL_FLOAT, g_sample.data());
+    if (g_gl.GetError() != GL_NO_ERROR) {
+        g_res.sampleFailed = true;
+        Log("postfx: the ground can't be read from what the game drew of the terrain");
+        return false;
+    }
+    const float* proj = g_haveProjCamera ? g_projCamera : (g_haveProjOther ? g_projOther : nullptr);
+    if (!proj)
+        return false;
+    double P[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }, invP[16];
+    for (int i = 0; i < 16; ++i)
+        P[i] = proj[i];
+    if (!Invert(P, invP))
+        return false;
+    const Vec3 up = WorldUp();
+    Vec3 au, av;
+    PlaneAxes(au, av);
+    const double cell = kTerrainCellMetres * g_unitsPerMetre;
+    const Vec3 eyePosition = CameraPosition(g_frame.rendered);
+    int taken = 0;
+    for (int sy = 0; sy < kSampleHeight; ++sy) {
+        const double y = (static_cast<double>(sy) + 0.5) / kSampleHeight * 2.0 - 1.0;
+        for (int sx = 0; sx < kSampleWidth; ++sx) {
+            const float depth = g_sample[sy * kSampleWidth + sx];
+            if (depth >= 0.999999f)
+                continue;  // the sky: no ground there
+            const double x = (static_cast<double>(sx) + 0.5) / kSampleWidth * 2.0 - 1.0;
+            const double z = static_cast<double>(depth) * 2.0 - 1.0;
+            const double cw = invP[3] * x + invP[7] * y + invP[11] * z + invP[15];
+            if (std::fabs(cw) < 1e-9)
+                continue;
+            Vec3 eye{ (invP[0] * x + invP[4] * y + invP[8] * z + invP[12]) / cw,
+                      (invP[1] * x + invP[5] * y + invP[9] * z + invP[13]) / cw,
+                      (invP[2] * x + invP[6] * y + invP[10] * z + invP[14]) / cw };
+            const double length = Length(eye);
+            if (length < 1e-6)
+                continue;
+            // Where the line of sight meets the ground: dropped when it grazes it (see above).
+            const Vec3 sight = EyeToWorld(g_frame.rendered, Vec3{ eye.x / length, eye.y / length, eye.z / length });
+            if (std::fabs(Dot(sight, up)) < kTerrainGrazing)
+                continue;
+            const Vec3 here = eyePosition +
+                              EyeToWorld(g_frame.rendered, eye);  // the view is the camera's own: the
+                                                                   // rotation applied, plus the eye
+            const double height = Dot(here, up);
+            if (Length(here - eyePosition) > kTerrainFarMetres * g_unitsPerMetre)
+                continue;  // the far plane, or a hill seen over the sky: not near your wheels
+            g_terrain[TerrainSlot(static_cast<long long>(std::floor(Dot(here, au) / cell)),
+                                 static_cast<long long>(std::floor(Dot(here, av) / cell)))] = height;
+            ++taken;
+        }
+    }
+    if (taken == 0) {
+        if (++g_sampleNothing > 90 && !g_sampleQuiet) {
+            g_sampleQuiet = true;  // this game's depth can't be read: the ridden field answers alone
+            Log("postfx: the ground seen on screen is never read; the air test keeps to what you've "
+                "ridden and to the fall of your bike");
+        }
+        return false;
+    }
+    g_sampleNothing = 0;
+    if (g_airLogging && !g_sampleLogged) {
+        g_sampleLogged = true;
+        Log("postfx: the ground is read from what the game drew of the terrain: %d samples a frame", taken);
+    }
+    return true;
+}
+
+// After a cleared strip let fresh ground into the window, press back from the cache what was
+// ruted there: every cached segment crossing the strip [from, from + count) (unwrapped texels)
+// of the map's columns (axis 0) or rows (axis 1). The blocks are the index: a block whose box
+// misses the strip is skipped whole, so a whole session's ruts stay cheap to re-press whatever
+// the count. The stamps are the ones a fresh rut gets, so the re-pressed mark is identical to
+// what was there before the ground was wiped - no seam, no blur, whatever the turn. Max blend
+// cannot lower what the strip still holds, so a segment sticking out past the strip simply
+// re-lays its own rut where it also lies. The cache holds the whole session, so this is what
+// carries a lap's ruts across many wrap-arounds.
+void RepressCache(int axis, long long from, long long count)
+{
+    if (!g_mark.set)
+        return;
+    MarkMap& m = g_mark;
+    Program& stamp = g_res.programs[kStamp];
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendEquationSeparate(kFuncMax, kFuncMax);
+    g_gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+    g_gl.Uniform1f(stamp["u_check"], 0.0f);  // the cache only holds ruts the tires really pressed
+    g_gl.Uniform1f(stamp["u_fallback"], 1.0f);
+    const double stripLo = static_cast<double>(from), stripHi = static_cast<double>(from + count);
+    // A block's box holds its segments' contacts only, so the test is widened by the widest
+    // rut's half (the rear's, the wider of the two): a segment reaching into the strip from
+    // outside the box still gets pressed. In the map's texels.
+    const double widest = 0.12 * g_unitsPerMetre / m.texel;
+    for (int i = 0; i < 2; ++i) {
+        for (const MarkBlock& b : g_markCache[i]) {
+            const double bLo = axis == 0 ? b.minU - widest : b.minV - widest;
+            const double bHi = axis == 0 ? b.maxU + widest : b.maxV + widest;
+            if (bHi < stripLo || bLo > stripHi)
+                continue;  // the whole block is clear of the strip: its segments can't be in it
+            for (const MarkSeg& s : b.segs) {
+                const double hw = s.halfWidth * g_unitsPerMetre / m.texel;
+                const double lo = axis == 0 ? std::fmin(s.au, s.bu) - hw : std::fmin(s.av, s.bv) - hw;
+                const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
+                if (hi < stripLo || lo > stripHi)
+                    continue;
+                Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw, s.strength);
+            }
+        }
+    }
+    g_gl.Disable(GL_BLEND);
+}
+
+// Your bike's own vertical acceleration, in g (negative falling, free fall: -1) ------------------
+// The wheels aren't rigid: they hang off the bike and the terrain, and in first person they're
+// stood in from it at all, so the contact's path is the noisiest sample there is. Your bike's own
+// origin is a single rigid body, so where the tracker has it, its height's acceleration is the
+// same answer steadier: the same least-squares fit motion.h keeps for the same reason. It's fit
+// here from the pose's positions rather than read off the pose, which fits over metres while the
+// world is in the mod's units, and the two signals then can't drift apart in scale.
+MotionFit    g_bikeAirFit;                    // the bike's origins, to fit its fall through
+Vec3         g_bikeLast;                      // its origin last frame, to see a cut
+double       g_bikeFallG = 0;                 // that acceleration along WorldUp, in g
+bool         g_bikeHave = false;              // whether it was fit this frame
+void UpdateBikeFall()
+{
+    const bike::Pose& pose = bike::Current();
+    if (!pose.tracked) {
+        g_bikeAirFit.Reset();
+        g_bikeHave = false;
+        g_bikeFallG = 0;
+        return;
+    }
+    const Vec3 here{ pose.worldPosition[0], pose.worldPosition[1], pose.worldPosition[2] };
+    if (g_bikeHave && std::fabs(Dot(here, WorldUp()) -
+                        Dot(g_bikeLast, WorldUp())) > kAirTeleportMetres * g_unitsPerMetre)
+        g_bikeAirFit.Reset();  // a cut or a respawn: don't fit the jump between the two places
+    g_bikeLast = here;
+    g_bikeAirFit.Add(g_markTime, here);
+    Vec3 velocity, accel;
+    if (!g_bikeAirFit.Estimate(kAirFitWindow, velocity, accel)) {
+        g_bikeHave = false;
+        g_bikeFallG = 0;
+        return;
+    }
+    const double gravity = kGravity * g_unitsPerMetre;  // the game's gravity, game units/s^2
+    g_bikeFallG = Clamp(Dot(accel, WorldUp()) / gravity, -kAirMaxG, kAirMaxG);
+    g_bikeHave = true;
+}
+
+// Moves the window with you, re-presses from the cache what the clearing wiped where fresh
+// ground came in, and presses this frame's grooves into the map. Returns whether the map is
+// usable.
+// Whether a wheel's tire is on the ground this frame, and where its rut may press -------------
+bool UpdateMarks(double dt)
 {
     const Config& cfg = GetConfig();
     if (cfg.tireMarks <= 0.0 || !g_frame.haveView || !EnsureMarks())
         return false;
+    g_markTime += dt;  // the clock the fits' samples are stamped with
     Program& p = Use(kStamp);
     (void)p;
     g_gl.Enable(GL_SCISSOR_TEST);
     g_gl.Disable(GL_BLEND);
     if (!g_res.marksCleared) {
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
+        ClearMarks(g_res.marks, 0, 0, g_mark.size, g_mark.size);
         g_res.marksCleared = true;
-        g_markWindow.set = false;
+        g_mark.set = false;
     }
     Vec3 u, v;
     PlaneAxes(u, v);
     const Vec3 eye = CameraPosition(g_frame.raw);
-    MarkWindow& m = g_markWindow;
-    const double texel = 0.04 * g_unitsPerMetre;
-    if (std::fabs(texel - g_markTexel) > 0.1 * texel) {  // the game's unit was measured: start over at 4 cm
-        g_markTexel = texel;
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
-        m.set = false;
-        for (Wheel& w : g_wheels)
+    const double texel = 0.04 * g_unitsPerMetre;  // where the map's texels are, game units
+    if (g_unitsLocked && std::fabs(texel - g_mark.texel) > 0.1 * texel) {
+        // The unit has settled somewhere other than where the map was laid out: start over at
+        // 4 cm. Gated on the unit being locked: while it's still being measured it drifts a
+        // little every frame, and re-laying on those blips wiped every mark mid-ride. The cache
+        // goes with it: its widths are in the unit the map was laid out in.
+        g_mark.texel = texel;
+        ClearMarks(g_res.marks, 0, 0, g_mark.size, g_mark.size);
+        g_mark.set = false;
+        for (Wheel& w : g_wheels) {
             w.haveLast = false;
+            w.fit.Reset();        // its positions are in game units as well
+            w.heightVel = 0;
+            w.heightAccel = 0;
+            w.fallG = 0;
+            w.airScore = 0;
+            w.airPeak = 0;
+            w.grounded = true;
+        }
+        ClearMarkCache();
+        ClearGroundField();   // its heights are in game units as well
+        ClearTerrainField();
+        g_bikeAirFit.Reset();
+        g_bikeHave = false;
+        g_bikeFallG = 0;
     }
-    const long long cu = static_cast<long long>(std::floor(Dot(eye, u) / g_markTexel));
-    const long long cv = static_cast<long long>(std::floor(Dot(eye, v) / g_markTexel));
+    MarkMap& m = g_mark;
+    const double uCam = Dot(eye, u), vCam = Dot(eye, v);
+    const long long cu = static_cast<long long>(std::floor(uCam / m.texel));
+    const long long cv = static_cast<long long>(std::floor(vCam / m.texel));
     if (!m.set) {
-        m.originU = cu - kMarkSize / 2;
-        m.originV = cv - kMarkSize / 2;
+        m.originU = cu - m.size / 2;
+        m.originV = cv - m.size / 2;
         m.set = true;
-        ClearMarks(0, 0, kMarkSize, kMarkSize);
+        ClearMarks(g_res.marks, 0, 0, m.size, m.size);
     }
-    // Keep yourself in the middle half of the window.
+    // Stay centred on the camera, and move only as far as that asks, at most a sixteenth of the
+    // map at a time (the old snap to the centre at every threshold cleared up to a quarter of
+    // the map in one go, of ground only a quarter behind you - visible again straight after a
+    // U-turn). Whatever the clearing wipes there, the cache re-presses right after, so a mark
+    // can never be cut where ground is reused: a U-turn comes back to last lap's ruts whole.
+    const long long slack = m.size / 16;
     const long long du = cu - m.originU, dv = cv - m.originV;
-    if (du < kMarkSize / 4 || du > 3 * kMarkSize / 4) {
-        const long long shift = du - kMarkSize / 2;
-        ClearBand(0, shift > 0 ? m.originU + kMarkSize : m.originU + shift, shift > 0 ? shift : -shift);
+    if (du < m.size / 2 - slack || du > m.size / 2 + slack) {
+        const long long shift = du > m.size / 2 + slack ? du - (m.size / 2 + slack) : du - (m.size / 2 - slack);
+        const long long from = shift > 0 ? m.originU + m.size : m.originU + shift;
+        const long long count = shift > 0 ? shift : -shift;
+        ClearBand(0, g_res.marks, m, from, count);
+        RepressCache(0, from, count);
         m.originU += shift;
     }
-    if (dv < kMarkSize / 4 || dv > 3 * kMarkSize / 4) {
-        const long long shift = dv - kMarkSize / 2;
-        ClearBand(1, shift > 0 ? m.originV + kMarkSize : m.originV + shift, shift > 0 ? shift : -shift);
+    if (dv < m.size / 2 - slack || dv > m.size / 2 + slack) {
+        const long long shift = dv > m.size / 2 + slack ? dv - (m.size / 2 + slack) : dv - (m.size / 2 - slack);
+        const long long from = shift > 0 ? m.originV + m.size : m.originV + shift;
+        const long long count = shift > 0 ? shift : -shift;
+        ClearBand(1, g_res.marks, m, from, count);
+        RepressCache(1, from, count);
         m.originV += shift;
     }
-    // The grooves: from each wheel's last contact with the ground to this one, only where the tire
-    // is down on the ground: checked against the terrain on screen (its depth, taken before anything
-    // stood on it), else (off screen) by whether the bike is falling freely.
+    // The grooves: from each wheel's last contact with the ground to this one, pressed only where
+    // the tire is down on it - and both answers must agree: the terrain's depth where the game drew
+    // that wheel (exact, but it exists only there), and this wheel's own world-space answer from its
+    // height (below), which is what answers in first person, where the wheels sit behind and under
+    // the camera and are hardly drawn at all. As the tire rises so does the camera, so the one pixel
+    // the screen does read of a tire in the air holds far-ahead ground at the tire's height and
+    // calls it down; the world's answer has to hold as well, so it gates the whole groove.
     g_gl.Enable(GL_BLEND);
     g_gl.BlendEquationSeparate(kFuncMax, kFuncMax);
     g_gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
@@ -2857,50 +3532,198 @@ bool UpdateMarks()
     const bool checkGround = g_frame.terrainSnapshot && g_res.terrainDepth != 0;
     Bind(stamp, "u_ground", 0, checkGround ? g_res.terrainDepth : 0);
     g_gl.Uniform1f(stamp["u_check"], checkGround ? 1.0f : 0.0f);
-    g_gl.Uniform1f(stamp["u_fallback"], g_air.airborne ? 0.0f : 1.0f);
     g_gl.Uniform1f(stamp["u_groundTol"], static_cast<float>(0.15 * g_unitsPerMetre));
     Vec(stamp, "u_upView", Normalize(WorldToEye(g_frame.rendered, WorldUp())));
+    const Vec3 up = WorldUp();
+    const double gravity = kGravity * g_unitsPerMetre;  // the game's gravity, game units/s^2
+    // Your bike's own fall, before the wheels' so both answers are this frame's.
+    UpdateBikeFall();
     for (int i = 0; i < 2; ++i) {
         Wheel& w = g_wheels[i];
         if (!w.on) {
-            w.haveLast = false;
+            // A moment off the tracker (a frame without a heading, a part that went away)
+            // keeps the wheel's last contact: coming back, the rut joins up instead of leaving
+            // a gap. Only a wheel off for over three quarters of a second forgets it.
+            w.off += dt;
+            if (w.off > 0.75)
+                w.haveLast = false;
+            w.fit.Reset();     // its contact isn't trusted while the wheel is off the tracker
+            w.fallG = 0;
+            w.heightAccel = 0;
             continue;
         }
+        w.off = 0.0;
         const Vec3 contact = w.contact;
-        const double tu = Dot(contact, u) / g_markTexel, tv = Dot(contact, v) / g_markTexel;
-        // Off the trail sideways (along it as far as it went, across it no more than a slide or the
-        // turn can take it): a moment the wheel followed was someone else's wheel alongside, or the
-        // wheel placed from a bike found a little off. Joined up, those drew a second trail beside
-        // yours and squiggles across it: not stamped. Only if it stays there a third of a second, and
-        // under your rider, does a trail start there (you went that way after all).
-        if (w.haveLast && g_rider.haveHeading) {
-            const Vec3 worldUp = WorldUp();
-            Vec3 side = Cross(g_rider.heading, worldUp);
-            const Vec3 step = contact - w.lastContact;
-            if (Length(side) > 1e-6 && Length(step) < 2.5 * g_unitsPerMetre) {
-                side = Normalize(side);
-                const double across = std::fabs(Dot(step, side));
-                const double along = std::fabs(Dot(step, g_rider.heading));
-                if (across > 0.12 * g_unitsPerMetre + 0.6 * along) {
-                    const double underRider = std::fabs(Dot(contact - g_rider.position, side));
-                    if (++w.trailSkipped < 20 || underRider > 0.45 * g_unitsPerMetre)
-                        continue;  // (the last contact kept: the trail goes on from it when it's back)
-                    w.haveLast = false;  // a new trail from here
-                }
+        const double tu = Dot(contact, u) / m.texel, tv = Dot(contact, v) / m.texel;
+        // Where its tire is on the ground, in the world (see the height field above, and your bike's
+        // fall just above this): a state that holds rather than a number that flips, read only from
+        // the tire's own path and your bike's own height - it asks nothing of the screen, which is
+        // what makes it work in first person, where the wheels sit behind and under the camera and
+        // are barely drawn at all, and the one pixel the screen does read of a rising tire holds
+        // ground far ahead at the tire's height and would call it down. A tire rolling follows the
+        // face it's on, a plane, so its height hardly accelerates; a tire in the air traces a
+        // parabola at the game's gravity all through the flight. Both are fit, and the fall is only
+        // believed when they both say so: alone, the wheel's own path said fall where there was
+        // none (a rough stretch of ground, in 1st person where the wheels are stood in from your
+        // bike and their height swings as it pitches) and none where there was one, so first
+        // person took the tires off the ground late and put them back in the middle of a flight,
+        // and the rut carried on being pressed under a wheel in the air while third person,
+        // reading the drawn rider's wheels, got the same jump right.
+        // Down to off the ground: that fall, held to kAirScoreAir - on its own, whatever the ground
+        // near there says - or that far above the ground near here at once, which only a launch does.
+        // Off to down: the fall's hold gone under kAirScoreDown, which a landing does by itself since
+        // nothing is falling any more then (kAirLandedDrain), or the tire at the ground near here
+        // having lost half of the hold its flight reached (kAirScoreAir only: that's the number the
+        // flip asks for too, and the state flapped back through the lip within two frames of the
+        // launch, which put the rut back on under a wheel in the air).
+        {
+            const bool wasGrounded = w.grounded;
+            const double cell = kGroundCellMetres * g_unitsPerMetre;  // a field cell, game units
+            const double height = Dot(contact, up);
+            w.fit.Add(g_markTime, contact);
+            Vec3 fitVel, fitAcc;
+            if (w.fit.Estimate(kAirFitWindow, fitVel, fitAcc)) {
+                w.heightVel = Dot(fitVel, up);
+                w.heightAccel = Dot(fitAcc, up);
+                w.fallG = Clamp(w.heightAccel / gravity, -kAirMaxG, kAirMaxG);
+            } else {
+                // Not enough samples yet (the wheel just came back, the fit just started over):
+                // no fall is being read, so nothing can be decided from it.
+                w.heightAccel = 0;
+                w.fallG = 0;
+            }
+            // The deeper of the tire's own fall and your bike's: a tire rolling follows the face
+            // it's on, a plane, so its height hardly accelerates, and a tire in the air traces a
+            // parabola accelerating at the game's gravity through the whole flight, the launch's
+            // rise through the drop. Your bike is the same parabola read off a rigid body rather
+            // than off a wheel that hangs off it and swings with its pitch, which is the difference
+            // that makes first person agree with third: read from the wheel alone, first person
+            // saw a fall where there was none and none where there was one, so the rut carried on
+            // under a wheel in the air.
+            const double fallG = g_bikeHave ? std::fmin(w.fallG, g_bikeFallG) : w.fallG;
+            // Both must agree that it is a free fall before one is believed: a rough stretch of
+            // ground puts a whole gravity of fall into a wheel's own fitted path while your bike,
+            // which is what actually left or didn't leave the ground, stays shallow, and the tire
+            // was at the ground near there every frame of it.
+            const bool bothFall = w.fallG < -kAirFreeFallG &&
+                                  (!g_bikeHave || g_bikeFallG < -kAirFreeFallG);
+            // Out of free fall at all, in both readings: the landing. Not the slam the contact makes
+            // (see the note by kAirLandedDrain).
+            const bool outOfFall = w.fallG > -kAirBackG && (!g_bikeHave || g_bikeFallG > -kAirBackG);
+            const double fcu = Dot(contact, u) / cell, fcv = Dot(contact, v) / cell;
+            double ridden = 0;
+            const bool riddenKnown = GroundHeightAt(fcu, fcv, ridden);  // what your tires pressed here
+            const double seenCell = kTerrainCellMetres * g_unitsPerMetre;
+            double seen = 0;
+            const bool seenKnown = TerrainHeightAt(Dot(contact, u) / seenCell, Dot(contact, v) / seenCell,
+                                                   seen);  // the bare ground the game drew here, ahead of you
+            // The seen and the ridden heights are never merged into one face, which is what one
+            // would reach for to make the answer geometric either way: in the middle of a flight the
+            // two disagree, and the seen one is then read as the ground the tire is on. The log of
+            // the run this was read from shows what that did (a wheel back on the ground with its
+            // own and your bike's fall still a whole gravity deep, its hold drained, the rut re-
+            // pressed under it a third of the way through a jump), which is why the seen field is
+            // asked only the question it can't get wrong in that direction: does the tire CLEAR the
+            // bare ground there. A face standing over it (a ramp, a crate, the tire's own lip) makes
+            // that answer no, never a false yes, so this half can only ever add air. Asking it
+            // "is the tire on that ground" is the question that lies in flight - what the camera saw
+            // at this column isn't the face under a wheel it barely draws - so going down stays with
+            // the readings and with the ridden field, which recorded the face your tire pressed.
+            const double seenGap = height - seen;      // game units above the ground the game drew here
+            const double riddenGap = height - ridden;  // and above what your tires pressed here
+            // Clear of the ground near here, in either field: only this far above the bare terrain
+            // the game drew, or this far above what your tires last pressed, counts as clearing it.
+            // It has to be a band rather than a line because the contact isn't a clean sample: the
+            // game's suspension compresses a wheel, and a wheel stood in from your bike reads within
+            // tens of centimetres of the face it rolls on whatever its pitch, so a rolling wheel has
+            // to be allowed that much of slack or it would be read clear all along a rough stretch.
+            // Nothing is said the other way here (see the note above about the seen field): going
+            // down is the readings' answer, so there's no number for how close to a surface a tire
+            // counts as being on it.
+            const bool riddenClear = riddenKnown && riddenGap > kAirClearMetres * g_unitsPerMetre;
+            // The seen field's clearance only where the ridden one doesn't speak: where your tires
+            // have pressed near here, that answer is the nearer face and already says how far the
+            // tire is from it, whereas the seen one would read a tire on a bridge or on high ground
+            // as clear of the bare terrain the terrain pass drew under it, and hold it off the ground
+            // after a few frames of rolling there. Past that face the seen field's the only one that
+            // knows the surface at all, which is what answers for a wheel the game never renders.
+            const bool seenClear = seenKnown && !riddenKnown && seenGap > kAirClearMetres * g_unitsPerMetre;
+            const bool clear = riddenClear || seenClear;
+            w.gap = riddenGap;
+            w.gapKnown = riddenKnown;
+            // The fall's hold, integrated rather than counted at one number: a tire known to clear
+            // the ground gains a whole gravity of it whatever its fitted fall says (this is what cuts
+            // the rut at the lip rather than a fit's window past it, and what answers in first person
+            // where the readings are all the wheel's height has), and one that isn't known to gains
+            // only what the fitted fall of the tire and your bike says, and only where both call a
+            // free fall. Either way a whole second of it makes a hold of 1. The hold is lost by the
+            // readings, not by either height field (see the note by kAirLandedDrain): a height
+            // field's idea of where the tire is is never what ends a flight.
+            if (clear || std::fabs(fallG) < kAirSpikG)
+                w.airScore = Clamp(w.airScore + dt * ((clear ? 1.0
+                                                            : (bothFall ? std::fmin(-fallG, 1.0)
+                                                                      : 0.0)) * kAirScoreGain -
+                                                      (outOfFall ? kAirLandedDrain : kAirScoreDrain)),
+                                   0.0, 1.0);
+            const bool falling = w.airScore > kAirScoreAir;
+            if (w.grounded) {
+                if (w.airScore < kAirScoreDown)
+                    GroundWrite(fcu, fcv, height);  // only a pressing tire's height goes in
+                w.airPeak = 0.0;                    // nothing of a flight to keep while it's down
+                if (falling || (riddenKnown && riddenGap > kAirClimbMetres * g_unitsPerMetre))
+                    w.grounded = false;  // its height has fallen freely for long enough
+            } else if (w.airScore < kAirScoreDown ||
+                       (riddenKnown && std::fabs(riddenGap) < kAirGap * g_unitsPerMetre &&
+                        w.airScore <= 0.5 * w.airPeak)) {
+                // landed: the fall's hold is gone, or the tire is back at the ground it last
+                // pressed near here and has lost half of whatever its flight held (asked for the
+                // hold to be under kAirScoreAir instead, the same number the flip asks for, the
+                // state flapped back through the lip two frames after the launch and pressed the
+                // rut on under a wheel in the air). Only the ridden field answers this: the seen
+                // one knows the bare terrain ahead of you, which sits under a tire in the middle
+                // of a flight, and calling it down there pressed the rut through whole jumps.
+                w.grounded = true;
+                GroundWrite(fcu, fcv, height);
+            } else if (w.airScore > w.airPeak)
+                w.airPeak = w.airScore;  // what this flight holds, to be lost by half to land
+            if (g_airLogging && w.grounded != wasGrounded && g_airLogLines < kAirLogLinesMax) {
+                ++g_airLogLines;
+                Log("postfx: tire marks: wheel %d %s the ground: it was %+.2f m above the height of "
+                    "the ground near here%s, the deeper of its own and your bike's fall was %+.2f g "
+                    "with the fall held to %+.2f (the tire's %+.2f g, the bike's %+.2f g, %s)",
+                    i, w.grounded ? "back on" : "off", (riddenKnown ? riddenGap : seenGap) / g_unitsPerMetre,
+                    riddenKnown ? "" : (seenKnown ? " (of ground seen on screen, never ridden here)"
+                                                  : " (of ground never seen nor ridden this close)"),
+                    fallG, w.airScore, w.fallG,
+                    g_bikeFallG, g_bikeHave ? "bike tracked" : "bike not tracked");
             }
         }
-        w.trailSkipped = 0;
         if (w.haveLast) {
-            const double step = std::hypot(tu - w.lastU, tv - w.lastV) * g_markTexel;
+            const double step = std::hypot(tu - w.lastU, tv - w.lastV) * m.texel;
             if (step > 2.5 * g_unitsPerMetre) {  // a respawn: don't join it up
                 w.haveLast = false;
             } else if (step < 0.01 * g_unitsPerMetre) {
                 continue;  // standing still: keep the last contact
             } else {
                 // Rear: a 240 mm rut (the tire digs and throws dirt aside), front: 180 mm, shallower.
+                // Stamped at the rut's true world width: the map's texels are 4 cm, so it's
+                // several texels across and the fresh line comes out smooth by construction.
                 Vec(stamp, "u_eyeA", TransformPoint(g_frame.rendered, w.lastContact));
                 Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, contact));
-                Groove(w.lastU, w.lastV, tu, tv, (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre / g_markTexel, i == 0 ? 1.0 : 0.7);
+                const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
+                const double strength = i == 0 ? 1.0 : 0.7;
+                // This wheel's own answer, which gates the whole groove: in the air it presses
+                // nothing, wherever the screen looks. Where it says down, the parts of the groove
+                // the screen can see are checked against the terrain's depth as well.
+                g_gl.Uniform1f(stamp["u_fallback"], w.grounded ? 1.0f : 0.0f);
+                Groove(g_res.marks, m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength);
+                // Into the cache too: when this ground comes back through the window's edge,
+                // the same segment is pressed again, so marks stay wherever you've ridden this
+                // session, however many times the window wrapped around since. Ruts the tires
+                // didn't really press aren't cached - they'd be re-pressed wherever the ground
+                // is reused. Oldest segments go only once the cap is reached.
+                if (w.grounded)
+                    PushMark(i, MarkSeg{ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
             }
         }
         w.lastU = tu;
@@ -2908,6 +3731,33 @@ bool UpdateMarks()
         w.lastContact = contact;
         w.haveLast = true;
     }
+    // What the marks' air test reads, whatever it makes up to decide: while rolling this should
+    // read a shallow fall (well under kAirFreeFallG) and no hold at all, and in a jump about -1 g
+    // with a hold that climbs past kAirScoreAir at the lip and stays up all the way through the
+    // flight - the first two seconds of riding, and every tenth second while any hold is being read,
+    // so the whole of a jump the user has just made is in the log beside the marks it made. The
+    // bike's own reading is printed as well: where the two disagree is what the answer came from.
+    // Only with g_airLogging on, the whole of this block being the watching of the test.
+    g_airReadTimer += dt;
+    if (g_airLogging && g_airReadLines < kAirReadLinesMax && g_airReadTimer >= kAirReadEvery &&
+        (g_airReadLines < 20 || g_wheels[0].airScore > 0.0 || g_wheels[1].airScore > 0.0)) {
+        g_airReadTimer = 0;
+        ++g_airReadLines;
+        Log("postfx: tire marks: air readout: rear %s%s: %+.2f g, fall %+.2f, gap %+.2f m%s; "
+            "front %s%s: %+.2f g, fall %+.2f, gap %+.2f m%s; your bike %+.2f g%s",
+            g_wheels[0].on ? "on the tracker" : "off it",
+            g_wheels[0].grounded ? ", down" : ", IN THE AIR",
+            g_wheels[0].fallG, g_wheels[0].airScore,
+            g_wheels[0].gap / g_unitsPerMetre, g_wheels[0].gapKnown ? "" : ", ground not known here",
+            g_wheels[1].on ? "on the tracker" : "off it",
+            g_wheels[1].grounded ? ", down" : ", IN THE AIR",
+            g_wheels[1].fallG, g_wheels[1].airScore,
+            g_wheels[1].gap / g_unitsPerMetre, g_wheels[1].gapKnown ? "" : ", ground not known here",
+            g_bikeFallG, g_bikeHave ? "" : ", your bike not tracked");
+    }
+    // Nothing else is forgotten: the cache keeps the whole session (the cap above trims the
+    // oldest), so riding the far end of a large track and coming back re-presses whatever you
+    // made there, however many times the window wrapped around in between.
     g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
     g_gl.Disable(GL_BLEND);
     g_gl.Disable(GL_SCISSOR_TEST);
@@ -3000,7 +3850,7 @@ void Render(int w, int h)
     ToFloat(haveInverse ? invP : P, g_m.invProj, 16);
     g_m.texel[0] = 1.0f / w;
     g_m.texel[1] = 1.0f / h;
-    const bool marksOn = UpdateMarks();  // after the matrices: the grooves check the ground on screen
+    const bool marksOn = UpdateMarks(dt);  // after the matrices: the grooves check the ground on screen
 
     const double* V = g_frame.rendered;
     if (g_frame.haveLight) {
@@ -3101,7 +3951,7 @@ void Render(int w, int h)
                            static_cast<float>((kBottomDeg - topDeg) * 0.5 * kDegToRad));
             g_gl.Uniform1f(p["u_headReach"], static_cast<float>(Clamp(1.0 + cfg.headlightAimDeg / 15.0, 0.6, 2.0)));
         }
-        // Tire marks: where the map's window is, from the camera, in the map's texels.
+        // Tire marks: where the map's window is, from the camera, in its own texels.
         Bind(p, "u_markMap", 6, marksOn ? g_res.marks.tex : 0);
         Bind(p, "u_wheelMask", 7, g_wheelMask.drawn ? g_res.wheelDepth : 0);
         g_gl.Uniform1f(p["u_wheelMaskOn"], g_wheelMask.drawn ? 1.0f : 0.0f);
@@ -3110,16 +3960,17 @@ void Render(int w, int h)
             Vec3 mu, mv;
             PlaneAxes(mu, mv);
             const Vec3 camera = CameraPosition(V);
-            g_gl.Uniform2f(p["u_markCam"], static_cast<float>(Dot(camera, mu) / g_markTexel - static_cast<double>(g_markWindow.originU)),
-                           static_cast<float>(Dot(camera, mv) / g_markTexel - static_cast<double>(g_markWindow.originV)));
-            g_gl.Uniform2f(p["u_markPhys"], static_cast<float>(MarkWrap(g_markWindow.originU)),
-                           static_cast<float>(MarkWrap(g_markWindow.originV)));
+            const double camU = Dot(camera, mu), camV = Dot(camera, mv);
+            g_gl.Uniform2f(p["u_markCam"], static_cast<float>(camU / g_mark.texel - static_cast<double>(g_mark.originU)),
+                           static_cast<float>(camV / g_mark.texel - static_cast<double>(g_mark.originV)));
+            g_gl.Uniform2f(p["u_markPhys"], static_cast<float>(MarkWrap(g_mark.originU, g_mark.size)),
+                           static_cast<float>(MarkWrap(g_mark.originV, g_mark.size)));
             Vec(p, "u_markU", WorldToEye(V, mu));
             Vec(p, "u_markV", WorldToEye(V, mv));
             Vec(p, "u_markUW", mu);
             Vec(p, "u_markVW", mv);
-            g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_markTexel));
-            g_gl.Uniform1f(p["u_markSize"], static_cast<float>(kMarkSize));
+            g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_mark.texel));
+            g_gl.Uniform1f(p["u_markSize"], static_cast<float>(g_mark.size));
         }
         // Tire dirt: each wheel's own space (its axle along x, turning with it) from the camera's.
         g_gl.Uniform1f(p["u_tireDirt"], static_cast<float>(cfg.tireDirt));
@@ -4055,8 +4906,11 @@ void TerrainPassDone()
     SavedState saved;
     Save(saved);
     PrepareState();
-    if (EnsureResources(w, h) && CaptureDepth(g_res.terrainFbo, g_res.terrainDepth))
+    if (EnsureResources(w, h) && CaptureDepth(g_res.terrainFbo, g_res.terrainDepth)) {
         g_frame.terrainSnapshot = true;
+        if (cfg.tireMarks > 0.0)
+            FillTerrainFromDepth();  // the ground ahead of you, for the marks' air test
+    }
     Restore(saved);
 }
 
@@ -4193,6 +5047,39 @@ bool GetOwnAnchors(OwnAnchors& out)
     out.unitsPerMetre = g_unitsPerMetre;
     out.thirdPerson = g_thirdPerson;
     return out.bike || out.torso;
+}
+
+// A new track was loaded (proc_hooks.cpp: the game sent its heightmap a new u_spacing / u_heights_dim_inv
+// when one loads, the same moment terrain.cpp forgets its map of the ground). Everything the marks
+// know belongs to the track that was just left: the map of the ground around you, the cache of your
+// ruts - which is what re-presses them wherever ground is reused, so kept, they'd be pressed back
+// where they were never made - the heights your tires recorded, and the terrain read off the screen.
+// Setting the map unset is enough to have it cleared and laid out fresh at the next frame's camera.
+void MarksNewTrack()
+{
+    if (!g_mark.set && g_markCache[0].empty() && g_markCache[1].empty())
+        return;  // nothing was learnt about a ground: the marks are as fresh as the new track's
+    g_mark.set = false;
+    for (Wheel& w : g_wheels) {
+        w.haveLast = false;
+        w.fit.Reset();    // its positions are in the old track's world as well
+        w.heightVel = 0;
+        w.heightAccel = 0;
+        w.fallG = 0;
+        w.airScore = 0;
+        w.airPeak = 0;
+        w.grounded = true;
+        w.gap = 0;
+        w.gapKnown = false;
+    }
+    ClearMarkCache();
+    ClearGroundField();
+    ClearTerrainField();
+    g_bikeAirFit.Reset();
+    g_bikeHave = false;
+    g_bikeFallG = 0;
+    Log("postfx: tire marks: a new track: its ground is empty and the ruts of the one before "
+        "forgotten, as are the heights your tires recorded and the terrain's own");
 }
 
 const char* TireStatusText()

@@ -1544,6 +1544,7 @@ void NoteTerrainUniform(GLint location, GLsizei count, const GLfloat* value, int
             last[0] = value[0];
             last[1] = second;
             terrain::ResetMap();
+            postfx::MarksNewTrack();  // the ground of the marks is another track's as well
             g_variants.clear();
             g_loggedBigCasters = 0;  // (another track: log what's left out of it too)
             Log("terrain: %s = %g %g (a new heightmap)", location == u.spacing ? kSpacingUniform : kHeightsDimUniform,
@@ -1680,6 +1681,10 @@ void FinishTerrainPass()
         return;
     if (g_program != g_mapProgram) {
         terrain::ResetMap();
+        // The whole terrain was built again by another program: the ground is not the one the marks
+        // were pressed in, however equal its heightmap's numbers came in (a track whose spacing and
+        // width match the one before is otherwise missed).
+        postfx::MarksNewTrack();
         g_variants.clear();
         g_mapProgram = g_program;
     }

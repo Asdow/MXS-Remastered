@@ -347,28 +347,53 @@ float ValueNoise(vec3 p)
     float d = mix(Hash13(i + vec3(0, 1, 1)), Hash13(i + vec3(1, 1, 1)), f.x);
     return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
 }
+)GLSL" R"GLSL(
+// How far inside the map's window this is (m), and how much of the map is used there: the
+// ruts hold on until the window's edge and fade out over the last kMarkBlend metres before
+// it. What the window's wrap-around cleared is not lost: postfx.cpp keeps the ruts you
+// pressed in a cache and re-presses them into the fresh strip the window lets in, with the
+// very same stamps a rut gets when it's first dug - so a mark never ends on a line where
+// ground is reused, and last lap's ruts come back whole after a U-turn.
+const float kMarkBlend = 60.0;
 
-float MarkAt(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
+float MarkNear(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
+
+// How much groove is at t, the fullest of the four texels next to it (its edges come from where
+// a neighbour holds a groove and this one little), and how much more there is to the right and
+// above: the groove's sides are lit as slopes from those two differences.
+vec4 MarkStatsNear(vec2 t)
+{
+    float m = MarkNear(t);
+    return vec4(m, max(max(MarkNear(t + vec2(2.0, 0.0)), MarkNear(t - vec2(2.0, 0.0))),
+                     max(MarkNear(t + vec2(0.0, 2.0)), MarkNear(t - vec2(0.0, 2.0)))),
+             MarkNear(t + vec2(1.0, 0.0)) - MarkNear(t - vec2(1.0, 0.0)),
+             MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0)));
+}
 
 // Ruts your tires dug into the ground: a groove of darker, packed and damp dirt with the knobs'
-// blocks pressed into its floor, its sides lit by the sun like any slope, and loose dirt thrown up
-// along both edges.
+// blocks pressed into its floor, its sides lit by the sun like any slope, and loose dirt thrown
+// up along both edges. The map only covers the window around you: its own ruts, and whatever the
+// cache re-pressed into ground the window reused, and what's left thins out over the last kMarkBlend
+// metres before the window's edge instead of ending on a line.
 vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
 {
-    vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / u_markTexel;
-    if (any(lessThan(t, vec2(3.0))) || any(greaterThan(t, vec2(u_markSize - 3.0))))
+    vec2 g = vec2(dot(p, u_markU), dot(p, u_markV));  // this pixel on the ground's plane, game units
+    vec2 t = u_markCam + g / u_markTexel;             // in the map's texels
+    // How far inside the window this is (m), and how much of the map counts there: the last
+    // kMarkBlend metres before its edge fade out.
+    float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
+    float wNear = smoothstep(0.0, kMarkBlend, inNear);
+    if (wNear < 0.004)
         return c;
-    float m = MarkAt(t);
-    // The edges: where the groove's neighbourhood holds a groove but this texel little of it.
-    float around = max(max(MarkAt(t + vec2(2.0, 0.0)), MarkAt(t - vec2(2.0, 0.0))),
-                       max(MarkAt(t + vec2(0.0, 2.0)), MarkAt(t - vec2(0.0, 2.0))));
+    vec4 sNear = MarkStatsNear(t);
+    float m = sNear.x * wNear, around = sNear.y * wNear, gx = sNear.z * wNear, gy = sNear.w * wNear;
+    float texel = u_markTexel;
+    around = max(around, m);
     if (m < 0.004 && around < 0.004)
         return c;
-    float gx = MarkAt(t + vec2(1.0, 0.0)) - MarkAt(t - vec2(1.0, 0.0));
-    float gy = MarkAt(t + vec2(0.0, 1.0)) - MarkAt(t - vec2(0.0, 1.0));
     float k = u_marks;
     // 7 cm deep in the middle: the normal tips with the groove's sides.
-    vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * u_metre * k / (2.0 * u_markTexel));
+    vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * u_metre * k / (2.0 * texel));
     vec3 nd = normalize(n + slope);
     float before = max(dot(n, u_lightWorld), 0.0) * 0.75 + 0.35;
     float after = max(dot(nd, u_lightWorld), 0.0) * 0.75 + 0.35;
@@ -639,12 +664,20 @@ uniform float u_strength;
 uniform vec3  u_eyeA, u_eyeB;   // the two contacts (view space): pressed only where the tire is down
 uniform sampler2D u_ground;     // the terrain's depth, before anything stood on it
 uniform float u_check;          // 1: check against it on screen
-uniform float u_fallback;       // off screen: 1 on the ground, 0 in the air
+uniform float u_fallback;       // this wheel's own answer, from its height in the world: 0 in the
+                                // air, presses nothing anywhere; 1: where the screen can see this
+                                // groove, the terrain's depth decides
 uniform float u_groundTol;      // how far above the ground still counts as down
 uniform vec3  u_upView;
 
+// Both answers must agree. The terrain's depth is the exact one but exists only where the game drew
+// the terrain under this wheel, and as the wheel rises the camera rises with it, so in first person
+// that pixel holds far-ahead ground at about the tire's height and calls a tire that is in the air
+// "down": the world's own answer has to hold as well rather than speak only off screen.
 float OnGround(float t)
 {
+    if (u_fallback < 0.5)
+        return 0.0;
     vec3 c = mix(u_eyeA, u_eyeB, t);
     if (u_check > 0.5 && c.z < -0.05) {
         vec2 uv = Project(c);
