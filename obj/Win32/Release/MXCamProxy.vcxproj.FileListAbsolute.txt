@@ -1,2 +1,6 @@
 V:\random code\MX Simulator Camera Mod\bin\Win32\Release\mxcam.ini
 V:\random code\shaders + mxcam\bin\Win32\Release\mxcam.ini
+V:\random code\shaders + mxcam\bin\Win32\Release\mxcam_sounds\mxsr_engine_default125.pack
+V:\random code\shaders + mxcam\bin\Win32\Release\mxcam_sounds\mxsr_engine_default250.pack
+V:\random code\shaders + mxcam\bin\Win32\Release\mxcam_sounds\mxsr_engine_default250f.pack
+V:\random code\shaders + mxcam\bin\Win32\Release\mxcam_sounds\mxsr_engine_default450f.pack

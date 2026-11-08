@@ -75,6 +75,9 @@ bool EndShaderFrame();
 // The last frame drew the 3D scene (riding, or a replay), not just the game's menus.
 bool SceneOnScreen();
 
+// The game's own menu (Esc) is open over the 3D scene: the HUD and cursor are left alone with it.
+bool GameMenuOverScene();
+
 // For the OTHER tab: what hiding the game's HUD and cursor is doing ("" when both are off).
 const char* GameOverlayStatusText();
 

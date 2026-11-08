@@ -18,6 +18,7 @@
 #include "config.h"
 #include "hooks.h"
 #include "log.h"
+#include "sound_packs.h"
 
 // ===========================================================================
 // 1. Export stubs
@@ -137,6 +138,13 @@ bool InitializeProxy(HMODULE self)
         Log("MXCam opengl32 proxy loaded (%s build)", sizeof(void*) == 8 ? "x64" : "x86");
         swprintf_s(path, L"%smxcam.ini", dir);
         LoadConfig(path);
+        // The engine sound packs installed (the panel's switches show them).
+        soundpacks::Startup();
+        Config& c = EditConfig();
+        c.soundPack125 = soundpacks::Installed(0);
+        c.soundPack250 = soundpacks::Installed(1);
+        c.soundPack250f = soundpacks::Installed(2);
+        c.soundPack450f = soundpacks::Installed(3);
     }
 
     // Load the genuine DLL by full path - a bare "opengl32.dll" would resolve back to us.

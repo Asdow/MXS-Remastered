@@ -31,6 +31,9 @@ struct Telemetry {
     bool   reset             = false;  // every filter started over this frame
     double verticalAccelG    = 0;
     double fallG             = 0;      // vertical acceleration used for airborne detection
+    double whip              = 0;      // 0..1 how far whip lock holds the view
+    double bikeRestDeg       = 0;      // the bike's resting pitch, learnt
+    double cameraRestDeg     = 0;      // the game camera's resting pitch, learnt
     double neckOffset        = 0;  // spring displacement along WorldUp (negative = compressed)
     double verticalOffset    = 0;  // total eye height change (smoothing + neck)
     // Attitudes in degrees: yaw (heading about WorldUp), pitch, roll.
@@ -58,10 +61,27 @@ void FrameTick();
 double ContentTime();
 double FrameInterval();
 
-// The game's clock as of the last Update(), in seconds: content time, except that a frame on
-// which the game showed more than one physics step counts for that many. Stamp motion samples
-// with it; it drifts from ContentTime(), so don't compare the two.
+// The game's clock as of the last Update(), in seconds: whole physics steps (kGameTick) counted
+// from how far things moved, where that can be told; the time between frames otherwise. Stamp
+// motion samples with it; it drifts from ContentTime(), so don't compare the two.
 double GameTime();
+
+// MX Simulator steps its physics 128 times a second, and every frame shows a whole number of
+// those steps: in a trace at ~124 fps, one frame in 35 showed two, whatever the frame times
+// said (they wobble by +-1.5 ms; a 52 ms hitch still showed one step). A frame is never
+// counted as showing none: see FinishFrame.
+constexpr double kGameTick = 1.0 / 128.0;
+// Below this much travel per step (units) the steps can't be counted from the travel.
+constexpr double kMinStepTravel = 0.03;
+
+// Counts the frames Update() has stamped on the game's clock. The bike tracker, which sees the
+// bike only after Update(), counts the steps of the frame it was on from the bike's own travel
+// (rigid, unlike the sprung game camera's) and, when the step count differs from Update()'s,
+// sets it with SetLastStep(): it moves the game's clock and the camera's last motion sample,
+// and returns the corrected GameTime().
+unsigned MotionFrame();
+double SetLastStep(double seconds);
+double LastStep();  // how far the last frame moved the game's clock (s), for the trace
 
 // view: the game's raw world->eye matrix (column-major). Returns false - leaving the frame
 // untouched - if it isn't a rigid camera transform (e.g. the wrong load was picked).

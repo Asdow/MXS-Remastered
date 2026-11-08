@@ -42,26 +42,33 @@ namespace camera {
 namespace {
 
 // Learns the angle something rests at (the bike's pitch on flat ground, the game camera's
-// look-down angle) as the peak of a histogram that forgets over ~30 s. Wheelies, jump faces
-// and landings are brief, so they barely move the peak.
+// look-down angle) as the peak of a histogram that forgets over ~30 s of riding. Wheelies, jump
+// faces and landings are brief, so they barely move the peak.
+// weight: how much a sample counts, and how far it makes the histogram forget. Riding counts in
+// full; standing still or lying down only a little (kRestStillWeight): riding spreads its time
+// over a range of pitches, while a bike lying still after a crash piles all of its into one bin -
+// 4 s of it at 25 deg took the rest from 3.7 to 20 deg for 20-30 s of riding after (replayed from
+// a trace), the view pitched by half that. A little, so a learner with nothing better (just
+// started, at the gate) still finds the rest from there.
 class RestEstimator {
 public:
-    void Add(double degrees, double dt)
+    void Add(double degrees, double dt, double weight = 1.0)
     {
         if (!seeded_) {
             value_ = degrees;
             seeded_ = true;
         }
-        if (dt <= 0)
+        if (dt <= 0 || weight <= 0)
             return;
-        const double decay = std::exp(-dt / 30.0);
+        const double decay = std::exp(-dt * weight / 30.0);
         for (double& bin : bins_)
             bin *= decay;
         const double position = Clamp(degrees, -kRange, kRange) + kRange;
         const int    i = position >= kBins - 1 ? kBins - 2 : static_cast<int>(position);
         const double f = position - i;
-        bins_[i]     += dt * (1.0 - f);
-        bins_[i + 1] += dt * f;
+        bins_[i]     += dt * weight * (1.0 - f);
+        bins_[i + 1] += dt * weight * f;
+        riding_      += dt * weight;
 
         int peak = 0;
         for (int b = 1; b < kBins; ++b) {
@@ -76,17 +83,50 @@ public:
                 offset = Clamp(0.5 * (a - c) / denominator, -0.5, 0.5);
         }
         const double mode = peak + offset - kRange;
-        value_ += (mode - value_) * (1.0 - std::exp(-0.7 * dt));
+        // Eased, once there's something to go on; until then (just started, nothing in the ini)
+        // straight to the peak, so a first frame at the spawn doesn't linger for seconds.
+        value_ += (mode - value_) * (1.0 - std::exp(-(riding_ < 1.0 ? 30.0 : 0.7) * dt));
     }
     double Degrees() const { return value_; }
+
+    // Starts from what was learnt in an earlier session, as if seen for `seconds` of riding.
+    void Seed(double degrees, double seconds)
+    {
+        value_ = degrees;
+        seeded_ = true;
+        const double position = Clamp(degrees, -kRange, kRange) + kRange;
+        const int    i = position >= kBins - 1 ? kBins - 2 : static_cast<int>(position);
+        const double f = position - i;
+        bins_[i]     += seconds * (1.0 - f);
+        bins_[i + 1] += seconds * f;
+    }
+    // Seconds of riding (weighted) it has learnt from in this session.
+    double Riding() const { return riding_; }
 
 private:
     static constexpr int    kBins  = 121;  // -60..+60 degrees
     static constexpr double kRange = 60.0;
     double bins_[kBins] = {};
     double value_  = 0;
+    double riding_ = 0;
     bool   seeded_ = false;
 };
+
+// What counts as riding on flat ground for the rest estimators: moving faster than this (units/s,
+// about 18 km/h), the bike within this far of upright and of level (a bike rests at a few degrees;
+// a face, a hill or a wheelie isn't flat ground). Anything else counts kRestStillWeight. Without
+// the pitch limit a session learnt the bike's rest as 36 deg while "riding", and kept it in the
+// ini: the next session's view sat 17 deg low until ~100 s of standing still outweighed it.
+constexpr double kRestMinSpeed    = 5.0;
+constexpr double kRestMaxRollDeg  = 60.0;
+constexpr double kRestMaxPitchDeg = 20.0;
+constexpr double kRestStillWeight = 0.05;
+// The rests are kept in the ini ([Learned] RestPitch: bike, game camera, game angle) once this
+// much riding is behind them, at most this often, and start the next session counting as
+// kRestSeedSeconds of riding: right from the first frame at the gate, and soon outweighed.
+constexpr double kRestSaveAfter   = 20.0;  // s of riding
+constexpr double kRestSaveEvery   = 60.0;  // s
+constexpr double kRestSeedSeconds = 5.0;
 
 // Landing (see FinishFrame): an impact, vertical acceleration this many g above resting...
 constexpr double kImpactG  = 0.8;
@@ -119,6 +159,19 @@ constexpr double kWhipFallTimeMin = 0.8, kWhipFallTimeFull = 1.2;  // s, time in
 // the path's own direction, averaged, not a filtered one. A filter lags a turn, and a double
 // taken while turning out of the landing of the one before (20 deg in 0.3 s) was held 18 deg
 // off its path, along the direction from before the turn, and swung back on landing.
+// Whip lock takes the view over as it is - where it points and how fast it is turning - and
+// brings it to the direction of travel, level, at the resting look-down angle, on these springs
+// (1/s). It used to aim straight at that within ~0.1 s: off a steep face (the bike 44 deg up,
+// the view 7 deg up at 50% pitch lock) a 13 deg snap down just after the lip. Easing only how
+// far the pitch went still stopped the view dead: up a face it tilts up at ~30 deg/s, and at
+// the lip that went to -10 deg/s within 40 ms (the roll from -23 to +35 deg/s), on every jump.
+// Carried on, the view's turning slows over ~0.15 s, then it eases home: 90% there after ~1.3 s
+// for the pitch, ~0.8 s for the heading and the roll.
+constexpr double kWhipPitchOmega = 3.0;
+constexpr double kWhipLevelOmega = 5.0;
+constexpr double kWhipMaxRate    = 120.0 * kDegToRad;  // rad/s carried over at most
+// The head's nod follows the neck on this spring (1/s); see Orient(), section 5.
+constexpr double kNodOmega = 8.0;
 constexpr double kTravelHoldBack = 0.25;  // s
 constexpr int    kTravelSamples  = 128;   // frames of history: covers it up to ~500 fps
 // In the air the path seen from above is a straight line, so the held direction then settles
@@ -164,7 +217,9 @@ constexpr double kApexLeadResponse = 4.0;                 // 1/s
 // Steadiness: the spring that follows the bike's lean and pitch runs at kSteadyFastest (1/s) just
 // above 0% down to kSteadySlowest at 100%, evenly on a log scale. At the default 60% that's ~7.6/s:
 // it trails a lean by about a quarter of a second, while a 5 Hz jolt reaches the view at about a
-// twentieth of its size (the view's own smoothing then halves that again).
+// twentieth of its size (the view's own smoothing then halves that again). The same scale goes on
+// up to 200% for those who want it calmer still: ~0.6/s at 150%, ~0.16/s at 200% (the view hardly
+// leans into a corner at all).
 constexpr double kSteadyFastest = 40.0, kSteadySlowest = 2.5;
 
 struct TravelSample {
@@ -201,6 +256,16 @@ struct State {
     bool   turnFromBike = false;  // turnRate is measured from the bike's path (else the eye's)
     bool   deepFall     = false;  // this fall has read as deep as real airtime (whip lock)
     double whip         = 0;      // 0..1 how far whip lock has taken over (eased)
+    bool   whipEngaged  = false;  // whip lock is taking over (last frame)
+    // Where whip lock holds the view (rad), easing to the travel direction, rest pitch, level:
+    // the heading as a turn from the direction of travel, the pitch and the roll, with rates.
+    double whipYaw   = 0, whipYawRate   = 0;
+    double whipPitch = 0, whipPitchRate = 0;
+    double whipRoll  = 0, whipRollRate  = 0;
+    // The view as it was last frame (the smoothed view's attitude), to tell how fast it turns.
+    bool   haveLastView = false;
+    Vec3   lastViewHeading;
+    double lastViewPitch = 0, lastViewRoll = 0;
     double airborne     = 0;      // 0 on the ground .. 1 in the air (eased)
     bool   inAir        = false;
     double fallTime     = 0;      // seconds of continuous free fall
@@ -215,9 +280,15 @@ struct State {
     // [0] of the game camera, [1] of the bike.
     double steadyRoll[2]  = {}, steadyRollRate[2]  = {};
     double steadyPitch[2] = {}, steadyPitchRate[2] = {};
+    // The same for the view itself, which whip lock holds level: these follow only the share
+    // of the lean and pitch it lets through (the head offsets keep following the bike).
+    double viewRoll[2]    = {}, viewRollRate[2]    = {};
+    double viewPitch[2]   = {}, viewPitchRate[2]   = {};
     bool   steadyBike     = false;  // [1] is following the bike (false: start it where the bike is)
     double neckOffset   = 0;      // spring displacement along WorldUp (negative = compressed)
     double neckVelocity = 0;
+    double nod          = 0;      // the head's nod from the neck (rad, eased: kNodOmega)
+    double nodRate      = 0;
 };
 
 // Everything the orientation half carries from frame to frame. A preview runs on a copy.
@@ -226,6 +297,9 @@ struct Model {
     RestEstimator cameraPitchRest;  // game camera pitch on flat ground (includes the game's angle)
     RestEstimator bikePitchRest;    // bike model pitch on flat ground
     RestEstimator gameAngleRest;    // game camera pitch relative to the bike: the game's 1st-person angle
+    bool          restLoaded = false;  // seeded from the ini (or found nothing there)
+    double        restSavedAt = -1;    // content time the rests were last written to the ini
+    double        restLoggedDeg = 0;   // the bike's rest when the log last mentioned it
     Vec3          lastHeading{ 0, 0, -1 };
     double        customWeight = 0; // 0 = game camera .. 1 = custom camera, eased on switches
     double        airG = -3.0;      // what free fall reads well into a jump (g), learned; MX Simulator's to start
@@ -257,7 +331,7 @@ Model     g_model;
 Frame     g_frame;
 Telemetry g_telemetry;
 MotionFit g_eyeFit;
-EventLog  g_cutLog, g_teleportLog;
+EventLog  g_cutLog, g_teleportLog, g_restLog;
 
 // D-pad look (SetLook). The head turns at Config::lookTurnSpeed.
 Look g_look = Look::Ahead;
@@ -271,13 +345,17 @@ double g_lastCommitWallTime = 0;   // when it ran, to notice pauses (loading, al
 double g_rawIntervalMs   = 0;
 
 // The game's own clock (FinishFrame), which the motion fits are stamped with. The game steps its
-// physics in fixed increments and now and then shows two (or three) steps in one frame - one
-// frame in 40 at 125 fps in a trace - which the swap times can't see. Stamped with the swap
+// physics in fixed increments (kGameTick) and now and then shows two steps in one frame - one
+// frame in 35 at 124 fps in a trace - which the swap times can't see. Stamped with the swap
 // time, such a frame read as a 6 g jolt and then a false landing, worst falling fast at the end
-// of a big jump: whip lock let go and grabbed again, and the neck bounced.
+// of a big jump: whip lock let go and grabbed again, and the neck bounced. The steps were once
+// counted only where the travel was a whole multiple of what the frame's time predicted, but
+// the frame times wobble too much for that (a two-step frame read as 1.73 or 2.30 steps, 13 of
+// 58 missed in a trace, a false landing 13 m up). They're counted against kGameTick now.
 double g_gameTime        = 0;
 double g_lastMotionTime  = -1;     // content time of the last FinishFrame()
-constexpr double kMinStepTravel = 0.03;  // units per frame below which steps aren't counted
+double g_lastStep        = 0;      // how far the last FinishFrame() moved the game's clock (s)
+unsigned g_motionFrame   = 0;      // FinishFrame()s so far
 
 double NowSeconds()
 {
@@ -565,9 +643,30 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     const bool onGround = s.airborne < 0.3;
 
     // ---- 3. Attitude of the game camera and of the bike -----------------------------------
+    // The rests start from the last session's (see kRestSeedSeconds).
+    if (commit && !m.restLoaded) {
+        m.restLoaded = true;
+        double v[3];
+        if (ReadLearned("RestPitch", v)) {
+            if (std::fabs(v[0]) <= kRestMaxPitchDeg) {
+                m.bikePitchRest.Seed(v[0], kRestSeedSeconds);
+                m.cameraPitchRest.Seed(v[1], kRestSeedSeconds);
+                m.gameAngleRest.Seed(v[2], kRestSeedSeconds);
+                Log("camera: the bike's resting pitch starts at %.1f deg (the game camera's %.1f), as learnt last time", v[0], v[1]);
+            } else {
+                Log("camera: ignored the resting pitch kept in the ini (the bike's %.1f deg can't be flat ground); learning it again", v[0]);
+            }
+        }
+        m.restLoggedDeg = m.bikePitchRest.Degrees();
+    }
+    // Riding on flat ground: moving, upright and level (s.pathSpeed is the bike's when the
+    // tracker has it).
+    const bool moving = s.pathSpeed > kRestMinSpeed;
+    const auto RestWeight = [&](const Attitude& a, double fromLevelRad) {
+        return moving && std::fabs(a.roll) < kRestMaxRollDeg * kDegToRad &&
+               std::fabs(fromLevelRad) < kRestMaxPitchDeg * kDegToRad ? 1.0 : kRestStillWeight;
+    };
     const Attitude cameraAtt = Measure(rawFwd, up, worldUp, m.lastHeading);
-    if (onGround && cameraAtt.level > 0.5)
-        m.cameraPitchRest.Add(cameraAtt.pitch * kRadToDeg, dt);
 
     // The custom camera eases in when the bike is found and out when it is lost; while easing
     // out it keeps using the last known bike pose (the bike barely moves against the camera).
@@ -608,8 +707,9 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     }
     if (haveBike) {
         bikeAtt = Measure(bikeFwd, bikeUp, worldUp, m.lastHeading);
+        const double bikeWeight = RestWeight(bikeAtt, bikeAtt.pitch);
         if (onGround && bikeAtt.level > 0.5 && pose.tracked)
-            m.bikePitchRest.Add(bikeAtt.pitch * kRadToDeg, dt);
+            m.bikePitchRest.Add(bikeAtt.pitch * kRadToDeg, dt, bikeWeight);
 
         // Where the game camera points relative to the bike: its look-down angle, and the
         // look-left / right / back keys.
@@ -617,9 +717,30 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
         const double x = Dot(rawFwd, bikeRight), y = Dot(rawFwd, bikeUp), z = Dot(rawFwd, bikeFwd);
         lookYaw = std::atan2(x, z);
         if (std::fabs(lookYaw) < 20.0 * kDegToRad && pose.tracked)
-            m.gameAngleRest.Add(std::atan2(y, std::sqrt(x * x + z * z)) * kRadToDeg, dt);
+            m.gameAngleRest.Add(std::atan2(y, std::sqrt(x * x + z * z)) * kRadToDeg, dt, bikeWeight);
     } else {
         m.customWeight = 0;
+    }
+    // The game camera on flat ground: level as the bike is, when the tracker has it (the camera
+    // looks down at the game's angle), else within kRestMaxPitchDeg of its rest so far.
+    if (onGround && cameraAtt.level > 0.5) {
+        const double fromLevel = haveBike && pose.tracked ? bikeAtt.pitch
+                               : cameraAtt.pitch - m.cameraPitchRest.Degrees() * kDegToRad;
+        m.cameraPitchRest.Add(cameraAtt.pitch * kRadToDeg, dt, RestWeight(cameraAtt, fromLevel));
+    }
+    if (commit && std::fabs(m.bikePitchRest.Degrees() - m.restLoggedDeg) > 3.0) {
+        LogEvent(g_restLog, "camera: the bike's resting pitch is now %.1f deg (was %.1f; the bike at %.1f deg, %.1f units/s, %s)",
+                 m.bikePitchRest.Degrees(), m.restLoggedDeg, bikeAtt.pitch * kRadToDeg, s.pathSpeed,
+                 onGround ? "on the ground" : "in the air");
+        m.restLoggedDeg = m.bikePitchRest.Degrees();
+    }
+    tel.bikeRestDeg   = m.bikePitchRest.Degrees();
+    tel.cameraRestDeg = m.cameraPitchRest.Degrees();
+    if (commit && m.bikePitchRest.Riding() > kRestSaveAfter &&
+        (m.restSavedAt < 0 || g_contentTime - m.restSavedAt > kRestSaveEvery)) {
+        m.restSavedAt = g_contentTime;
+        const double v[3] = { m.bikePitchRest.Degrees(), m.cameraPitchRest.Degrees(), m.gameAngleRest.Degrees() };
+        WriteLearned("RestPitch", v);
     }
     const double absYawDeg = std::fabs(lookYaw) * kRadToDeg;
 
@@ -656,6 +777,22 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
         bikeSteady.roll = Steady(s.steadyRoll[1], s.steadyRollRate[1], bikeAtt.roll, !s.steadyBike);
         bikeExcess = Steady(s.steadyPitch[1], s.steadyPitchRate[1], bikePitchExcess, !s.steadyBike);
     }
+    // The view's own springs follow only what whip lock (as of last frame) lets through. Through
+    // a jump they used to follow the bike's nose dropping for the landing while whip lock held
+    // the view level over them; letting go on landing showed that pitch, now stale - the bike's
+    // nose was already up off the rear wheel - and the view dipped 3-5 deg in 0.15 s and came
+    // back. Held level, they start from level on landing and ease to the bike from there.
+    // Without whip lock they are the springs above.
+    const double heldLevel = cfg.whipLock * s.whip;
+    Attitude gameView = cameraAtt;
+    gameView.roll = Steady(s.viewRoll[0], s.viewRollRate[0], cameraAtt.roll * (1.0 - heldLevel), false);
+    const double gameViewExcess = Steady(s.viewPitch[0], s.viewPitchRate[0], cameraPitchExcess * (1.0 - heldLevel), false);
+    Attitude bikeView = bikeAtt;
+    double bikeViewExcess = bikePitchExcess;
+    if (haveBike) {
+        bikeView.roll = Steady(s.viewRoll[1], s.viewRollRate[1], bikeAtt.roll * (1.0 - heldLevel), !s.steadyBike);
+        bikeViewExcess = Steady(s.viewPitch[1], s.viewPitchRate[1], bikePitchExcess * (1.0 - heldLevel), !s.steadyBike);
+    }
     s.steadyBike = haveBike;
 
     // ---- 4. Target view -------------------------------------------------------------------
@@ -686,15 +823,20 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     // Game camera: the game's view with the locks applied. (It is fixed to the bike, so its
     // own pitch away from rest is the bike's.) A look-left / right / back isn't a swing.
     double airYaw = AirYaw(cameraAtt.heading, s.airNoseCamera) * (1.0 - SmoothStep(50.0, 75.0, absYawDeg));
-    const double gamePitch = cameraRestPitch + (1.0 - cfg.pitchLock) * gameExcess;
-    const double gameRoll  = LockedRoll(gameSteady, cfg.horizonLock, cfg);
+    // With the custom camera chosen but the bike not found yet (just spawned, standing still), this
+    // view stands in for it: at the custom camera's look-down angle, not the game's, so the angle
+    // slider works from the first frame and nothing jumps when the bike is found. (It used to
+    // sit at the game's 1st Person Angle, the slider doing nothing, until riding off.)
+    const double gameRestPitch = cfg.customCamera ? -cfg.cameraAngleDeg * kDegToRad : cameraRestPitch;
+    const double gamePitch = gameRestPitch + (1.0 - cfg.pitchLock) * gameViewExcess;
+    const double gameRoll  = LockedRoll(gameView, cfg.horizonLock, cfg);
     Quat target = Build(Turn(cameraAtt.heading, airYaw, worldUp), gamePitch, gameRoll, worldUp);
 
     // Custom camera: built from the bike only.
     if (m.customWeight > 1e-3) {
-        const double angleDown = cfg.keepGameAngle ? -m.gameAngleRest.Degrees() : cfg.cameraAngleDeg;
-        const double pitch = (1.0 - cfg.pitchLock) * bikeExcess - angleDown * kDegToRad;
-        const double roll  = LockedRoll(bikeSteady, cfg.horizonLock, cfg);
+        const double angleDown = cfg.cameraAngleDeg;
+        const double pitch = (1.0 - cfg.pitchLock) * bikeViewExcess - angleDown * kDegToRad;
+        const double roll  = LockedRoll(bikeView, cfg.horizonLock, cfg);
         // The game's look keys turn the camera 90 / 180 degrees; smaller offsets (the game
         // camera's own wobble, whip or gimbal) are ignored.
         const double look = lookYaw * SmoothStep(50.0, 75.0, absYawDeg);
@@ -768,14 +910,49 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
         const double jumpSize = std::fmax(SmoothStep(kWhipAirtimeMin, kWhipAirtimeFull, launchAirtime),
                                           SmoothStep(kWhipFallTimeMin, kWhipFallTimeFull, s.fallTime));
         s.whip += ((engage ? jumpSize : 0.0) - s.whip) * LowPassAlpha(engage ? 25.0 : 6.0, dt);
+
+        // Where it holds the view: taken over from the view as it is, turning as it turns (see
+        // kWhipPitchOmega), then eased to the direction of travel, the resting pitch, level.
+        const double customRest = -cfg.cameraAngleDeg;
+        const double cameraRest = cfg.customCamera ? customRest : m.cameraPitchRest.Degrees();  // (as gamePitch)
+        const double restPitch = (cameraRest + (customRest - cameraRest) * m.customWeight) * kDegToRad;
+        const Attitude seen = Measure(Rotate(s.smoothRot, { 0, 0, -1 }), Rotate(s.smoothRot, { 0, 1, 0 }),
+                                      worldUp, s.travel);
+        const auto TurnFrom = [&](Vec3 from, Vec3 to) {  // + = to the right, as Turn()
+            return std::atan2(Dot(to, Normalize(Cross(from, worldUp))), Dot(to, from));
+        };
+        const auto Rate = [&](double change) { return dt > 1e-6 ? Clamp(change / dt, -kWhipMaxRate, kWhipMaxRate) : 0.0; };
+        const bool haveRates = s.haveLastView && !snap;
+        const double yawRate   = haveRates ? Rate(TurnFrom(s.lastViewHeading, seen.heading)) : 0.0;
+        const double pitchRate = haveRates ? Rate(seen.pitch - s.lastViewPitch) : 0.0;
+        const double rollRate  = haveRates ? Rate(WrapAngle(seen.roll - s.lastViewRoll)) : 0.0;
+        s.lastViewHeading = seen.heading;
+        s.lastViewPitch = seen.pitch;
+        s.lastViewRoll = seen.roll;
+        s.haveLastView = true;
+        if (snap) {
+            s.whipYaw = s.whipYawRate = 0;
+            s.whipPitch = restPitch;
+            s.whipPitchRate = 0;
+            s.whipRoll = s.whipRollRate = 0;
+        } else if (engage && !s.whipEngaged) {
+            s.whipYaw = TurnFrom(s.travel, seen.heading);
+            s.whipYawRate = yawRate;
+            s.whipPitch = seen.pitch;
+            s.whipPitchRate = pitchRate;
+            s.whipRoll = seen.roll;
+            s.whipRollRate = rollRate;
+        } else {
+            CriticalSpring(s.whipYaw, s.whipYawRate, 0.0, kWhipLevelOmega, dt);
+            CriticalSpring(s.whipPitch, s.whipPitchRate, restPitch, kWhipPitchOmega, dt);
+            CriticalSpring(s.whipRoll, s.whipRollRate, 0.0, kWhipLevelOmega, dt);
+        }
+        s.whipEngaged = engage;
     }
     const double whipWeight = cfg.whipLock * s.whip;
-    if (whipWeight > 1e-3) {
-        const double cameraRest = m.cameraPitchRest.Degrees();
-        const double customRest = -(cfg.keepGameAngle ? -m.gameAngleRest.Degrees() : cfg.cameraAngleDeg);
-        const double restPitch = (cameraRest + (customRest - cameraRest) * m.customWeight) * kDegToRad;
-        target = Slerp(target, Build(s.travel, restPitch, 0.0, worldUp), whipWeight);
-    }
+    tel.whip = whipWeight;
+    if (whipWeight > 1e-3)
+        target = Slerp(target, Build(Turn(s.travel, s.whipYaw, worldUp), s.whipPitch, s.whipRoll, worldUp), whipWeight);
     m.lastHeading = cameraAtt.heading;
 
     // Head position: along the bike (custom) or the game camera's own axes.
@@ -828,9 +1005,20 @@ bool Orient(Model& m, const double view[16], double dt, bool commit, Frame& f)
     // Neck compression also nods the head forward a little (rotation about the camera's right
     // axis; a negative angle pitches down). Uses last frame's neck, so the orientation is
     // complete here - the sky, drawn before the camera position is known, gets all of it.
+    // The nod follows the neck through a spring (kNodOmega): the neck goes from fully stretched
+    // in the air to fully compressed within ~50 ms of a landing, and nodding with it pitched the
+    // view 4.4 deg down at ~90 deg/s - with whip lock holding the view still through the air,
+    // a plain snap down on every landing. Through the spring: ~16 deg/s, over ~0.3 s.
     if (cfg.nodDegPerMeter != 0) {
+        const double nod = s.neckOffset * cfg.nodDegPerMeter * kDegToRad;
+        if (snap || dt <= 0) {
+            s.nod = nod;
+            s.nodRate = 0;
+        } else {
+            CriticalSpring(s.nod, s.nodRate, nod, kNodOmega, dt);
+        }
         const Vec3 pitchAxis = Rotate(rot, { 1, 0, 0 });
-        rot = AxisAngle(pitchAxis, s.neckOffset * cfg.nodDegPerMeter * kDegToRad) * rot;
+        rot = AxisAngle(pitchAxis, s.nod) * rot;
     }
 
     f.rot      = Normalize(rot);
@@ -918,19 +1106,26 @@ bool FinishFrame(const double view[16], double correction[16])
 
     // ---- 6. Motion: velocity, acceleration, airborne ------------------------------------
     // How many physics steps the game moved on this frame: at speed the camera covers a whole
-    // multiple of an ordinary frame's distance. Only counted on an ordinary frame interval, so a
-    // hitch or a pause just advances the clock by the time that passed.
+    // number of steps' travel. Where it doesn't - slow, or the sprung camera bouncing on a
+    // landing - the clock moves by the time that passed, and the bike tracker corrects it from
+    // the bike's own travel (SetLastStep). A pause just advances it. Never by no steps: the
+    // velocity it's judged by comes from samples stamped with this clock, so a clock that
+    // stood still kept a stale velocity that went on reading as no steps - stuck for good
+    // (seen after a crash: the neck pinned, fall_g at 159, standing still read as riding).
+    // Above 128 fps a frame with no new step then just counts its time, as it always did.
     const double wallDt = g_lastMotionTime >= 0 ? std::fmax(g_contentTime - g_lastMotionTime, 0.0) : 0.0;
     g_lastMotionTime = g_contentTime;
-    int steps = 1;
-    const double expectedTravel = Length(s.velocity) * wallDt;
-    if (wallDt < 1.5 * g_frameInterval && expectedTravel > kMinStepTravel) {
-        const double ratio = Length(rawPos - s.prevPos) / expectedTravel;
-        const int n = int(std::floor(ratio + 0.5));
-        if (n >= 2 && n <= 3 && std::fabs(ratio - n) < 0.25)
-            steps = n;
+    double step = wallDt;
+    const double stepTravel = Length(s.velocity) * kGameTick;
+    if (wallDt < 0.25 && stepTravel > kMinStepTravel) {
+        const double ratio = Length(rawPos - s.prevPos) / stepTravel;
+        const double n = std::floor(ratio + 0.5);
+        if (n >= 1 && n <= 4 && std::fabs(ratio - n) < 0.25)
+            step = n * kGameTick;
     }
-    g_gameTime += wallDt * steps;
+    g_gameTime += step;
+    g_lastStep = step;
+    ++g_motionFrame;
 
     // A least-squares fit over the last ~0.1 s (AccelFilterHz), stamped with the game's clock:
     // frame-to-frame timing noise averages out instead of being differentiated twice.
@@ -1091,6 +1286,19 @@ void SetLook(Look look) { g_look = look; }
 
 double ContentTime() { return g_contentTime; }
 double GameTime() { return g_gameTime; }
+unsigned MotionFrame() { return g_motionFrame; }
+double LastStep() { return g_lastStep; }
+
+double SetLastStep(double seconds)
+{
+    const double delta = seconds - g_lastStep;
+    if (std::fabs(delta) > 1e-9) {
+        g_gameTime += delta;
+        g_eyeFit.ShiftNewest(delta);
+        g_lastStep = seconds;
+    }
+    return g_gameTime;
+}
 double FrameInterval() { return g_frameInterval; }
 
 bool PreviewRotation(const double view[16], double out[16])

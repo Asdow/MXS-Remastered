@@ -88,6 +88,7 @@ WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16]);
 struct OwnAnchors {
     bool   bike = false, torso = false;  // found this frame
     double bikeWorld[16] = {};           // your bike's model
+    double bikeAcross[3] = { 1, 0, 0 };  // across your bike, in its own space (the wheels' axles)
     double torsoWorld[16] = {};          // your rider's torso bone (it carries the head)
     double riderPosition[3] = {};        // the middle of your rider and bike
     double raw[16] = {};                 // the game's view this frame, and the one drawn with
@@ -96,6 +97,10 @@ struct OwnAnchors {
     bool   thirdPerson = false;          // the camera is metres away from your rider
 };
 bool GetOwnAnchors(OwnAnchors& out);
+
+// The game drew wheel i's own draw call (kept while it was yours) near your rider this frame: no
+// stand-in tire goes in the shadow map beside it (0 rear, 1 front).
+void NoteWheelDrawnByGame(int i);
 
 // Something of the game's own was cast this frame in place of a stand-in shape: a part kept on your
 // torso (your helmet; piece = false: no ball for your head), or a body piece of your rider's
@@ -114,6 +119,9 @@ const char* WheelTraceText();
 bool WantsWheelMask();
 // This frame's camera (the game's view), once the 3D scene has started.
 bool FrameRawView(double raw[16]);
+// The one it's drawn with (after the helmet cam's correction: an uploaded u_modelview is
+// View * Model with it), and the world's up (unit).
+bool FrameRenderedView(double rendered[16], double up[3]);
 // Wheel i (0 rear, 1 front) drawn by the game this frame and taken for yours: every part of it that
 // turns about its axle (the tire, rim and spokes, the brake disc, the sprocket: the one followed can
 // be any of them, and the mask was once just the disc), each one's u_modelview as the game sent it

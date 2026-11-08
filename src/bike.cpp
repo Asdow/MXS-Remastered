@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bike.h"
+#include "camera.h"
 #include "config.h"
 #include "hooks.h"
 #include "log.h"
@@ -78,6 +79,8 @@ double        g_viewInverse[16];   // this frame's camera -> world
 bool          g_haveBikePos = false;
 int           g_motionTrackId = 0;
 Vec3          g_bikePos;
+Vec3          g_bikeVelocity;       // the fit's, as of g_bikePos (units per second of game time)
+unsigned      g_bikeMotionFrame = 0;  // camera::MotionFrame() g_bikePos was seen on
 MotionFit     g_bikeFit;
 
 // Only to notice long gaps (menus, loading); the filters step by the frame time they're given.
@@ -110,10 +113,65 @@ double AngleSpread(const Track& t) { return std::sqrt(t.angleVar); }
 // Lower is steadier. 10 cm of bounce counts like 1 degree of wobble.
 double Score(const Track& t) { return AngleSpread(t) + 10.0 * QSpread(t); }
 
-bool Qualifies(const Track& t)
+bool Steady(const Track& t)
 {
-    return t.missTime == 0 && t.alive >= kMinAlive && t.travel >= kMinTravel &&
+    return t.missTime == 0 && t.alive >= kMinAlive &&
            QSpread(t) < 0.3 + 0.05 * Length(t.meanQ) && AngleSpread(t) < kMaxAngleSpreadDeg;
+}
+
+bool Qualifies(const Track& t) { return Steady(t) && t.travel >= kMinTravel; }
+
+// Where the camera sat on the bike, as learnt riding (kept in the ini's [Learned] section).
+// Standing still, the bike and the scenery both stay put against the camera, so travel can't
+// tell them apart - and until the bike is found the custom camera can't run (the game camera's
+// angle, the angle slider doing nothing): 76 s after a spawn in a test, until riding off. But only
+// the bike has the camera at this spot in its space, looking this way: a steady track that
+// matches is the bike, moving or not. (Another rider's bike next to you has the camera metres
+// off to its side.)
+constexpr double kKnownDistance = 0.3;   // units, of the camera's place on the bike
+constexpr double kKnownAngleDeg = 8.0;   // of the camera's direction on the bike
+constexpr double kKnownSaveAfter = 3.0;  // s a riding-proven lock is held before it's kept
+bool g_knownLoaded = false;
+bool g_haveKnown   = false;
+bool g_knownSaved  = false;              // this session
+Vec3 g_knownQ, g_knownFwd, g_knownUp;
+
+void LoadKnown()
+{
+    if (g_knownLoaded)
+        return;
+    g_knownLoaded = true;
+    double q[3], f[3], u[3];
+    if (ReadLearned("BikeCameraAt", q) && ReadLearned("BikeCameraForward", f) && ReadLearned("BikeCameraUp", u)) {
+        const Vec3 fwd{ f[0], f[1], f[2] }, up{ u[0], u[1], u[2] };
+        if (std::fabs(Length(fwd) - 1.0) < 0.05 && std::fabs(Length(up) - 1.0) < 0.05) {
+            g_knownQ = { q[0], q[1], q[2] };
+            g_knownFwd = fwd;
+            g_knownUp = up;
+            g_haveKnown = true;
+        }
+    }
+}
+
+bool Recognised(const Track& t)
+{
+    return g_haveKnown && Steady(t) && Length(t.meanQ - g_knownQ) < kKnownDistance &&
+           OrientationDiffDeg(t.meanFwd, t.meanUp, g_knownFwd, g_knownUp) < kKnownAngleDeg;
+}
+
+void SaveKnown(const Track& t)
+{
+    g_knownQ = t.meanQ;
+    g_knownFwd = Normalize(t.meanFwd);
+    g_knownUp = Normalize(t.meanUp);
+    g_haveKnown = true;
+    g_knownSaved = true;
+    const double q[3] = { g_knownQ.x, g_knownQ.y, g_knownQ.z };
+    const double f[3] = { g_knownFwd.x, g_knownFwd.y, g_knownFwd.z };
+    const double u[3] = { g_knownUp.x, g_knownUp.y, g_knownUp.z };
+    WriteLearned("BikeCameraAt", q);
+    WriteLearned("BikeCameraForward", f);
+    WriteLearned("BikeCameraUp", u);
 }
 
 // The signed unit axis (+-X, +-Y, +-Z) closest to v, skipping axis `exclude`.
@@ -238,10 +296,14 @@ void EndFrame(double gameTime, double frameDt)
 
     const Config& cfg = GetConfig();
     if (SecondsSinceLastFrame() > 1.0) {
-        // Paused or in a menu for a while: start over.
-        Unlock("no camera for over a second");
-        g_tracks.clear();
+        // A pause: a menu, alt-tab, loading - or saving the settings, which stalled the game for
+        // 1.4 s and lost the bike every time; standing still, it took until riding off again
+        // (the custom camera at the game camera's angle meanwhile). The bike is still where it
+        // was against the camera, so the tracks carry on: the locked one is kept if it matches
+        // again, and dropped as usual (kMaxMissTime) if it doesn't, as after a change of track.
+        // Only the travel and the bike's motion start over.
         g_havePos = false;
+        g_haveBikePos = false;
     }
     const double dt = Clamp(frameDt, 0.0, 0.1);
 
@@ -346,6 +408,22 @@ void EndFrame(double gameTime, double frameDt)
         Lock(*best);  // a clearly steadier object (e.g. the frame rather than the steering fork)
         locked = best;
     }
+    if (!locked) {  // standing still: the bike by where the camera sits on it (see Recognised)
+        LoadKnown();
+        Track* known = nullptr;
+        for (Track& t : g_tracks) {
+            if (Recognised(t) && (!known || Score(t) < Score(*known)))
+                known = &t;
+        }
+        if (known) {
+            if (g_logLines++ < kMaxLogLines)
+                Log("bike: recognised your bike standing still (the camera sits where it did on it before)");
+            Lock(*known);
+            locked = known;
+        }
+    }
+    if (locked && !g_knownSaved && Qualifies(*locked) && locked->alive > kKnownSaveAfter)
+        SaveKnown(*locked);  // proven by riding: kept for the next spawn
     g_pose.fresh = false;
     if (locked) {
         // During a short gap the last match is kept: the bike barely moves against the camera.
@@ -372,17 +450,34 @@ void EndFrame(double gameTime, double frameDt)
         // fit over the last 0.15 s on the game's clock, which frame-timing jitter can't throw off.
         const Vec3 pos{ world[12], world[13], world[14] };
         g_pose.worldPosition[0] = pos.x; g_pose.worldPosition[1] = pos.y; g_pose.worldPosition[2] = pos.z;
+        const unsigned motionFrame = camera::MotionFrame();
+        bool sameTrack = true;
         if (locked->id != g_motionTrackId || !g_haveBikePos || Length(pos - g_bikePos) > cfg.teleportDistance) {
             g_motionTrackId = locked->id;
             g_bikeFit.Reset();
+            sameTrack = false;
         }
-        g_bikeFit.Add(gameTime, pos);
+        // How many physics steps this frame showed, from the bike's own travel since last frame:
+        // the bike moves rigidly, while the game camera the clock counted them from is sprung
+        // (on a landing it moved half the bike's distance a step, and a two-step frame there
+        // went uncounted). The camera's count is corrected to it.
+        double time = gameTime;
+        const double stepTravel = Length(g_bikeVelocity) * camera::kGameTick;
+        if (sameTrack && g_bikeMotionFrame + 1 == motionFrame && stepTravel > camera::kMinStepTravel) {
+            const double ratio = Length(pos - g_bikePos) / stepTravel;
+            const double n = std::floor(ratio + 0.5);
+            if (n >= 1 && n <= 4 && std::fabs(ratio - n) < 0.25)
+                time = camera::SetLastStep(n * camera::kGameTick);
+        }
+        g_bikeFit.Add(time, pos);
         Vec3 velocity, accel;
         const Vec3 worldUp{ cfg.worldUp[0], cfg.worldUp[1], cfg.worldUp[2] };
         g_pose.haveAccel = g_bikeFit.Estimate(0.15, velocity, accel);
         g_pose.verticalAccelG = g_pose.haveAccel ? Dot(accel, worldUp) / kGravity : 0.0;
         g_pose.velocity[0] = velocity.x; g_pose.velocity[1] = velocity.y; g_pose.velocity[2] = velocity.z;
+        g_bikeVelocity = g_pose.haveAccel ? velocity : Vec3{};
         g_bikePos = pos;
+        g_bikeMotionFrame = motionFrame;
         g_haveBikePos = true;
     } else if (!locked) {
         g_haveBikePos = false;

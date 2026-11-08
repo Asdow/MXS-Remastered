@@ -299,6 +299,14 @@ void PollHotkeys()
     const bool dump   = Pressed(cfg.dumpKey, dumpKey);
     const bool trace  = Pressed(cfg.traceKey, traceKey);
     const bool shaders = Pressed(cfg.shaderToggleKey, shadersKey);
+    // For automated tests: the ini read again on a given frame (a setting changed while playing).
+    static const int testReloadFrame = [] {
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_RELOAD_FRAME", text, sizeof text) > 0 ? atoi(text) : -1;
+    }();
+    static int polledFrames = 0;
+    if (testReloadFrame >= 0 && polledFrames++ == testReloadFrame)
+        ReloadConfig();
     if (!GameHasFocus() || OverlayListeningForKey())  // a keybind is being picked: that press is its answer
         return;
 

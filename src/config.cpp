@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <string>
+#include <vector>
 
 #include "config.h"
 #include "log.h"
@@ -89,9 +91,188 @@ void ReadVector(const wchar_t* section, const wchar_t* key, double (&value)[3])
     value[2] = z / length;
 }
 
+double NowSeconds()
+{
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    return double(now.QuadPart) / double(frequency.QuadPart);
+}
+
+// Edits to the ini made in memory and written out in one go. WritePrivateProfileString reads and
+// rewrites the whole file on every call: a save (~400 keys - the settings and three presets) took
+// 1.4 s, the game frozen meanwhile (and the bike tracker took it for a pause). The same rules as
+// Windows': sections and keys match regardless of case and surrounding spaces, comments and other
+// keys stay as they are, a new key goes after the last line of its section, a new section at the
+// end of the file. A UTF-16 file (which this mod never writes) is left to Windows, call by call.
+class IniBatch {
+public:
+    explicit IniBatch(const wchar_t* path) : path_(path)
+    {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"rb") != 0 || !f)
+            return;  // (no file yet: it's made on Commit)
+        std::string text;
+        char buffer[8192];
+        size_t n;
+        while ((n = fread(buffer, 1, sizeof buffer, f)) > 0)
+            text.append(buffer, n);
+        fclose(f);
+        if (text.size() >= 2 && static_cast<unsigned char>(text[0]) == 0xFF && static_cast<unsigned char>(text[1]) == 0xFE) {
+            direct_ = true;
+            return;
+        }
+        size_t start = 0;
+        while (start < text.size()) {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos)
+                end = text.size();
+            std::string line = text.substr(start, end - start);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            lines_.push_back(line);
+            start = end + 1;
+        }
+    }
+
+    // value nullptr removes the key; key nullptr removes the whole section.
+    bool Set(const wchar_t* section, const wchar_t* key, const wchar_t* value)
+    {
+        if (direct_)
+            return WritePrivateProfileStringW(section, key, value, path_) != FALSE;
+        const std::string s = Trim(Narrow(section));
+        size_t begin, end;
+        const bool found = FindSection(s, begin, end);
+        if (!key) {
+            if (found) {
+                lines_.erase(lines_.begin() + static_cast<std::ptrdiff_t>(begin - 1), lines_.begin() + static_cast<std::ptrdiff_t>(end));
+                changed_ = true;
+            }
+            return true;
+        }
+        const std::string k = Trim(Narrow(key));
+        if (found) {
+            for (size_t i = begin; i < end; ++i) {
+                std::string name;
+                if (KeyOf(lines_[i], name) && _stricmp(name.c_str(), k.c_str()) == 0) {
+                    if (value)
+                        lines_[i] = name + "=" + Narrow(value);  // (the key as the file spells it)
+                    else
+                        lines_.erase(lines_.begin() + static_cast<std::ptrdiff_t>(i));
+                    changed_ = true;
+                    return true;
+                }
+            }
+        }
+        if (!value)
+            return true;
+        const std::string line = k + "=" + Narrow(value);
+        if (found) {
+            size_t at = begin;  // after the section's last key (a comment after it may be the next section's)
+            for (size_t i = begin; i < end; ++i) {
+                std::string name;
+                if (KeyOf(lines_[i], name))
+                    at = i + 1;
+            }
+            lines_.insert(lines_.begin() + static_cast<std::ptrdiff_t>(at), line);
+        } else {
+            lines_.push_back("[" + s + "]");
+            lines_.push_back(line);
+        }
+        changed_ = true;
+        return true;
+    }
+
+    // Writes the file (if anything changed): to a temporary file first, then over the ini, so a
+    // failure part way can't leave half an ini.
+    bool Commit()
+    {
+        if (direct_ || !changed_)
+            return true;
+        std::string text;
+        for (const std::string& line : lines_) {
+            text += line;
+            text += "\r\n";
+        }
+        wchar_t temp[1100];
+        swprintf_s(temp, L"%s.saving", path_);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, temp, L"wb") != 0 || !f)
+            return false;
+        const bool written = fwrite(text.data(), 1, text.size(), f) == text.size();
+        const bool closed = fclose(f) == 0;
+        if (!written || !closed || !MoveFileExW(temp, path_, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DeleteFileW(temp);
+            return false;
+        }
+        changed_ = false;
+        return true;
+    }
+
+private:
+    static std::string Narrow(const wchar_t* w)
+    {
+        char buffer[512] = "";
+        WideCharToMultiByte(CP_ACP, 0, w, -1, buffer, sizeof buffer, nullptr, nullptr);
+        return buffer;
+    }
+    static std::string Trim(const std::string& s)
+    {
+        const size_t a = s.find_first_not_of(" \t");
+        if (a == std::string::npos)
+            return std::string();
+        const size_t b = s.find_last_not_of(" \t");
+        return s.substr(a, b - a + 1);
+    }
+    // A "[name]" line: its name.
+    static bool SectionOf(const std::string& line, std::string& name)
+    {
+        const std::string t = Trim(line);
+        if (t.empty() || t[0] != '[')
+            return false;
+        const size_t close = t.find(']');
+        if (close == std::string::npos)
+            return false;
+        name = Trim(t.substr(1, close - 1));
+        return true;
+    }
+    // A "key=value" line (not a comment): its key.
+    static bool KeyOf(const std::string& line, std::string& name)
+    {
+        const std::string t = Trim(line);
+        if (t.empty() || t[0] == ';' || t[0] == '#' || t[0] == '[')
+            return false;
+        const size_t equals = t.find('=');
+        if (equals == std::string::npos)
+            return false;
+        name = Trim(t.substr(0, equals));
+        return true;
+    }
+    // The section's lines: [begin, end), its header at begin - 1.
+    bool FindSection(const std::string& section, size_t& begin, size_t& end) const
+    {
+        for (size_t i = 0; i < lines_.size(); ++i) {
+            std::string name;
+            if (SectionOf(lines_[i], name) && _stricmp(name.c_str(), section.c_str()) == 0) {
+                begin = i + 1;
+                end = begin;
+                while (end < lines_.size() && !SectionOf(lines_[end], name))
+                    ++end;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const wchar_t*           path_;
+    std::vector<std::string> lines_;
+    bool                     direct_  = false;
+    bool                     changed_ = false;
+};
+
 // Every setting the presets and DEFAULTS cover (CopyTunables), written into the usual sections,
 // or into a preset's own (keys "Section.Key").
-bool WriteTunables(const Config& c, const wchar_t* presetSection)
+bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
 {
     struct Value {
         const wchar_t* section;
@@ -100,7 +281,6 @@ bool WriteTunables(const Config& c, const wchar_t* presetSection)
     };
     const Value values[] = {
         { L"Camera",    L"CustomCamera",         c.customCamera ? 1.0 : 0.0 },
-        { L"Camera",    L"KeepGameAngle",        c.keepGameAngle ? 1.0 : 0.0 },
         { L"Camera",    L"CameraAngleDeg",       c.cameraAngleDeg },
         { L"Camera",    L"HeadForward",          c.headForward },
         { L"Camera",    L"HeadHeight",           c.headHeight },
@@ -161,6 +341,7 @@ bool WriteTunables(const Config& c, const wchar_t* presetSection)
         { L"Graphics",  L"ShadowResolution",     static_cast<double>(c.shadowResolution) },
         { L"Graphics",  L"Headlight",            c.headlight },
         { L"Graphics",  L"HeadlightBeamDeg",     c.headlightBeamDeg },
+        { L"Graphics",  L"HeadlightAimDeg",      c.headlightAimDeg },
         { L"Graphics",  L"AmbientOcclusion",     c.ambientOcclusion },
         { L"Graphics",  L"SunRays",              c.sunRays },
         { L"Graphics",  L"Bloom",                c.bloom },
@@ -193,9 +374,9 @@ bool WriteTunables(const Config& c, const wchar_t* presetSection)
         if (presetSection) {
             wchar_t full[128];
             swprintf_s(full, L"%s.%s", v.section, v.key);
-            ok = WritePrivateProfileStringW(presetSection, full, text, g_path) != FALSE && ok;
+            ok = ini.Set(presetSection, full, text) && ok;
         } else {
-            ok = WritePrivateProfileStringW(v.section, v.key, text, g_path) != FALSE && ok;
+            ok = ini.Set(v.section, v.key, text) && ok;
         }
     }
     return ok;
@@ -214,7 +395,9 @@ bool SaveConfig()
     if (!g_path[0])
         return false;
 
-    bool ok = WritePrivateProfileStringW(L"General", L"Enabled", g_config.enabled ? L"1" : L"0", g_path) != FALSE;
+    const double started = NowSeconds();
+    IniBatch ini(g_path);
+    bool ok = ini.Set(L"General", L"Enabled", g_config.enabled ? L"1" : L"0");
     // The keybinds (the KEYBINDS tab).
     const struct { const wchar_t* section; const wchar_t* key; int vk; } keys[] = {
         { L"General",  L"MenuKey",   g_config.menuKey },
@@ -224,35 +407,50 @@ bool SaveConfig()
     for (const auto& k : keys) {
         wchar_t text[16];
         swprintf_s(text, L"0x%02X", k.vk);
-        ok = WritePrivateProfileStringW(k.section, k.key, text, g_path) != FALSE && ok;
+        ok = ini.Set(k.section, k.key, text) && ok;
+    }
+    // The controller's look binds (by name: DPAD_LEFT, RS_X-, PADDLE1...).
+    const struct { const wchar_t* key; int control; } looks[] = {
+        { L"LookLeftControl",  g_config.lookLeftControl },
+        { L"LookRightControl", g_config.lookRightControl },
+        { L"LookBackControl",  g_config.lookBackControl },
+    };
+    for (const auto& l : looks) {
+        wchar_t text[32];
+        swprintf_s(text, L"%hs", gamepad::ControlKey(l.control));
+        ok = ini.Set(L"Look", l.key, text) && ok;
     }
     // A display choice, shared by the presets.
-    ok = WritePrivateProfileStringW(L"Other", L"FullscreenWindow", g_config.fullscreenWindow ? L"1" : L"0", g_path) != FALSE && ok;
-    ok = WriteTunables(g_config, nullptr) && ok;
+    ok = ini.Set(L"Other", L"FullscreenWindow", g_config.fullscreenWindow ? L"1" : L"0") && ok;
+    ok = WriteTunables(ini, g_config, nullptr) && ok;
     // The presets: which one is live (its settings are the ones above), and the others' own.
     wchar_t active[8];
     swprintf_s(active, L"%d", g_activePreset + 1);
-    ok = WritePrivateProfileStringW(L"Presets", L"Active", active, g_path) != FALSE && ok;
+    ok = ini.Set(L"Presets", L"Active", active) && ok;
     for (int i = 0; i < kPresetCount; ++i) {
         if (i == g_activePreset) {
-            WritePrivateProfileStringW(PresetSection(i), nullptr, nullptr, g_path);  // it's the usual sections
+            ini.Set(PresetSection(i), nullptr, nullptr);  // it's the usual sections
             continue;
         }
         Config preset = g_config;
         CopyTunables(g_presets[i], preset);
-        ok = WriteTunables(preset, PresetSection(i)) && ok;
+        ok = WriteTunables(ini, preset, PresetSection(i)) && ok;
     }
     // Renamed to HorizonLock; drop the old key so the file can't disagree with itself.
-    WritePrivateProfileStringW(L"Leveling", L"LeanCompensation", nullptr, g_path);
-    WritePrivateProfileStringW(L"Replay", L"ChaseCam", nullptr, g_path);  // now Camera
-    Log("config: %s %ls", ok ? "saved" : "FAILED to save", g_path);
+    ini.Set(L"Leveling", L"LeanCompensation", nullptr);
+    ini.Set(L"Replay", L"ChaseCam", nullptr);  // now Camera
+    // Keep game angle is gone: the custom camera uses its look-down angle, the game camera the game's.
+    ini.Set(L"Camera", L"KeepGameAngle", nullptr);
+    for (int i = 0; i < kPresetCount; ++i)
+        ini.Set(PresetSection(i), L"Camera.KeepGameAngle", nullptr);
+    ok = ini.Commit() && ok;
+    Log("config: %s %ls (%.0f ms)", ok ? "saved" : "FAILED to save", g_path, (NowSeconds() - started) * 1000.0);
     return ok;
 }
 
 void CopyTunables(const Config& from, Config& to)
 {
     to.customCamera         = from.customCamera;
-    to.keepGameAngle        = from.keepGameAngle;
     to.cameraAngleDeg       = from.cameraAngleDeg;
     to.headForward          = from.headForward;
     to.headHeight           = from.headHeight;
@@ -314,6 +512,7 @@ void CopyTunables(const Config& from, Config& to)
     to.shadowMapSize        = from.shadowMapSize;
     to.headlight            = from.headlight;
     to.headlightBeamDeg     = from.headlightBeamDeg;
+    to.headlightAimDeg      = from.headlightAimDeg;
     to.ambientOcclusion     = from.ambientOcclusion;
     to.sunRays              = from.sunRays;
     to.bloom                = from.bloom;
@@ -412,6 +611,21 @@ Config ParseConfig(const Config& base)
     c.dumpKey   = ReadInt(L"General", L"DumpKey", c.dumpKey);
     c.menuKey   = ReadInt(L"General", L"MenuKey", c.menuKey);
     c.traceKey  = ReadInt(L"General", L"TraceKey", c.traceKey);
+    // The controller's look binds: a name (NONE unbinds it; anything unknown keeps the default).
+    const struct { const wchar_t* key; int Config::* field; } looks[] = {
+        { L"LookLeftControl",  &Config::lookLeftControl },
+        { L"LookRightControl", &Config::lookRightControl },
+        { L"LookBackControl",  &Config::lookBackControl },
+    };
+    for (const auto& l : looks) {
+        char name[64] = "";
+        ReadString(L"Look", l.key, name);
+        if (name[0]) {
+            const gamepad::Control control = gamepad::ParseControl(name);
+            if (control != gamepad::kNone || _stricmp(name, "NONE") == 0)
+                c.*l.field = control;
+        }
+    }
 
     ReadString(L"Detection", L"ModelviewUniform", c.modelviewUniform);
     ReadString(L"Detection", L"CameraProgramUniform", c.cameraProgramUniform);
@@ -424,7 +638,6 @@ Config ParseConfig(const Config& base)
     c.bikeSearchRadius = ReadDouble(L"Detection", L"BikeSearchRadius", c.bikeSearchRadius);
 
     c.customCamera   = ReadInt(L"Camera", L"CustomCamera", c.customCamera) != 0;
-    c.keepGameAngle  = ReadInt(L"Camera", L"KeepGameAngle", c.keepGameAngle) != 0;
     c.cameraAngleDeg = ReadDouble(L"Camera", L"CameraAngleDeg", c.cameraAngleDeg);
     c.headForward    = ReadDouble(L"Camera", L"HeadForward", c.headForward);
     c.headHeight     = ReadDouble(L"Camera", L"HeadHeight", c.headHeight);
@@ -517,7 +730,12 @@ Config ParseConfig(const Config& base)
     c.headlightBeamDeg = ReadDouble(L"Graphics", L"HeadlightBeamDeg", c.headlightBeamDeg);
     c.headlightForward = ReadDouble(L"Graphics", L"HeadlightForward", c.headlightForward);
     c.headlightHeight  = ReadDouble(L"Graphics", L"HeadlightHeight", c.headlightHeight);
-    c.headlightPitchDeg = ReadDouble(L"Graphics", L"HeadlightPitchDeg", c.headlightPitchDeg);
+    {
+        // (Before HeadlightAimDeg: HeadlightPitchDeg, how far it was aimed down, its top edge 6
+        // degrees under that.)
+        const double aim = ReadDouble(L"Graphics", L"HeadlightAimDeg", 1e9);
+        c.headlightAimDeg = aim < 1e8 ? aim : 6.0 - ReadDouble(L"Graphics", L"HeadlightPitchDeg", 6.0 - c.headlightAimDeg);
+    }
     c.ambientOcclusion = ReadDouble(L"Graphics", L"AmbientOcclusion", c.ambientOcclusion);
     c.aoRadius         = ReadDouble(L"Graphics", L"AORadius", c.aoRadius);
     c.sunRays          = ReadDouble(L"Graphics", L"SunRays", c.sunRays);
@@ -559,7 +777,7 @@ Config ParseConfig(const Config& base)
     c.horizonLock          = Clamp(c.horizonLock, 0.0, 1.0);
     c.pitchLock            = Clamp(c.pitchLock, 0.0, 1.0);
     c.maxRollCorrectionDeg = Clamp(c.maxRollCorrectionDeg, 0.0, 180.0);
-    c.steadiness           = Clamp(c.steadiness, 0.0, 1.0);
+    c.steadiness           = Clamp(c.steadiness, 0.0, 2.0);
     c.airLooseness         = Clamp(c.airLooseness, 0.0, 1.0);
     c.whipLock             = Clamp(c.whipLock, 0.0, 1.0);
     c.lookSideDeg          = Clamp(c.lookSideDeg, 10.0, 90.0);
@@ -611,7 +829,7 @@ Config ParseConfig(const Config& base)
     c.headlightBeamDeg     = Clamp(c.headlightBeamDeg, 5.0, 90.0);
     c.headlightForward     = Clamp(c.headlightForward, -3.0, 3.0);
     c.headlightHeight      = Clamp(c.headlightHeight, -3.0, 3.0);
-    c.headlightPitchDeg    = Clamp(c.headlightPitchDeg, -30.0, 45.0);
+    c.headlightAimDeg      = Clamp(c.headlightAimDeg, -20.0, 15.0);
     c.ambientOcclusion     = Clamp(c.ambientOcclusion, 0.0, 1.0);
     c.aoRadius             = Clamp(c.aoRadius, 0.1, 5.0);
     c.sunRays              = Clamp(c.sunRays, 0.0, 1.0);

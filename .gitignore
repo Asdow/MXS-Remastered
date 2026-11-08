@@ -1,3 +1,8 @@
 # Written by the mod at runtime
 mxcam.log
 mxcam_trace.csv
+
+# The sound mods' sound files: the packs (tools/engine_sounds builds them) and their previews,
+# and the copies the build puts next to the DLLs. The code that installs them stays in the repo.
+mxcam_sounds/
+bin/*/Release/mxcam_sounds/
