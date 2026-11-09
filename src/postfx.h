@@ -162,5 +162,9 @@ void FrameEnd(bool apply = true);
 // One line for the settings panel.
 const char* StatusText();
 
+// Your speed (m/s), from your rider's movement (for the dab indicator). False when your rider
+// hasn't been seen lately.
+bool RiderSpeed(double& speed);
+
 }  // namespace postfx
 }  // namespace mxcam

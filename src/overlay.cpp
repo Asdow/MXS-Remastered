@@ -26,6 +26,7 @@
 #include "bike.h"
 #include "camera.h"
 #include "config.h"
+#include "dab.h"
 #include "gamepad.h"
 #include "hooks.h"
 #include "log.h"
@@ -980,6 +981,10 @@ const RowDef kRows[] = {
               "The cache size doesn't effect FPS, it only changes how much memory is used"),
     Slider(1, nullptr,           "Tire dirt",            &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Mud caked on your tires, in clumps that turn with the wheels, lit by the sun."),
+    Toggle(1, nullptr,           "Marks & dirt on every bike", &Config::marksEveryBike)
+        .Help("Tire marks and tire dirt on every bike around you in a lobby or a replay, not just yours: "
+              "any model, found by its wheels turning. Their ruts are pressed where the ground under "
+              "them is on screen, out to about 100 m."),
     Slider(1, "COLOR",           "Brightness",           &Config::exposure,         -2.0,  2.0,   0.05,   1.0,    2, " EV")
         .Help("Overall exposure. +1 EV is twice as bright, -1 EV half."),
     Slider(1, nullptr,           "Contrast",             &Config::contrast,         -0.5,  0.5,   0.01,   100.0,  0, "%")
@@ -1067,6 +1072,11 @@ const RowDef kRows[] = {
     Toggle(4, nullptr,          "Hide cursor",               &Config::hideCursor)
         .Help("Hides the game's mouse cursor while you ride or watch a replay. It comes back as soon "
               "as you move the mouse, and is never hidden in the game's menus."),
+    Toggle(4, nullptr,          "Dab indicator",             &Config::dabIndicator)
+        .Help("Shows at the bottom right, next to the speedometer, whether your rider is standing or "
+              "sitting: a red rider standing on the bike, or a green one sitting with a foot down while "
+              "you hold the game's Sit/Dab key. Follows the game's own settings: your Sit/Dab key or "
+              "button, Sticky Sit/Dab and Dab When Stopped."),
     Toggle(4, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
         .Help("With the game in windowed mode, makes its window cover the whole screen with no border "
               "(borderless fullscreen): Alt+Tab stays instant. Off puts the window back as it was. "
@@ -1577,7 +1587,8 @@ void FormatValue(const RowDef& def, double value, char* out, size_t size)
     if (def.number == &Config::markCacheSegs) {
         // The mark cache: the count it keeps, and the memory it costs (both wheels, kMarkSegBytes
         // a segment), so the size can be weighed before it's set.
-        const double bytes = value * 2.0 * static_cast<double>(kMarkSegBytes);
+        // (With every bike's marks on, theirs as well: a cache of their own, four times one of yours.)
+        const double bytes = value * (GetConfig().marksEveryBike ? 6.0 : 2.0) * static_cast<double>(kMarkSegBytes);
         snprintf(out, size, "%.0f segs: %.1f MB", value, bytes / (1024.0 * 1024.0));
         return;
     }
@@ -2037,7 +2048,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     const float gap = S(10), bw = S(180);
     const float buttonsX = x + innerW - 3 * bw - 2 * gap;
     if (Button(saveItem, buttonsX, bw, g_panel.dirty ? "SAVE" : "SAVED", g_panel.dirty,
-               "Writes your settings and keybinds to mxcam.ini so they load next time.")) {
+               "Writes your settings and keybinds to MXS_REMASTERED.ini so they load next time.")) {
         if (SaveConfig()) {
             g_panel.dirty = false;
             SetStatus("SAVED TO MXCAM.INI", now);
@@ -2068,7 +2079,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         const bool areaHot = in.Inside(x, y, sx0 + total - x, buttonH);
         OfferHelp("Three presets, each with its own copy of every setting (not the keybinds). Click one to "
                   "switch to it: your changes stay with the preset you made them in. SAVE writes all three "
-                  "to mxcam.ini, and the game starts with the one in use.",
+                  "to MXS_REMASTERED.ini, and the game starts with the one in use.",
                   y, y + buttonH, x, sx0 + total - x, areaHot, focused);
         if (focused)
             Marker(px + S(10), segY, segH);
@@ -2323,6 +2334,121 @@ void StartupHintFrame(HWND window, double now)
     RestoreState(saved);
 }
 
+// ===========================================================================
+// The dab indicator (Config::dabIndicator): bottom right, by the game's speedometer, whether your
+// rider stands on the pegs (red, a rider standing on the bike) or sits or dabs (green, a rider sitting
+// with a foot down), from the game's dab key and settings (dab.cpp).
+// ===========================================================================
+// A line of width w with round ends.
+void Segment(float x0, float y0, float x1, float y1, float w, uint32_t color)
+{
+    const float dx = x1 - x0, dy = y1 - y0, length = std::sqrt(dx * dx + dy * dy);
+    if (length > 1e-3f) {
+        const float nx = -dy / length * w * 0.5f, ny = dx / length * w * 0.5f;
+        const float u = 4.0f / kAtlasSize;  // the solid block
+        const Vertex a{ x0 + nx, y0 + ny, u, u, color }, b{ x1 + nx, y1 + ny, u, u, color };
+        const Vertex c{ x1 - nx, y1 - ny, u, u, color }, d{ x0 - nx, y0 - ny, u, u, color };
+        g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+    }
+    Disc(x0, y0, w * 0.5f, color);
+    Disc(x1, y1, w * 0.5f, color);
+}
+
+// The icon, in units of a 64 x 56 box (the bike facing right, its wheels on the ground at the bottom).
+struct IconLine { float x0, y0, x1, y1, w; };
+const IconLine kDabBike[] = {
+    { 4, 27, 10, 30, 3.0f },    // rear fender
+    { 10, 30, 30, 30, 3.8f },   // seat
+    { 30, 30, 42, 25, 3.8f },   // tank
+    { 13, 44, 29, 40, 3.2f },   // swingarm
+    { 29, 40, 41, 28, 3.2f },   // frame and engine
+    { 51, 44, 43, 22, 3.2f },   // fork
+    { 43, 22, 40, 18, 3.0f },   // bars
+    { 46, 31, 56, 29, 3.0f },   // front fender
+};
+const float kDabWheels[2][2] = { { 13, 44 }, { 51, 44 } };
+constexpr float kDabWheelRadius = 8.5f;
+struct IconRider {
+    IconLine lines[5];
+    float    headX, headY;
+};
+const IconRider kDabStanding = {
+    { { 29, 40, 36, 31, 3.4f }, { 36, 31, 28, 20, 3.4f },   // shin from the peg, thigh
+      { 28, 20, 35, 9, 3.4f },                              // torso
+      { 35, 9, 42, 13, 3.4f }, { 42, 13, 40, 18, 3.4f } },  // arm to the bars
+    38, 4.5f,
+};
+const IconRider kDabSitting = {
+    { { 20, 27, 32, 27, 3.4f }, { 32, 27, 38, 51, 3.4f },   // thigh along the seat, the dabbed leg to the ground
+      { 20, 27, 25, 13, 3.4f },                             // torso
+      { 25, 13, 33, 16, 3.4f }, { 33, 16, 40, 18, 3.4f } }, // arm to the bars
+    27.5f, 8,
+};
+constexpr float kDabHeadRadius = 4.3f;
+
+void BuildDabIndicator(int width, int height, bool sitting)
+{
+    const float s = g_atlasScale;
+    const auto S = [s](float v) { return std::round(v * s); };
+    const uint32_t color = sitting ? Rgba(46, 204, 96, 1.0f) : Rgba(226, 58, 58, 1.0f);
+    const uint32_t back = Rgba(13, 17, 26, 1.0f);
+    const float unit = 1.15f * s, pad = S(10);
+    const float w = std::round(64 * unit) + 2 * pad, h = std::round(56 * unit) + 2 * pad;
+    // Bottom right, left of where the game draws its speedometer.
+    const float x = std::round(width - S(285) - w), y = std::round(height - S(20) - h);
+    RoundedRect(x - S(2), y - S(2), w + S(4), h + S(4), S(8), color);
+    RoundedRect(x, y, w, h, S(6), Rgba(13, 17, 26, 0.88f));
+    const auto X = [&](float u) { return x + pad + u * unit; };
+    const auto Y = [&](float v) { return y + pad + v * unit; };
+    for (const auto& wheel : kDabWheels) {
+        const int n = 20;
+        for (int i = 0; i < n; ++i) {
+            const float a0 = 6.2831853f * i / n, a1 = 6.2831853f * (i + 1) / n;
+            Segment(X(wheel[0] + kDabWheelRadius * std::cos(a0)), Y(wheel[1] + kDabWheelRadius * std::sin(a0)),
+                    X(wheel[0] + kDabWheelRadius * std::cos(a1)), Y(wheel[1] + kDabWheelRadius * std::sin(a1)), 3.0f * unit,
+                    color);
+        }
+    }
+    for (const IconLine& l : kDabBike)
+        Segment(X(l.x0), Y(l.y0), X(l.x1), Y(l.y1), l.w * unit, color);
+    // The rider over the bike, with an outline in the box's colour so it stands apart from it.
+    const IconRider& rider = sitting ? kDabSitting : kDabStanding;
+    for (int pass = 0; pass < 2; ++pass) {
+        const float extra = pass == 0 ? 2.4f : 0.0f;
+        const uint32_t c = pass == 0 ? back : color;
+        for (const IconLine& l : rider.lines)
+            Segment(X(l.x0), Y(l.y0), X(l.x1), Y(l.y1), (l.w + extra) * unit, c);
+        Disc(X(rider.headX), Y(rider.headY), (kDabHeadRadius + extra * 0.5f) * unit, c);
+    }
+}
+
+// Draws the dab indicator over this frame (the menu closed), while you ride or watch.
+void DabIndicatorFrame(HWND window)
+{
+    if (!GetConfig().dabIndicator)
+        return;
+    double speed = 0;
+    const bool haveSpeed = postfx::RiderSpeed(speed);
+    dab::Update(haveSpeed, speed);
+    const bool sitting = dab::Sitting();
+    if (!SceneOnScreen() || GameMenuOverScene())
+        return;
+    RECT client;
+    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
+        return;
+    const int width = client.right, height = client.bottom;
+    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
+    SavedState saved;
+    SaveState(saved);
+    if (EnsureResources(scale)) {
+        g_batch.clear();
+        g_keepRanges.clear();
+        BuildDabIndicator(width, height, sitting);
+        DrawBatch(width, height);
+    }
+    RestoreState(saved);
+}
+
 }  // namespace
 
 bool OverlayListeningForKey()
@@ -2418,6 +2544,7 @@ void OverlayFrame(HDC dc)
         if (!window || !g_glAvailable)
             return;
         if (!((menuKey && focus) || testOpen)) {
+            DabIndicatorFrame(window);
             StartupHintFrame(window, now);  // (which key opens the menu, for a few seconds after the start)
             return;
         }

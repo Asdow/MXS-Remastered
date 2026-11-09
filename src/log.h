@@ -1,5 +1,5 @@
 // log.h
-//   Tiny thread-safe text log (mxcam.log next to the DLL).
+//   Tiny thread-safe text log (MXS_REMASTERED.log, in the folder paths.h picks).
 #pragma once
 
 namespace mxcam {

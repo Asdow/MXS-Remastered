@@ -358,18 +358,6 @@ const float kMarkBlend = 60.0;
 
 float MarkNear(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
 
-// How much groove is at t, the fullest of the four texels next to it (its edges come from where
-// a neighbour holds a groove and this one little), and how much more there is to the right and
-// above: the groove's sides are lit as slopes from those two differences.
-vec4 MarkStatsNear(vec2 t)
-{
-    float m = MarkNear(t);
-    return vec4(m, max(max(MarkNear(t + vec2(2.0, 0.0)), MarkNear(t - vec2(2.0, 0.0))),
-                     max(MarkNear(t + vec2(0.0, 2.0)), MarkNear(t - vec2(0.0, 2.0)))),
-             MarkNear(t + vec2(1.0, 0.0)) - MarkNear(t - vec2(1.0, 0.0)),
-             MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0)));
-}
-
 // Ruts your tires dug into the ground: a groove of darker, packed and damp dirt with the knobs'
 // blocks pressed into its floor, its sides lit by the sun like any slope, and loose dirt thrown
 // up along both edges. The map only covers the window around you: its own ruts, and whatever the
@@ -385,12 +373,19 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     float wNear = smoothstep(0.0, kMarkBlend, inNear);
     if (wNear < 0.004)
         return c;
-    vec4 sNear = MarkStatsNear(t);
-    float m = sNear.x * wNear, around = sNear.y * wNear, gx = sNear.z * wNear, gy = sNear.w * wNear;
-    float texel = u_markTexel;
+    // How much groove is here, and the fullest of the four texels next to it (its edges come from
+    // where a neighbour holds a groove and this one little) - first: most ground has no rut near it,
+    // and is left there without the four taps more the slopes take. Then how much more groove there
+    // is to the right and above: its sides are lit as slopes from those two differences.
+    float m = MarkNear(t) * wNear;
+    float around = max(max(MarkNear(t + vec2(2.0, 0.0)), MarkNear(t - vec2(2.0, 0.0))),
+                       max(MarkNear(t + vec2(0.0, 2.0)), MarkNear(t - vec2(0.0, 2.0)))) * wNear;
     around = max(around, m);
     if (m < 0.004 && around < 0.004)
         return c;
+    float gx = (MarkNear(t + vec2(1.0, 0.0)) - MarkNear(t - vec2(1.0, 0.0))) * wNear;
+    float gy = (MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0))) * wNear;
+    float texel = u_markTexel;
     float k = u_marks;
     // 7 cm deep in the middle: the normal tips with the groove's sides.
     vec3 slope = (u_markUW * gx + u_markVW * gy) * (0.07 * u_metre * k / (2.0 * texel));
@@ -666,7 +661,8 @@ uniform sampler2D u_ground;     // the terrain's depth, before anything stood on
 uniform float u_check;          // 1: check against it on screen
 uniform float u_fallback;       // this wheel's own answer, from its height in the world: 0 in the
                                 // air, presses nothing anywhere; 1: where the screen can see this
-                                // groove, the terrain's depth decides
+                                // groove, the terrain's depth decides; 2 (another bike's wheel, whose
+                                // air nothing else knows): pressed only where the screen says down
 uniform float u_groundTol;      // how far above the ground still counts as down
 uniform vec3  u_upView;
 
@@ -683,11 +679,20 @@ float OnGround(float t)
         vec2 uv = Project(c);
         if (OnScreen(uv)) {
             float d = textureLod(u_ground, uv, 0.0).r;
-            if (!IsSky(d))
-                return dot(c - ViewPos(uv, d), u_upView) < u_groundTol ? 1.0 : 0.0;
+            if (!IsSky(d)) {
+                vec3 g = ViewPos(uv, d);
+                if (u_fallback > 1.5) {
+                    // Another bike's wheel: the ground seen there must be at the tire, not past it -
+                    // as high within the tolerance either way, and near it along the line of sight.
+                    // (Only "no higher than it" pressed ruts under wheels in the air, wherever the
+                    // ground seen past them stood as high: a hill, a jump's face.)
+                    return abs(dot(c - g, u_upView)) < u_groundTol && length(c - g) < 10.0 * u_groundTol ? 1.0 : 0.0;
+                }
+                return dot(c - g, u_upView) < u_groundTol ? 1.0 : 0.0;
+            }
         }
     }
-    return u_fallback;
+    return u_fallback > 1.5 ? 0.0 : u_fallback;
 }
 
 void main()

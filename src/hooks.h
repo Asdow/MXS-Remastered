@@ -81,7 +81,7 @@ bool GameMenuOverScene();
 // For the OTHER tab: what hiding the game's HUD and cursor is doing ("" when both are off).
 const char* GameOverlayStatusText();
 
-// Writes the last 15 s of per-frame camera data to mxcam_trace.csv, then keeps recording for
+// Writes the last 15 s of per-frame camera data to MXS_REMASTERED_trace.csv, then keeps recording for
 // the given number of seconds.
 void StartTrace(double seconds);
 

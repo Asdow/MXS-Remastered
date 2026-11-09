@@ -36,7 +36,9 @@
 
 #include "bike.h"
 #include "config.h"
+#include "dab.h"
 #include "hooks.h"
+#include "lobby_wheels.h"
 #include "log.h"
 #include "mathlib.h"
 #include "motion.h"
@@ -175,6 +177,12 @@ struct GLApi {
     void   (APIENTRY* GenerateMipmap)(GLenum);
     void   (APIENTRY* BindSampler)(GLuint, GLuint);  // optional (GL 3.3)
     decltype(&::glScissor)             Scissor;
+    // Optional (GL 3.2): reading the depth back without waiting for it (FillTerrainFromDepth).
+    void*  (APIENTRY* FenceSync)(GLenum, GLbitfield);
+    GLenum (APIENTRY* ClientWaitSync)(void*, GLbitfield, unsigned long long);
+    void   (APIENTRY* DeleteSync)(void*);
+    void   (APIENTRY* GetBufferSubData)(GLenum, ptrdiff_t, ptrdiff_t, void*);
+    void   (APIENTRY* DeleteBuffers)(GLsizei, const GLuint*);
 };
 
 GLApi g_gl{};
@@ -265,6 +273,11 @@ bool LoadGL()
     MXCAM_LOAD(Scissor, "glScissor");
 #undef MXCAM_LOAD
     g_gl.BindSampler = reinterpret_cast<decltype(g_gl.BindSampler)>(GetRealGLFunction("glBindSampler"));
+    g_gl.FenceSync = reinterpret_cast<decltype(g_gl.FenceSync)>(GetRealGLFunction("glFenceSync"));
+    g_gl.ClientWaitSync = reinterpret_cast<decltype(g_gl.ClientWaitSync)>(GetRealGLFunction("glClientWaitSync"));
+    g_gl.DeleteSync = reinterpret_cast<decltype(g_gl.DeleteSync)>(GetRealGLFunction("glDeleteSync"));
+    g_gl.GetBufferSubData = reinterpret_cast<decltype(g_gl.GetBufferSubData)>(GetRealGLFunction("glGetBufferSubData"));
+    g_gl.DeleteBuffers = reinterpret_cast<decltype(g_gl.DeleteBuffers)>(GetRealGLFunction("glDeleteBuffers"));
     g_glState = ok ? 1 : -1;
     if (!ok)
         Log("postfx: OpenGL 3.0 (framebuffer objects) is needed for the shaders; they stay off");
@@ -447,6 +460,16 @@ struct Resources {
     GLuint  sampleFbo = 0, sampleDepth = 0;        // that depth, downsampled, to read back
     int     samplePacking = -1;                    // the depth format it was made in (depthMode's)
     bool    sampleFailed = false;                  // reading it back didn't work: tried once
+    // That read, without waiting for it: into one of these buffers, taken a frame or two later when
+    // the GPU has done it (with the view and projection of the frame it was read in).
+    struct SampleRead {
+        GLuint buffer = 0;
+        void*  fence  = nullptr;  // set while the read is on its way
+        double invProj[16] = {}, view[16] = {};
+    };
+    static constexpr int kSampleReads = 3;
+    SampleRead sampleReads[kSampleReads];
+    int        sampleNext = 0;                     // the slot the next read goes in
     GLuint  shadowFbo = 0, shadowMap = 0;          // depth seen from the sun
     Target  marks;                                 // tire marks: the map of the ground around you (TireMarks)
     bool    marksCleared = false;
@@ -1223,6 +1246,10 @@ bool      g_thirdPerson = false;          // the camera is away from your rider 
 
 // Your bike this frame (world transform), however it was found.
 struct BikeNow { bool found = false; int how = 0; double model[16] = {}; };
+// For the trace (F11): which of this frame's objects FindBike took (-1: none), how (0 followed, 1
+// searched), how far your rider was from where it sits on it (m), and the headlight's placement.
+struct BikeTrace { int object = -1, pass = -1, objects = 0; double carry = -1; int headlightMode = -1; Vec3 headlight; bool lit = false; };
+BikeTrace g_bikeTrace;
 BikeNow g_bikeNow;
 
 // ---- Your bike's wheels ----------------------------------------------------------------------
@@ -1358,7 +1385,7 @@ int    g_wheelLogLines = 0;       // lost / found again lines written (capped, p
 constexpr int kWheelLogLinesMax = 200;
 bool   g_wheelsWereOn = false;
 
-// A one-off report after riding a while (mxcam_bike.txt next to the log): what the wheel search
+// A one-off report after riding a while (MXS_REMASTERED_bike.txt next to the log): what the wheel search
 // saw under your rider, for bug reports.
 struct BikeReport {
     double riding = 0;         // seconds ridden (moving) this session
@@ -1486,9 +1513,16 @@ void LearnJoints(const double torsoWorld[16], const Vec3 shoulder[2], const Vec3
     }
 }
 
+// The dab indicator (dab.cpp) needs your speed when the effects are off: FindOwnRider is then run
+// at the end of the frame (see FrameEnd).
+bool   g_riderThisFrame = false;  // FindOwnRider ran this frame
+double g_riderTime = -1;          // when it last ran
+
 void FindOwnRider(double dt)
 {
     OwnRider& r = g_rider;
+    g_riderThisFrame = true;
+    g_riderTime = Seconds();
     r.seen = false;
     r.haveTorso = false;
     r.haveJoints = false;
@@ -1669,6 +1703,9 @@ int g_headlightMode = -1;  // how the headlight was last placed (for the log)
 
 void NoteHeadlightMode(int mode, const Vec3& position)
 {
+    g_bikeTrace.headlightMode = mode;
+    g_bikeTrace.headlight = position;
+    g_bikeTrace.lit = true;
     if (mode == g_headlightMode)
         return;
     g_headlightMode = mode;
@@ -1795,6 +1832,9 @@ bool FindBike(double model[16])
     const BikeModel& b = g_bikeModel;
     double bestError = 1e9;
     bool found = false;
+    g_bikeTrace.object = g_bikeTrace.pass = -1;
+    g_bikeTrace.carry = -1;
+    g_bikeTrace.objects = static_cast<int>(g_objects.size());
     for (int pass = 0; pass < 2 && !found; ++pass) {
         const bool follow = pass == 0;
         if (follow && !g_haveLastBike)
@@ -1833,6 +1873,9 @@ bool FindBike(double model[16])
                     std::copy(world, world + 16, model);
                     found = true;
                     g_lastBikeProgram = o.program;
+                    g_bikeTrace.object = static_cast<int>(&o - g_objects.data());
+                    g_bikeTrace.pass = 0;
+                    g_bikeTrace.carry = carry / g_unitsPerMetre;
                 }
                 continue;
             }
@@ -1852,6 +1895,9 @@ bool FindBike(double model[16])
                 std::copy(world, world + 16, model);
                 found = true;
                 g_lastBikeProgram = o.program;
+                g_bikeTrace.object = static_cast<int>(&o - g_objects.data());
+                g_bikeTrace.pass = 1;
+                g_bikeTrace.carry = error / g_unitsPerMetre;
             }
         }
     }
@@ -2670,7 +2716,7 @@ void UpdateWheels(double now, double dt)
     if (g_report.capturing && ++g_report.framesCaptured >= 3 && !g_report.written) {
         g_report.written = true;
         wchar_t path[1024];
-        swprintf_s(path, L"%smxcam_bike.txt", LogDirectory());
+        swprintf_s(path, L"%sMXS_REMASTERED_bike.txt", LogDirectory());
         FILE* f = _wfsopen(path, L"w", _SH_DENYWR);
         if (f) {
             fprintf(f, "MXS Remastered: what the tire marks / tire dirt saw near your rider\n%s\n\n", g_tireStatus);
@@ -2745,7 +2791,7 @@ constexpr double kMarkBlend      = 60.0;   // m: how wide the fade band before t
                                            // edge is (the shader's kMarkBlend, kept in step
                                            // with this)
 constexpr double kMarkCacheMin   = 10000.0;    // segments per wheel the cache keeps at least
-constexpr double kMarkCacheMax   = 1000000.0;  // ...and at most: the range the panel and mxcam.ini
+constexpr double kMarkCacheMax   = 1000000.0;  // ...and at most: the range the panel and MXS_REMASTERED.ini
                                                // offer for MarkCacheSegs ("Mark cache", which
                                                // shows the memory: kMarkSegBytes a segment times
                                                // both wheels, so a million is about 92 MB). Big
@@ -2764,8 +2810,13 @@ struct MarkBlock {
     std::vector<MarkSeg> segs;       // up to kMarkBlockSegs of one wheel's trail, oldest first
     double minU, maxU, minV, maxV;   // the box those segments cover, in the map's texels
 };
-std::deque<MarkBlock> g_markCache[2];  // each wheel's ruts this session, oldest block first
-size_t                g_markCacheSize[2] = {};  // segments held per wheel (what the cap counts)
+// [0] your rear wheel's, [1] your front's, [2] every other bike's (Config::marksEveryBike): strokes
+// of about kOthersStroke each, merged from their frame-to-frame paths, kOthersCapTimes yours' cap.
+std::deque<MarkBlock> g_markCache[3];  // each wheel's ruts this session, oldest block first
+size_t                g_markCacheSize[3] = {};  // segments held per wheel (what the cap counts)
+constexpr double kOthersStroke = 0.5;   // m: every other bike's ruts cached in strokes this long
+constexpr int    kOthersCapTimes = 4;   // their cache: this many times one of your wheels' (a full gate's
+                                        // ~44 wheels lay down strokes ~50 times as fast as yours)
 struct MarkMap {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
     double    texel = 0;      // one texel, in game units
@@ -2779,12 +2830,13 @@ size_t MarkCacheCap()
 {
     return static_cast<size_t>(Clamp(GetConfig().markCacheSegs, kMarkCacheMin, kMarkCacheMax));
 }
+size_t CacheCapOf(int i) { return i == 2 ? MarkCacheCap() * kOthersCapTimes : MarkCacheCap(); }
 
 // Nothing the cache holds any more: its segments are placed in the texels the map was laid out
 // with, so a new layout starts them over.
 void ClearMarkCache()
 {
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         g_markCache[i].clear();
         g_markCacheSize[i] = 0;
     }
@@ -2810,7 +2862,7 @@ void PushMark(int i, const MarkSeg& s)
         b.maxV = std::fmax(b.maxV, hiV);
     }
     ++g_markCacheSize[i];
-    const size_t cap = MarkCacheCap();
+    const size_t cap = CacheCapOf(i);
     while (g_markCacheSize[i] > cap && blocks.size() > 1) {
         g_markCacheSize[i] -= blocks.front().segs.size();
         blocks.pop_front();
@@ -3237,12 +3289,6 @@ bool TerrainHeightAt(double cu, double cv, double& height)
     return known;
 }
 
-// Turns this frame's terrain depth into heights in the world. The depth is downsampled to a small
-// texture and read back once a frame (a few thousand samples: the whole window would be), and each
-// sample is put where it is in the world: the window's depth unprojected through the frame's
-// projection and view, the same reconstruction the shaders do. Samples where the line of sight runs
-// along the ground rather than meeting it are dropped: there a whole metre of height follows from a
-// rounding of the depth, so they'd write ground metres away from where it is.
 constexpr int    kSampleWidth   = 160;    // samples across the window
 constexpr int    kSampleHeight  = 90;     // and down
 constexpr double kTerrainGrazing = 0.12;  // a line of sight this close to the ground: dropped
@@ -3255,6 +3301,105 @@ bool g_sampleLogged = false;              // the first fill logs what it made, o
 bool g_sampleQuiet  = false;              // nothing accepted for a whole spell: stop trying
 int  g_sampleNothing = 0;                 // frames in a row that took no sample at all
 
+// Puts one frame's depth samples where they are in the world (the frame's inverse projection and
+// view). False if none of them was ground.
+bool PlaceSamples(const float* samples, const double invP[16], const double view[16])
+{
+    const Vec3 up = WorldUp();
+    Vec3 au, av;
+    PlaneAxes(au, av);
+    const double cell = kTerrainCellMetres * g_unitsPerMetre;
+    const Vec3 eyePosition = CameraPosition(view);
+    int taken = 0;
+    for (int sy = 0; sy < kSampleHeight; ++sy) {
+        const double y = (static_cast<double>(sy) + 0.5) / kSampleHeight * 2.0 - 1.0;
+        for (int sx = 0; sx < kSampleWidth; ++sx) {
+            const float depth = samples[sy * kSampleWidth + sx];
+            if (depth >= 0.999999f)
+                continue;  // the sky: no ground there
+            const double x = (static_cast<double>(sx) + 0.5) / kSampleWidth * 2.0 - 1.0;
+            const double z = static_cast<double>(depth) * 2.0 - 1.0;
+            const double cw = invP[3] * x + invP[7] * y + invP[11] * z + invP[15];
+            if (std::fabs(cw) < 1e-9)
+                continue;
+            Vec3 eye{ (invP[0] * x + invP[4] * y + invP[8] * z + invP[12]) / cw,
+                      (invP[1] * x + invP[5] * y + invP[9] * z + invP[13]) / cw,
+                      (invP[2] * x + invP[6] * y + invP[10] * z + invP[14]) / cw };
+            const double length = Length(eye);
+            if (length < 1e-6)
+                continue;
+            // Where the line of sight meets the ground: dropped when it grazes it (see above).
+            const Vec3 sight = EyeToWorld(view, Vec3{ eye.x / length, eye.y / length, eye.z / length });
+            if (std::fabs(Dot(sight, up)) < kTerrainGrazing)
+                continue;
+            const Vec3 here = eyePosition + EyeToWorld(view, eye);  // the view is the camera's own: the
+                                                                     // rotation applied, plus the eye
+            const double height = Dot(here, up);
+            if (Length(here - eyePosition) > kTerrainFarMetres * g_unitsPerMetre)
+                continue;  // the far plane, or a hill seen over the sky: not near your wheels
+            g_terrain[TerrainSlot(static_cast<long long>(std::floor(Dot(here, au) / cell)),
+                                 static_cast<long long>(std::floor(Dot(here, av) / cell)))] = height;
+            ++taken;
+        }
+    }
+    if (taken == 0) {
+        if (++g_sampleNothing > 90 && !g_sampleQuiet) {
+            g_sampleQuiet = true;  // this game's depth can't be read: the ridden field answers alone
+            Log("postfx: the ground seen on screen is never read; the air test keeps to what you've "
+                "ridden and to the fall of your bike");
+        }
+        return false;
+    }
+    g_sampleNothing = 0;
+    if (g_airLogging && !g_sampleLogged) {
+        g_sampleLogged = true;
+        Log("postfx: the ground is read from what the game drew of the terrain: %d samples a frame", taken);
+    }
+    return true;
+}
+
+constexpr GLenum kPixelPackBuffer         = 0x88EB;  // GL_PIXEL_PACK_BUFFER
+constexpr GLenum kPixelPackBufferBinding  = 0x88ED;
+constexpr GLenum kStreamRead              = 0x88E1;
+constexpr GLenum kSyncGpuCommandsComplete = 0x9117;
+constexpr GLenum kAlreadySignaled         = 0x911A;
+constexpr GLenum kConditionSatisfied      = 0x911C;
+
+bool CanReadLater()
+{
+    return g_gl.FenceSync && g_gl.ClientWaitSync && g_gl.DeleteSync && g_gl.GetBufferSubData;
+}
+
+// The reads of earlier frames the GPU has finished, oldest first, placed in the world (never
+// waiting for one that isn't done: it's taken next frame). True if any of them had ground.
+bool TakeFinishedReads()
+{
+    bool any = false;
+    for (int n = 0; n < Resources::kSampleReads; ++n) {
+        const int i = (g_res.sampleNext + n) % Resources::kSampleReads;  // the oldest first
+        Resources::SampleRead& r = g_res.sampleReads[i];
+        if (!r.fence)
+            continue;
+        const GLenum state = g_gl.ClientWaitSync(r.fence, 0, 0);
+        if (state != kAlreadySignaled && state != kConditionSatisfied)
+            break;  // not done yet (and the ones after it aren't either)
+        g_gl.DeleteSync(r.fence);
+        r.fence = nullptr;
+        g_gl.BindBuffer(kPixelPackBuffer, r.buffer);
+        g_gl.GetBufferSubData(kPixelPackBuffer, 0, kSampleWidth * kSampleHeight * sizeof(float), g_sample.data());
+        any = PlaceSamples(g_sample.data(), r.invProj, r.view) || any;
+    }
+    return any;
+}
+
+// Turns the terrain's depth into heights in the world. The depth is downsampled to a small texture
+// and read back (a few thousand samples: the whole window would be), and each sample is put where
+// it is in the world: the window's depth unprojected through the frame's projection and view, the
+// same reconstruction the shaders do. Samples where the line of sight runs along the ground rather
+// than meeting it are dropped: there a whole metre of height follows from a rounding of the depth,
+// so they'd write ground metres away from where it is. The read goes into a buffer the GPU fills
+// when it gets there, and is taken a frame or two later: reading it straight away made the game
+// wait for the GPU to finish everything before it, every frame (half the frame rate on some PCs).
 bool FillTerrainFromDepth()
 {
     if (g_res.sampleFailed || g_sampleQuiet || !g_frame.haveView || g_res.terrainFbo == 0 ||
@@ -3282,18 +3427,6 @@ bool FillTerrainFromDepth()
             return false;
         }
     }
-    g_gl.BindFramebuffer(kReadFramebuffer, g_res.terrainFbo);
-    DrainErrors();  // the read below is checked: nothing of its own counted beforehand
-    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.sampleFbo);
-    g_gl.BlitFramebuffer(0, 0, g_res.width, g_res.height, 0, 0, kSampleWidth, kSampleHeight,
-                         GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-    g_gl.BindFramebuffer(kReadFramebuffer, g_res.sampleFbo);
-    g_gl.ReadPixels(0, 0, kSampleWidth, kSampleHeight, GL_DEPTH_COMPONENT, GL_FLOAT, g_sample.data());
-    if (g_gl.GetError() != GL_NO_ERROR) {
-        g_res.sampleFailed = true;
-        Log("postfx: the ground can't be read from what the game drew of the terrain");
-        return false;
-    }
     const float* proj = g_haveProjCamera ? g_projCamera : (g_haveProjOther ? g_projOther : nullptr);
     if (!proj)
         return false;
@@ -3302,58 +3435,58 @@ bool FillTerrainFromDepth()
         P[i] = proj[i];
     if (!Invert(P, invP))
         return false;
-    const Vec3 up = WorldUp();
-    Vec3 au, av;
-    PlaneAxes(au, av);
-    const double cell = kTerrainCellMetres * g_unitsPerMetre;
-    const Vec3 eyePosition = CameraPosition(g_frame.rendered);
-    int taken = 0;
-    for (int sy = 0; sy < kSampleHeight; ++sy) {
-        const double y = (static_cast<double>(sy) + 0.5) / kSampleHeight * 2.0 - 1.0;
-        for (int sx = 0; sx < kSampleWidth; ++sx) {
-            const float depth = g_sample[sy * kSampleWidth + sx];
-            if (depth >= 0.999999f)
-                continue;  // the sky: no ground there
-            const double x = (static_cast<double>(sx) + 0.5) / kSampleWidth * 2.0 - 1.0;
-            const double z = static_cast<double>(depth) * 2.0 - 1.0;
-            const double cw = invP[3] * x + invP[7] * y + invP[11] * z + invP[15];
-            if (std::fabs(cw) < 1e-9)
-                continue;
-            Vec3 eye{ (invP[0] * x + invP[4] * y + invP[8] * z + invP[12]) / cw,
-                      (invP[1] * x + invP[5] * y + invP[9] * z + invP[13]) / cw,
-                      (invP[2] * x + invP[6] * y + invP[10] * z + invP[14]) / cw };
-            const double length = Length(eye);
-            if (length < 1e-6)
-                continue;
-            // Where the line of sight meets the ground: dropped when it grazes it (see above).
-            const Vec3 sight = EyeToWorld(g_frame.rendered, Vec3{ eye.x / length, eye.y / length, eye.z / length });
-            if (std::fabs(Dot(sight, up)) < kTerrainGrazing)
-                continue;
-            const Vec3 here = eyePosition +
-                              EyeToWorld(g_frame.rendered, eye);  // the view is the camera's own: the
-                                                                   // rotation applied, plus the eye
-            const double height = Dot(here, up);
-            if (Length(here - eyePosition) > kTerrainFarMetres * g_unitsPerMetre)
-                continue;  // the far plane, or a hill seen over the sky: not near your wheels
-            g_terrain[TerrainSlot(static_cast<long long>(std::floor(Dot(here, au) / cell)),
-                                 static_cast<long long>(std::floor(Dot(here, av) / cell)))] = height;
-            ++taken;
+
+    GLint packBuffer = 0;
+    g_gl.GetIntegerv(kPixelPackBufferBinding, &packBuffer);
+    const bool later = CanReadLater();
+    bool placed = later && TakeFinishedReads();
+
+    // This frame's read: into the next free buffer (none free: skipped this frame, never waited for).
+    Resources::SampleRead* slot = nullptr;
+    if (later) {
+        Resources::SampleRead& r = g_res.sampleReads[g_res.sampleNext];
+        if (!r.fence) {
+            if (!r.buffer) {
+                g_gl.GenBuffers(1, &r.buffer);
+                g_gl.BindBuffer(kPixelPackBuffer, r.buffer);
+                g_gl.BufferData(kPixelPackBuffer, kSampleWidth * kSampleHeight * sizeof(float), nullptr, kStreamRead);
+            }
+            slot = &r;
         }
     }
-    if (taken == 0) {
-        if (++g_sampleNothing > 90 && !g_sampleQuiet) {
-            g_sampleQuiet = true;  // this game's depth can't be read: the ridden field answers alone
-            Log("postfx: the ground seen on screen is never read; the air test keeps to what you've "
-                "ridden and to the fall of your bike");
+    if (!later || slot) {
+        g_gl.BindFramebuffer(kReadFramebuffer, g_res.terrainFbo);
+        DrainErrors();  // the read below is checked: nothing of its own counted beforehand
+        g_gl.BindFramebuffer(kDrawFramebuffer, g_res.sampleFbo);
+        g_gl.BlitFramebuffer(0, 0, g_res.width, g_res.height, 0, 0, kSampleWidth, kSampleHeight,
+                             GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        g_gl.BindFramebuffer(kReadFramebuffer, g_res.sampleFbo);
+        if (slot) {
+            g_gl.BindBuffer(kPixelPackBuffer, slot->buffer);
+            g_gl.ReadPixels(0, 0, kSampleWidth, kSampleHeight, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        } else {
+            g_gl.BindBuffer(kPixelPackBuffer, 0);
+            g_gl.ReadPixels(0, 0, kSampleWidth, kSampleHeight, GL_DEPTH_COMPONENT, GL_FLOAT, g_sample.data());
         }
-        return false;
+        if (g_gl.GetError() != GL_NO_ERROR) {
+            g_gl.BindBuffer(kPixelPackBuffer, packBuffer);
+            g_res.sampleFailed = true;
+            Log("postfx: the ground can't be read from what the game drew of the terrain");
+            return false;
+        }
+        if (slot) {
+            slot->fence = g_gl.FenceSync(kSyncGpuCommandsComplete, 0);
+            for (int i = 0; i < 16; ++i) {
+                slot->invProj[i] = invP[i];
+                slot->view[i] = g_frame.rendered[i];
+            }
+            g_res.sampleNext = (g_res.sampleNext + 1) % Resources::kSampleReads;
+        } else {
+            placed = PlaceSamples(g_sample.data(), invP, g_frame.rendered);
+        }
     }
-    g_sampleNothing = 0;
-    if (g_airLogging && !g_sampleLogged) {
-        g_sampleLogged = true;
-        Log("postfx: the ground is read from what the game drew of the terrain: %d samples a frame", taken);
-    }
-    return true;
+    g_gl.BindBuffer(kPixelPackBuffer, packBuffer);
+    return placed;
 }
 
 // After a cleared strip let fresh ground into the window, press back from the cache what was
@@ -3381,7 +3514,7 @@ void RepressCache(int axis, long long from, long long count)
     // rut's half (the rear's, the wider of the two): a segment reaching into the strip from
     // outside the box still gets pressed. In the map's texels.
     const double widest = 0.12 * g_unitsPerMetre / m.texel;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         for (const MarkBlock& b : g_markCache[i]) {
             const double bLo = axis == 0 ? b.minU - widest : b.minV - widest;
             const double bHi = axis == 0 ? b.maxU + widest : b.maxV + widest;
@@ -3441,6 +3574,13 @@ void UpdateBikeFall()
 // ground came in, and presses this frame's grooves into the map. Returns whether the map is
 // usable.
 // Whether a wheel's tire is on the ground this frame, and where its rut may press -------------
+// What every bike's paths did this frame in the marks (for the trace: WheelTraceText).
+struct LobbyMarkStats {
+    int    segments = 0, yours = 0, clear = 0, step = 0, outside = 0, pressed = 0;
+    double nearest[2] = { -1, -1 };  // m from each of your wheels' contacts to the nearest path's end (-1: none)
+};
+LobbyMarkStats g_lobbyStats;
+
 bool UpdateMarks(double dt)
 {
     const Config& cfg = GetConfig();
@@ -3730,6 +3870,113 @@ bool UpdateMarks(double dt)
         w.lastV = tv;
         w.lastContact = contact;
         w.haveLast = true;
+    }
+    // Every other bike's wheels (Config::marksEveryBike, lobby_wheels.h): their paths since the last
+    // frame, pressed only where the screen shows the tire on the ground (u_fallback 2) - nothing
+    // here knows another bike's air the way your own wheels' fall is read above. Yours are left out
+    // (pressed above already), as is anything outside the map's window.
+    // Cached as well (g_markCache[2]), in strokes of kOthersStroke, so they come back wherever the
+    // window reuses ground, as yours do. The screen's test that decides what's pressed is the GPU's,
+    // so what's cached is what two answers here agree was on the ground: the wheel not falling (its
+    // contact's own fall, lobby_wheels.cpp) and not clear of the ground seen there. (Cached whole,
+    // the ruts under wheels in the air would be pressed back in wherever the cache re-presses.)
+    {
+        struct Stroke { double su = 0, sv = 0, lu = 0, lv = 0; double seen = 0; bool have = false; };
+        static std::unordered_map<unsigned, Stroke> strokes;  // each wheel's stroke being drawn out
+        const auto Flush = [&](Stroke& k) {
+            if (k.have && std::hypot(k.lu - k.su, k.lv - k.sv) * m.texel > 0.05 * g_unitsPerMetre)
+                PushMark(2, MarkSeg{ k.su, k.sv, k.lu, k.lv, 0.105, 0.85 });
+            k.have = false;
+        };
+        const double seenCell = kTerrainCellMetres * g_unitsPerMetre;
+        const auto ClearOfSeen = [&](Vec3 p) {
+            double seen = 0;
+            return TerrainHeightAt(Dot(p, u) / seenCell, Dot(p, v) / seenCell, seen) &&
+                   Dot(p, up) - seen > kAirClearMetres * g_unitsPerMetre;
+        };
+        static std::vector<lobby::Segment> others;
+        lobby::TakeSegments(others);
+        g_lobbyStats = LobbyMarkStats{};
+        g_lobbyStats.segments = static_cast<int>(others.size());
+        for (const lobby::Segment& s : others)
+            for (int i = 0; i < 2; ++i)
+                if (g_wheels[i].on) {
+                    const double d = Length(Vec3{ s.b[0], s.b[1], s.b[2] } - g_wheels[i].contact) / g_unitsPerMetre;
+                    if (g_lobbyStats.nearest[i] < 0 || d < g_lobbyStats.nearest[i])
+                        g_lobbyStats.nearest[i] = d;
+                }
+        if (cfg.marksEveryBike && checkGround) {
+            g_gl.Uniform1f(stamp["u_fallback"], 2.0f);
+            const double margin = 64.0;
+            const double halfWidth = 0.105 * g_unitsPerMetre, strength = 0.85;
+            for (const lobby::Segment& s : others) {
+                const Vec3 a{ s.a[0], s.a[1], s.a[2] }, b{ s.b[0], s.b[1], s.b[2] };
+                const double step = Length(b - a);
+                Stroke& stroke = strokes[s.id];
+                stroke.seen = g_markTime;
+                if (step < 0.01 * g_unitsPerMetre || step > 2.5 * g_unitsPerMetre) {
+                    ++g_lobbyStats.step;
+                    if (step >= 0.01 * g_unitsPerMetre)
+                        Flush(stroke);  // (a respawn: the stroke ends where it was)
+                    continue;  // (standing still, or a respawn)
+                }
+                // Your own wheel, while its own groove above is pressing (no second rut). Where yours
+                // reads itself off the ground it's left to this path's tests: leant over mid-corner,
+                // your rut stopped at the apex and came back on the way out, with nothing pressed
+                // between (this path's tests then answered for the bikes around you correctly).
+                bool yours = false;
+                for (const Wheel& w : g_wheels)
+                    yours = yours || (w.on && w.grounded && Length(b - w.contact) < 0.6 * g_unitsPerMetre);
+                if (yours) {
+                    ++g_lobbyStats.yours;
+                    Flush(stroke);
+                    continue;
+                }
+                // (In the air or not is the shader's test: the ground seen at the tire, right at it.)
+                const double au = Dot(a, u) / m.texel, av = Dot(a, v) / m.texel;
+                const double bu = Dot(b, u) / m.texel, bv = Dot(b, v) / m.texel;
+                const auto Inside = [&](double tu, double tv) {
+                    return tu > static_cast<double>(m.originU) + margin && tu < static_cast<double>(m.originU + m.size) - margin &&
+                           tv > static_cast<double>(m.originV) + margin && tv < static_cast<double>(m.originV + m.size) - margin;
+                };
+                if (!Inside(au, av) || !Inside(bu, bv)) {
+                    ++g_lobbyStats.outside;
+                    Flush(stroke);
+                    continue;
+                }
+                ++g_lobbyStats.pressed;  // (sent to be pressed: the screen's test may still say air)
+                Vec(stamp, "u_eyeA", TransformPoint(g_frame.rendered, a));
+                Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, b));
+                Groove(g_res.marks, m, au, av, bu, bv, halfWidth / m.texel, strength);
+                // Into the cache, in strokes: only while both answers say on the ground.
+                if (s.grounded && !ClearOfSeen(a) && !ClearOfSeen(b)) {
+                    if (!stroke.have) {
+                        stroke.su = au;
+                        stroke.sv = av;
+                        stroke.have = true;
+                    }
+                    stroke.lu = bu;
+                    stroke.lv = bv;
+                    if (std::hypot(bu - stroke.su, bv - stroke.sv) * m.texel >= kOthersStroke * g_unitsPerMetre) {
+                        PushMark(2, MarkSeg{ stroke.su, stroke.sv, bu, bv, 0.105, 0.85 });
+                        stroke.su = bu;
+                        stroke.sv = bv;
+                    }
+                } else {
+                    Flush(stroke);
+                }
+            }
+        }
+        // Wheels gone (out of sight, out of reach): their strokes end where they were last.
+        for (auto it = strokes.begin(); it != strokes.end();) {
+            if (g_markTime - it->second.seen > 0.5 || !cfg.marksEveryBike) {
+                if (cfg.marksEveryBike)
+                    Flush(it->second);
+                it = strokes.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     // What the marks' air test reads, whatever it makes up to decide: while rolling this should
     // read a shallow fall (well under kAirFreeFallG) and no hold at all, and in a jump about -1 g
@@ -4997,7 +5244,7 @@ WheelCast OwnWheelCast(int i, unsigned* program, float viewModel[16])
 
 const char* WheelTraceText()
 {
-    static char text[256];
+    static char text[512];
     double inv[16];
     const bool bike = g_bikeNow.found && AffineInverse(g_bikeNow.model, inv);
     int n = 0;
@@ -5007,7 +5254,28 @@ const char* WheelTraceText()
         n += snprintf(text + n, sizeof text - n, "%d,%d,%d,%.3f,%.3f,%.3f,", w.on ? 1 : 0, w.on && !w.fromBike ? 1 : 0,
                       w.farOff ? 1 : 0, local.x, local.y, local.z);
     }
-    snprintf(text + n, sizeof text - n, "%.3f,%d", g_wheels[1].stretch, bike ? 1 : 0);
+    n += snprintf(text + n, sizeof text - n, "%.3f,%d", g_wheels[1].stretch, bike ? 1 : 0);
+    // The marks: your wheels' own answer (pressing), and what every bike's paths did this frame.
+    const LobbyMarkStats& l = g_lobbyStats;
+    n += snprintf(text + n, sizeof text - n, ",%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f", g_wheels[0].on && g_wheels[0].grounded ? 1 : 0,
+                  g_wheels[1].on && g_wheels[1].grounded ? 1 : 0, l.segments, l.yours, l.clear, l.step, l.outside, l.pressed,
+                  l.nearest[0], l.nearest[1]);
+    // The headlight (third person): the mode it was placed in, your bike's object, the rider's
+    // distance from its place on it (m), and the light from your rider: ahead, up, across (m).
+    {
+        const BikeTrace& b = g_bikeTrace;
+        Vec3 rel;
+        if (b.lit && g_rider.seen && g_rider.haveHeading) {
+            const Vec3 d = (b.headlight - g_rider.position) / g_unitsPerMetre, upW = WorldUp();
+            rel = Vec3{ Dot(d, g_rider.heading), Dot(d, upW), Dot(d, Normalize(Cross(g_rider.heading, upW))) };
+        }
+        n += snprintf(text + n, sizeof text - n, ",%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f", b.lit ? b.headlightMode : -1,
+                      g_thirdPerson ? 1 : 0, b.pass, b.object, b.objects, b.carry, rel.x, rel.y, rel.z);
+        g_bikeTrace.lit = false;
+    }
+    // The dab indicator (dab.cpp): the dab key held, sitting, your speed (m/s).
+    snprintf(text + n, sizeof text - n, ",%d,%d,%.2f", dab::KeyDown() ? 1 : 0, dab::Sitting() ? 1 : 0,
+             g_rider.seen ? Length(g_rider.velocity) / g_unitsPerMetre : -1.0);
     return text;
 }
 
@@ -5057,7 +5325,7 @@ bool GetOwnAnchors(OwnAnchors& out)
 // Setting the map unset is enough to have it cleared and laid out fresh at the next frame's camera.
 void MarksNewTrack()
 {
-    if (!g_mark.set && g_markCache[0].empty() && g_markCache[1].empty())
+    if (!g_mark.set && g_markCache[0].empty() && g_markCache[1].empty() && g_markCache[2].empty())
         return;  // nothing was learnt about a ground: the marks are as fresh as the new track's
     g_mark.set = false;
     for (Wheel& w : g_wheels) {
@@ -5130,6 +5398,13 @@ void FrameEnd(bool apply)
         g_frame.applied = true;
         Apply();
     }
+    // The dab indicator's rider, when the effects didn't look for it this frame (shaders off).
+    if (cfg.dabIndicator && g_frame.haveView && !g_riderThisFrame && LoadGL()) {
+        const double now = Seconds();
+        const double dt = g_riderTime > 0 ? Clamp(now - g_riderTime, 1.0 / 1000.0, 0.25) : 1.0 / 60.0;
+        FindOwnRider(dt);
+    }
+    g_riderThisFrame = false;
     if (g_frame.haveView) {
         for (int i = 0; i < 16; ++i)
             g_lastRaw[i] = g_frame.raw[i];
@@ -5140,6 +5415,14 @@ void FrameEnd(bool apply)
     g_skeletons.clear();
     g_objects.clear();
     g_shadow = ShadowFrame{};
+}
+
+bool RiderSpeed(double& speed)
+{
+    if (!g_rider.seen || g_riderTime < 0 || Seconds() - g_riderTime > 0.5)
+        return false;
+    speed = Length(g_rider.velocity) / g_unitsPerMetre;
+    return true;
 }
 
 const char* StatusText()
@@ -5155,7 +5438,7 @@ const char* StatusText()
     if (!cfg.shaders)
         snprintf(g_status, sizeof g_status, "SHADERS OFF   \xB7   %s TOGGLES", keyName);
     else if (g_glState < 0 || g_res.failed)
-        snprintf(g_status, sizeof g_status, "SHADERS UNAVAILABLE - SEE MXCAM.LOG");
+        snprintf(g_status, sizeof g_status, "SHADERS UNAVAILABLE - SEE MXS_REMASTERED.LOG");
     else if (g_lastApplyTime < 0 || Seconds() - g_lastApplyTime > 1.0)
         snprintf(g_status, sizeof g_status, "WAITING FOR THE 3D VIEW");
     else

@@ -3,8 +3,10 @@
 //   soundtable of recorded patches; the stock ones are a single engine cycle each, looped, and sound
 //   bland. Each pack (made by tools/engine_sounds/make_engine_sounds.py from the stock recordings)
 //   replaces one stock engine's soundtable with patches of 16 cycles, each a little different. The
-//   packs ship in the mxcam_sounds folder next to opengl32.dll; installing one copies it into the
+//   packs ship in the MXS_REMASTERED_sounds folder next to opengl32.dll; installing one copies it into the
 //   game folder as a .saf archive (the game reads those when it starts), removing it deletes it.
+//   When the game folder can't be written to without administrator rights (Program Files), the pack
+//   goes in the game's personal folder (%LOCALAPPDATA%\MX Simulator) instead, which it also reads.
 //   Only files: nothing of the game's own is changed, in memory or on disk.
 #pragma once
 
