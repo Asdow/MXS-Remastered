@@ -978,6 +978,10 @@ const RowDef kRows[] = {
               "imprint and loose clods along the edges. They stay on the track for about 160 m "
               "around you, and come back exactly as you made them whenever you return to a spot "
               "you'd ridden (see the mark cache below for how far back that reaches)."),
+    Slider(1, nullptr,           "Mark depth",           &Config::markDepth,        0.0,   1.0,   0.01,   100.0,  0, "%", "Flat")
+        .Help("How dug-in the ruts look: the groove's floor is read where your eye actually sees "
+              "it through the groove, so at low angles the near lip covers the floor and the far "
+              "wall shows, and the floors lose light near the lips. 0 keeps the marks flat on the ground."),
     Slider(1, nullptr,           "Mark cache",           &Config::markCacheSegs,    10000.0, 1000000.0, 25000.0, 1.0, 0, "", nullptr)
         .Help("How far back along your ride the tire marks are remembered. "
               "A cache of 40 000 is ~11 minutes of riding at 60fps"

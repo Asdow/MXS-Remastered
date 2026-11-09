@@ -371,6 +371,7 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Graphics",  L"DirtScale",            c.dirtScale },
         { L"Graphics",  L"TireMarks",            c.tireMarks },
         { L"Graphics",  L"MarkCacheSegs",        c.markCacheSegs },
+        { L"Graphics",  L"MarkDepth",            c.markDepth },
         { L"Graphics",  L"MarksEveryBike",       c.marksEveryBike ? 1.0 : 0.0 },
         { L"Graphics",  L"HeadlightEveryBike",   c.headlightEveryBike ? 1.0 : 0.0 },
         { L"Graphics",  L"TireDirt",             c.tireDirt },
@@ -548,6 +549,7 @@ void CopyTunables(const Config& from, Config& to)
     to.dirtScale            = from.dirtScale;
     to.tireMarks            = from.tireMarks;
     to.markCacheSegs        = from.markCacheSegs;
+    to.markDepth            = from.markDepth;
     to.marksEveryBike       = from.marksEveryBike;
     to.headlightEveryBike   = from.headlightEveryBike;
     to.tireDirt             = from.tireDirt;
@@ -776,6 +778,7 @@ Config ParseConfig(const Config& base)
     c.dirtScale        = ReadDouble(L"Graphics", L"DirtScale", c.dirtScale);
     c.tireMarks        = ReadDouble(L"Graphics", L"TireMarks", c.tireMarks);
     c.markCacheSegs    = ReadDouble(L"Graphics", L"MarkCacheSegs", c.markCacheSegs);
+    c.markDepth        = ReadDouble(L"Graphics", L"MarkDepth", c.markDepth);
     c.marksEveryBike   = ReadInt(L"Graphics", L"MarksEveryBike", c.marksEveryBike) != 0;
     c.headlightEveryBike = ReadInt(L"Graphics", L"HeadlightEveryBike", c.headlightEveryBike) != 0;
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
@@ -872,6 +875,7 @@ Config ParseConfig(const Config& base)
     c.dirtScale            = Clamp(c.dirtScale, 0.25, 4.0);
     c.tireMarks            = Clamp(c.tireMarks, 0.0, 1.0);
     c.markCacheSegs        = Clamp(std::round(c.markCacheSegs), 10000.0, 1000000.0);
+    c.markDepth            = Clamp(c.markDepth, 0.0, 1.0);
     c.tireDirt             = Clamp(c.tireDirt, 0.0, 1.0);
     c.motionBlur           = Clamp(c.motionBlur, 0.0, 1.0);
     c.depthOfField         = Clamp(c.depthOfField, 0.0, 1.0);
