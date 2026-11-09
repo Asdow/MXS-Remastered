@@ -377,9 +377,13 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Graphics",  L"MotionBlur",           c.motionBlur },
         { L"Graphics",  L"DepthOfField",         c.depthOfField },
         { L"Graphics",  L"DofFocus",             c.dofFocus },
+        { L"Weather",   L"Snow",                 c.snow },
+        { L"Weather",   L"Snowfall",             c.snowfall },
+        { L"Weather",   L"Wind",                 c.snowWind },
         { L"Other",     L"HideHud",              c.hideHud ? 1.0 : 0.0 },
         { L"Other",     L"HideCursor",           c.hideCursor ? 1.0 : 0.0 },
         { L"Other",     L"DabIndicator",         c.dabIndicator ? 1.0 : 0.0 },
+        { L"Other",     L"DabSticky",            static_cast<double>(c.dabSticky) },
         { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
     };
 }
@@ -550,6 +554,9 @@ void CopyTunables(const Config& from, Config& to)
     to.markCacheSegs        = from.markCacheSegs;
     to.marksEveryBike       = from.marksEveryBike;
     to.headlightEveryBike   = from.headlightEveryBike;
+    to.snow                 = from.snow;
+    to.snowfall             = from.snowfall;
+    to.snowWind             = from.snowWind;
     to.tireDirt             = from.tireDirt;
     to.motionBlur           = from.motionBlur;
     to.depthOfField         = from.depthOfField;
@@ -557,6 +564,7 @@ void CopyTunables(const Config& from, Config& to)
     to.hideHud              = from.hideHud;
     to.hideCursor           = from.hideCursor;
     to.dabIndicator         = from.dabIndicator;
+    to.dabSticky            = from.dabSticky;
     to.fadeMenu             = from.fadeMenu;
 }
 
@@ -778,6 +786,9 @@ Config ParseConfig(const Config& base)
     c.markCacheSegs    = ReadDouble(L"Graphics", L"MarkCacheSegs", c.markCacheSegs);
     c.marksEveryBike   = ReadInt(L"Graphics", L"MarksEveryBike", c.marksEveryBike) != 0;
     c.headlightEveryBike = ReadInt(L"Graphics", L"HeadlightEveryBike", c.headlightEveryBike) != 0;
+    c.snow             = Clamp(ReadDouble(L"Weather", L"Snow", c.snow), 0.0, 1.0);
+    c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
+    c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
     c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
     c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);
@@ -785,6 +796,7 @@ Config ParseConfig(const Config& base)
     c.hideHud          = ReadInt(L"Other", L"HideHud", c.hideHud) != 0;
     c.hideCursor       = ReadInt(L"Other", L"HideCursor", c.hideCursor) != 0;
     c.dabIndicator     = ReadInt(L"Other", L"DabIndicator", c.dabIndicator) != 0;
+    c.dabSticky        = Clamp(ReadInt(L"Other", L"DabSticky", c.dabSticky), 0, 2);
     c.fadeMenu         = ReadInt(L"Other", L"FadeMenu", c.fadeMenu) != 0;
     c.fullscreenWindow = ReadInt(L"Other", L"FullscreenWindow", c.fullscreenWindow) != 0;
     c.dumpShaders      = ReadInt(L"Graphics", L"DumpShaders", c.dumpShaders) != 0;
@@ -938,6 +950,8 @@ int TabOf(const TunableValue& v)
         return 2;
     if (wcscmp(v.section, L"Other") == 0)
         return 4;
+    if (wcscmp(v.section, L"Weather") == 0)
+        return 5;
     return 0;  // Camera, Smoothing, Leveling, Air, Look, Neck
 }
 

@@ -806,8 +806,8 @@ RowDef PadRow(int tab, const char* section, const char* label, int Config::* con
     return def;
 }
 
-const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS", "OTHER" };
-constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3, kTabOther = 4;
+const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS", "OTHER", "WEATHER" };
+constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3, kTabOther = 4, kTabWeather = 5;
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
 
 // Each tab's rows, column by column (.Col starts the next one).
@@ -1079,7 +1079,8 @@ const RowDef kRows[] = {
         .Help("Shows at the bottom right, next to the speedometer, whether your rider is standing or "
               "sitting: a red rider standing on the bike, or a green one sitting with a foot down while "
               "you hold the game's Sit/Dab key. Follows the game's own settings: your Sit/Dab key or "
-              "button, Sticky Sit/Dab and Dab When Stopped."),
+              "button and Dab When Stopped. Turning it on asks whether the game's Sticky Sit/Dab is on "
+              "(turn it off and on again to change your answer)."),
     Toggle(4, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
         .Help("With the game in windowed mode, makes its window cover the whole screen with no border "
               "(borderless fullscreen): Alt+Tab stays instant. Off puts the window back as it was. "
@@ -1103,6 +1104,16 @@ const RowDef kRows[] = {
         .Help("A fuller engine sound for every bike that uses the game's stock 450 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts. "
               "Bikes with their own custom sounds keep them."),
+
+    // ======== WEATHER ========
+    Slider(5, "SNOW",           "Snow",                      &Config::snow,             0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Snow on the track: the ground turns white (thinner on steep slopes, your ruts dig "
+              "through it to the dirt) under a grey, overcast sky. Needs the shaders on (GRAPHICS)."),
+    Slider(5, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
+              "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
+    Slider(5, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
+        .Help("How hard the wind blows the falling snow sideways."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -1129,6 +1140,10 @@ struct PanelState {
     double lastFrame    = 0;
     int    adjustRow    = -1;   // index into kRows of the slider last adjusted
     double adjustedAt   = -1;   // when (by the keys; dragging counts for as long as it lasts)
+    // The dab indicator was just turned on: asking whether the game's Sticky Sit/Dab is on (the
+    // game's settings file can't be trusted for it: see Config::dabSticky). 0 OFF, 1 ON highlighted.
+    bool   askSticky    = false;
+    int    askChoice    = 0;
 };
 PanelState g_panel;
 
@@ -1666,6 +1681,10 @@ bool RowInactive(const RowDef& def, const Config& cfg)
         if (def.number == &Config::headlightBeamDeg || def.number == &Config::headlightAimDeg ||
             def.flag == &Config::headlightEveryBike)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
+        if (def.number == &Config::snowfall)
+            return cfg.snow <= 0.0;
+        if (def.number == &Config::snowWind)
+            return cfg.snow <= 0.0 || cfg.snowfall <= 0.0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;
         if (def.number == &Config::markCacheSegs)
@@ -1960,6 +1979,10 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 SetFlag(flag, !flag);
                 if (def.flag == &Config::enabled)
                     camera::Reset();
+                if (def.flag == &Config::dabIndicator && flag) {  // turned on: is the game's Sticky Sit/Dab on?
+                    g_panel.askSticky = true;
+                    g_panel.askChoice = cfg.dabSticky == 2 ? 1 : 0;
+                }
             }
             Text(kFontBody, cx, labelY, def.label, labelColor, 0);
             const float sw = Switch(cx + cw, y + rowH * 0.5f, S(22), flag, hot);
@@ -2041,6 +2064,14 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         snprintf(readout, sizeof readout, "%s   \xB7   %s", postfx::StatusText(), tires[0] ? tires : texfilter::StatusText());
     } else if (g_panel.tab == kTabKeybinds) {
         snprintf(readout, sizeof readout, "CLICK A KEY, THEN PRESS THE NEW ONE   \xB7   ESC CANCELS   \xB7   SAVE TO KEEP THEM");
+    } else if (g_panel.tab == kTabWeather) {
+        if (!cfg.shaders)
+            snprintf(readout, sizeof readout, "WEATHER NEEDS THE SHADERS ON (GRAPHICS TAB)");
+        else if (cfg.snow <= 0.0)
+            snprintf(readout, sizeof readout, "NO WEATHER   ·   TURN UP SNOW TO MAKE IT SNOW");
+        else
+            snprintf(readout, sizeof readout, "SNOW %.0f%%   ·   SNOWFALL %.0f%%   ·   WIND %.0f%%", cfg.snow * 100.0,
+                     cfg.snowfall * 100.0, cfg.snowWind * 100.0);
     } else if (g_panel.tab == kTabOther) {
         const char* status = GameOverlayStatusText();
         snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
@@ -2331,8 +2362,9 @@ void UpdateFade(double now)
             }
     }
     const int row = g_panel.adjustRow;
-    const bool graphicsSlider = row >= 0 && row < kRowCount && kRows[row].tab == kTabGraphics &&
-                                kRows[row].kind == RowKind::Slider && g_panel.tab == kTabGraphics;
+    const bool graphicsSlider = row >= 0 && row < kRowCount && kRows[row].tab == g_panel.tab &&
+                                kRows[row].kind == RowKind::Slider &&
+                                (g_panel.tab == kTabGraphics || g_panel.tab == kTabWeather);
     const bool adjusting = cfg.fadeMenu && graphicsSlider &&
                            (g_panel.dragging == row || (g_panel.adjustedAt >= 0 && now - g_panel.adjustedAt < kAdjustHold));
     const float target = adjusting ? kFadedOpacity : 1.0f;
@@ -2456,6 +2488,66 @@ void StartupHintFrame(HWND window, double now)
 }
 
 // ===========================================================================
+// Turning the dab indicator on asks whether the game's Sticky Sit/Dab is on (Config::dabSticky): its
+// settings file can say the old setting for a long while after it's changed (the game writes it only
+// now and then), so the answer is asked, not read. OFF / ON with the mouse, the arrow keys and Enter;
+// Esc never minds (the indicator goes back off).
+void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, double now)
+{
+    const float s = g_atlasScale;
+    const auto S = [s](float v) { return std::round(v * s); };
+    Rect(0, 0, static_cast<float>(screenWidth), static_cast<float>(screenHeight), Rgba(0, 0, 0, 0.55f));
+    const float boxW = S(640), boxH = S(260);
+    const float bx = std::round((screenWidth - boxW) * 0.5f), by = std::round((screenHeight - boxH) * 0.5f);
+    RoundedRect(bx - 1, by - 1, boxW + 2, boxH + 2, S(10) + 1, kBorder);
+    RoundedRect(bx, by, boxW, boxH, S(10), kPanelSolid);
+    const float pad = S(28);
+    float y = by + pad;
+    Text(kFontSmall, bx + pad, y, "DAB INDICATOR", kSection, S(2));
+    y += LineHeight(kFontSmall) + S(14);
+    Text(kFontBody, bx + pad, y, "Is Sticky Sit/Dab on in MX Simulator's settings?", kLabel, 0);
+    y += LineHeight(kFontBody) + S(10);
+    Text(kFontSmall, bx + pad, y, "OFF: you sit while you hold the Sit/Dab button.", kDim, S(1));
+    y += LineHeight(kFontSmall) + S(4);
+    Text(kFontSmall, bx + pad, y, "ON: one press sits you, the next stands you up.", kDim, S(1));
+
+    const float buttonW = S(150), buttonH = S(42), gap = S(16);
+    const float buttonsY = by + boxH - pad - buttonH;
+    const float firstX = bx + boxW - pad - 2 * buttonW - gap;
+    if (in.step)
+        g_panel.askChoice = in.step > 0 ? 1 : 0;
+    int chosen = -1;
+    for (int b = 0; b < 2; ++b) {
+        const float x = firstX + b * (buttonW + gap);
+        const bool hot = in.Inside(x, buttonsY, buttonW, buttonH);
+        if (hot)
+            g_panel.askChoice = b;
+        if (hot && in.pressed)
+            chosen = b;
+        const bool lit = g_panel.askChoice == b;
+        RoundedRect(x - 1, buttonsY - 1, buttonW + 2, buttonH + 2, S(6) + 1, lit ? kBlueHot : kBorder);
+        RoundedRect(x, buttonsY, buttonW, buttonH, S(6), lit ? kBlue : kPanelSolid);
+        const char* label = b ? "ON" : "OFF";
+        Text(kFontSmall, std::round(x + (buttonW - TextWidth(kFontSmall, label, S(2))) * 0.5f),
+             buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), label, White(lit ? 1.0f : 0.88f), S(2));
+    }
+    Text(kFontSmall, bx + pad, buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), "ESC CANCELS", kDim, S(1));
+    if (in.activate)
+        chosen = g_panel.askChoice;
+    if (chosen >= 0) {
+        EditConfig().dabSticky = chosen ? 2 : 1;
+        g_panel.dirty = true;
+        g_panel.askSticky = false;
+        SetStatus(chosen ? "DAB INDICATOR ON (STICKY SIT/DAB ON) - SAVE TO KEEP IT"
+                         : "DAB INDICATOR ON (STICKY SIT/DAB OFF) - SAVE TO KEEP IT", now);
+    }
+    // The menu's own cursor, over the question (the menu behind it was drawn without the mouse).
+    if (in.inside) {
+        Disc(in.mx, in.my, S(6) + 1.5f, Rgba(0, 0, 0, 0.55f));
+        Disc(in.mx, in.my, S(5), White(1.0f));
+    }
+}
+
 // The dab indicator (Config::dabIndicator): bottom right, by the game's speedometer, whether your
 // rider stands on the pegs (red, a rider standing on the bike) or sits or dabs (green, a rider sitting
 // with a foot down), from the game's dab key and settings (dab.cpp).
@@ -2671,7 +2763,12 @@ void OverlayFrame(HDC dc)
         }
         g_hintDone = true;  // (they've found it)
         OpenPanel(window);
-    } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && (menuKey || escape))) {
+    } else if (g_panel.askSticky && focus && escape) {
+        // Esc on the question: never mind (the indicator goes back off), the menu stays open.
+        EditConfig().dabIndicator = false;
+        g_panel.askSticky = false;
+    } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && !g_panel.askSticky && (menuKey || escape))) {
+        g_panel.askSticky = false;
         ClosePanel();
         return;
     }
@@ -2703,8 +2800,17 @@ void OverlayFrame(HDC dc)
         g_batch.clear();
         g_keepRanges.clear();
         UpdateFade(now);
-        BuildPanel(width, height, in, now);
-        ApplyFade();
+        if (g_panel.askSticky) {
+            // The question takes every click and key; the menu behind it is shown, untouched.
+            Input none;
+            none.mx = none.my = -1;
+            BuildPanel(width, height, none, now);
+            ApplyFade();
+            BuildStickyQuestion(width, height, in, now);
+        } else {
+            BuildPanel(width, height, in, now);
+            ApplyFade();
+        }
         DrawBatch(width, height);
     }
     RestoreState(saved);

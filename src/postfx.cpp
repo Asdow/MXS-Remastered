@@ -486,6 +486,9 @@ struct Resources {
     GLuint  headProgram = 0, headVao = 0;          // the shadow stand-ins (DrawStandIns)
     GLint   shapeLight = -1, shapeModel = -1, shapeKind = -1, shapeMinor = -1;
     bool    headTried = false;
+    Program snow;                                  // the snowfall (DrawSnowfall)
+    GLuint  snowVao = 0;
+    bool    snowTried = false;
 };
 Resources g_res;
 // The tire dirt's mask this frame (see BeginWheelMask).
@@ -4555,6 +4558,111 @@ void UnderstandScene()
     UpdateAir(dt);
 }
 
+// ---- WEATHER: the snowfall (Config::snowfall; see shaders::kSnowVertex) ----------------------
+constexpr double kSnowBoxMetres   = 30.0;   // the box of flakes that wraps round the camera
+constexpr int    kSnowFlakesMax   = 14000;  // at 100%: about one in every two cubic metres around you
+constexpr double kSnowFallMetres  = 1.1;    // m/s, a snowflake's pace (each its own, 0.7 to 1.3 of it)
+constexpr double kSnowWindMetres  = 7.0;    // m/s at 100% wind
+constexpr double kSnowFlakeMetres = 0.013;  // a flake's radius (each 0.6 to 1.4 of it)
+double g_snowDrift[3] = {};                 // how far the wind has carried the snow (wrapped to the box)
+
+bool MakeSnowProgram()
+{
+    if (g_res.snowTried)
+        return g_res.snow.id != 0;
+    g_res.snowTried = true;
+    std::string error;
+    for (const char* version : { "#version 150\n", "#version 130\n" }) {
+        const GLuint vs = CompileShader(kVertexShader, version, shaders::kSnowVertex, nullptr, error);
+        if (!vs)
+            continue;
+        const GLuint fs = CompileShader(kFragmentShader, version, shaders::kSnowFragment, nullptr, error);
+        if (!fs) {
+            g_gl.DeleteShader(vs);
+            continue;
+        }
+        const GLuint program = g_gl.CreateProgram();
+        g_gl.AttachShader(program, vs);
+        g_gl.AttachShader(program, fs);
+        g_gl.LinkProgram(program);
+        g_gl.DeleteShader(vs);
+        g_gl.DeleteShader(fs);
+        GLint linked = 0;
+        g_gl.GetProgramiv(program, kLinkStatus, &linked);
+        if (!linked) {
+            g_gl.DeleteProgram(program);
+            continue;
+        }
+        g_res.snow.id = program;
+        g_gl.GenVertexArrays(1, &g_res.snowVao);  // no attributes: everything comes from gl_VertexID
+        Log("postfx: snowfall ready (%s)", version[9] == '5' ? "GLSL 150" : "GLSL 130");
+        if (version[9] != '5' && !error.empty())
+            LogInfo("the snowfall as GLSL 150 (130 is used)", error);
+        return true;
+    }
+    LogInfo("the snowfall couldn't be built (snow on the ground still works)", error);
+    return false;
+}
+
+// Into the HDR image the composite just made (before bloom, depth of field and motion blur, which
+// then take the flakes in like the rest of the scene). colour: a flake's, lit as the scene is.
+void DrawSnowfall(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec3 colour, double now, double dt, int h)
+{
+    const Config& cfg = GetConfig();
+    const int flakes = static_cast<int>(kSnowFlakesMax * cfg.snowfall);
+    if (flakes < 1 || !MakeSnowProgram())
+        return;
+    const double u = g_unitsPerMetre, box = kSnowBoxMetres * u;
+    const auto Wrap = [box](double v) { const double m = std::fmod(v, box); return m < 0 ? m + box : m; };
+    // The wind: across the fall, its direction swinging slowly; carried frame by frame, so changing it
+    // never moves the snow that's already falling.
+    Vec3 east = Cross(up, Vec3{ 0, 0, 1 });
+    if (Length(east) < 0.1)
+        east = Cross(up, Vec3{ 1, 0, 0 });
+    east = Normalize(east);
+    const Vec3 north = Normalize(Cross(east, up));
+    const double swing = 0.35 * std::sin(now * 0.05), gust = 0.8 + 0.2 * std::sin(now * 0.6) * std::sin(now * 0.23);
+    const Vec3 wind = (east * std::cos(swing) + north * std::sin(swing)) * (cfg.snowWind * kSnowWindMetres * u * gust);
+    const double step = Clamp(dt, 0.0, 0.25);
+    g_snowDrift[0] = Wrap(g_snowDrift[0] + wind.x * step);
+    g_snowDrift[1] = Wrap(g_snowDrift[1] + wind.y * step);
+    g_snowDrift[2] = Wrap(g_snowDrift[2] + wind.z * step);
+
+    Program& p = g_res.snow;
+    g_gl.UseProgram(p.id);
+    g_gl.BindVertexArray(g_res.snowVao);
+    float rotation[9];
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r)
+            rotation[c * 3 + r] = static_cast<float>(V[c * 4 + r]);
+    g_gl.UniformMatrix4fv(p["u_proj"], 1, GL_FALSE, g_m.proj);
+    g_gl.UniformMatrix4fv(p["u_invProj"], 1, GL_FALSE, g_m.invProj);
+    g_gl.UniformMatrix3fv(p["u_viewRot"], 1, GL_FALSE, rotation);
+    Vec(p, "u_camBox", Vec3{ Wrap(eye.x), Wrap(eye.y), Wrap(eye.z) });
+    g_gl.Uniform1f(p["u_box"], static_cast<float>(box));
+    g_gl.Uniform1f(p["u_time"], static_cast<float>(std::fmod(now, 3600.0)));
+    Vec(p, "u_fall", up * (-kSnowFallMetres * u));
+    Vec(p, "u_drift", Vec3{ g_snowDrift[0], g_snowDrift[1], g_snowDrift[2] });
+    Vec(p, "u_sway1", east);
+    Vec(p, "u_sway2", north);
+    g_gl.Uniform1f(p["u_size"], static_cast<float>(kSnowFlakeMetres * u));
+    g_gl.Uniform1f(p["u_pixel"], static_cast<float>(2.0 / (std::fmax(std::fabs(P[5]), 1e-3) * h)));
+    g_gl.Uniform1f(p["u_metre"], static_cast<float>(u));
+    g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
+    Vec(p, "u_colour", colour);
+    Bind(p, "u_depth", 0, g_res.depth);
+
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
+    g_gl.Viewport(0, 0, g_res.hdr.w, g_res.hdr.h);
+    g_gl.Disable(GL_CULL_FACE);
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);  // (premultiplied; the image's alpha kept)
+    g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
+    g_gl.DrawArrays(GL_TRIANGLES, 0, flakes * 6);
+    g_gl.Disable(GL_BLEND);
+    g_gl.BindVertexArray(g_res.vao);  // (the fullscreen triangle, for the passes after)
+}
+
 void Render(int w, int h)
 {
     const Config& cfg = GetConfig();
@@ -4610,6 +4718,12 @@ void Render(int w, int h)
     const Vec3 eye = CameraPosition(V);
     const auto Wrap = [](double v) { const double m = std::fmod(v, 64.0); return m < 0 ? m + 64.0 : m; };
     const Vec3 camWrapped{ Wrap(eye.x), Wrap(eye.y), Wrap(eye.z) };
+    // WEATHER: the light the snow is seen in (the time of day's, dim at night; a grey day's without it).
+    const bool snowOn = cfg.snow > 0.0;
+    const double snowLight = tod ? std::fmax(sky.day, 0.03) * sky.exposure : 0.8;
+    const Vec3 snowTint = tod ? sky.tint : Vec3{ 1.0, 1.0, 1.0 };
+    const Vec3 snowFog{ 0.60 * snowTint.x * snowLight, 0.64 * snowTint.y * snowLight, 0.70 * snowTint.z * snowLight };
+    const Vec3 flakeColour{ 0.86 * snowTint.x * snowLight, 0.89 * snowTint.y * snowLight, 0.94 * snowTint.z * snowLight };
 
     // ---- Lighting: AO and sun shadows (half resolution) ----
     const double sunStrength = tod ? std::fmax(sky.day, 0.4 * sky.night) : 1.0;
@@ -4791,8 +4905,13 @@ void Render(int w, int h)
         g_gl.Uniform1f(p["u_time"], static_cast<float>(std::fmod(now, 1000.0)));
         const double fovY = 2.0 * std::atan(1.0 / std::fmax(std::fabs(P[5]), 1e-3));
         g_gl.Uniform1f(p["u_pixelAngle"], static_cast<float>(fovY / h));
+        g_gl.Uniform1f(p["u_snow"], snowOn ? static_cast<float>(cfg.snow) : 0.0f);
+        g_gl.Uniform1f(p["u_snowfall"], static_cast<float>(cfg.snowfall));
+        Vec(p, "u_snowFog", snowFog);
         Draw(g_res.hdr);
     }
+    if (snowOn && cfg.snowfall > 0.0 && depthOk)
+        DrawSnowfall(V, P, eye, up, flakeColour, now, dt, h);
     g_lastTerrainMask = g_frame.terrainSnapshot;
     const Target* current = &g_res.hdr;
     const auto Spare = [&current]() -> Target& { return current == &g_res.a ? g_res.b : g_res.a; };
@@ -5668,7 +5787,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
 void TerrainPassDone()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
+    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0 && cfg.snow <= 0.0) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
         g_res.failed || !LoadGL())
         return;
     GLint drawFb = 0;

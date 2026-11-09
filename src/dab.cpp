@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "config.h"
 #include "gamepad.h"
 #include "log.h"
 #include "paths.h"
@@ -201,8 +202,11 @@ void Update(bool haveSpeed, double speed)
     else if (b.control)
         down = gamepad::IsDown(b.control);
     g_down = down;
-    // Sticky Sit/Dab: a press sits, the next stands.
-    if (g_game.sticky) {
+    // Sticky Sit/Dab: a press sits, the next stands. As the game's file says, unless it's set here
+    // (Config::dabSticky: the game writes its file only now and then, so it can say the old setting).
+    const int choice = GetConfig().dabSticky;
+    const bool sticky = choice == 0 ? g_game.sticky : choice == 2;
+    if (sticky) {
         if (down && !g_wasDown)
             g_latched = !g_latched;
     } else {
@@ -210,7 +214,7 @@ void Update(bool haveSpeed, double speed)
     }
     g_wasDown = down;
     // (Held at any speed: the game's Max Dab Speed doesn't stop the key sitting you.)
-    const bool held = g_game.sticky ? g_latched : down;
+    const bool held = sticky ? g_latched : down;
     g_sitting = held || (g_game.autoDab && haveSpeed && speed < kStopped);
 }
 

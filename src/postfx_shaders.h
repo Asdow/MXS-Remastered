@@ -219,6 +219,9 @@ uniform vec3  u_headUp[12];
 uniform float u_headPower[12];  // each one's strength (0..1: fading in and out as bikes are found and lost)
 uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of it below level, its half-height
 uniform float u_headReach;      // how far it reaches (1 = level; more aimed up, less aimed down)
+uniform float u_snow;           // WEATHER: 0..1 snow on the ground and an overcast sky (0: no weather)
+uniform float u_snowfall;       // 0..1 how heavily it falls: the haze in the distance
+uniform vec3  u_snowFog;        // that haze's colour (as bright as the light of the time of day)
 
 // 1 = lit, 0 = in the shadow of something the sun's view saw first. 3 x 3 hardware-filtered
 // taps for soft edges; fades out at the edge of the map.
@@ -421,6 +424,33 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 n)
     return col;
 }
 
+// How much rut your tires dug here (0..1): the map's own groove, as TireMarks reads it.
+float RutAt(vec3 p)
+{
+    vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / u_markTexel;
+    float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
+    return MarkNear(t) * smoothstep(0.0, kMarkBlend, inNear) * u_marks;
+}
+
+// Snow on the ground (WEATHER): white, a little blue in it, thinner on steep slopes and in drifts
+// that come and go over the ground. Where a rut dug through
+// it, the dirt underneath shows: wet, darker. The ground's own shading (its baked light and bumps)
+// carries over gently. Lit afterwards like the ground (AO, the sun's shadows).
+vec3 Snow(vec3 c, vec3 wp, vec3 n, float z, float ground, float rut)
+{
+    float upright = smoothstep(0.35, 0.8, dot(n, u_up));
+    float drifts = ValueNoise(wp * (0.3 / u_metre)) * 0.65 + ValueNoise(wp * (1.6 / u_metre)) * 0.35;
+    float depth = u_snow * (0.45 + 0.55 * upright) * (0.7 + 0.6 * drifts);
+    float cover = smoothstep(0.25, 0.6, depth);
+    float dug = smoothstep(0.12, 0.55, rut);
+    cover *= 1.0 - 0.92 * dug;
+    vec3 white = vec3(0.80, 0.84, 0.90) * (0.92 + 0.08 * ValueNoise(wp * (5.0 / u_metre)));
+    float shading = clamp(pow(max(Luma(c), 1e-4) / 0.2, 0.3), 0.65, 1.2);
+    vec3 snow = white * shading;  // (no glints: grains a pixel wide or more read as white dashes, and shimmer)
+    vec3 wet = c * mix(1.0, 0.62, u_snow);  // the dirt under it, damp
+    return mix(c, mix(wet, snow, cover), ground);
+}
+
 // Mud on your tires: clumps caked on the tread and the sidewalls that turn with the wheel, a
 // little dust on the rim and hub. Lit by the sun from the surface's own normal.
 vec3 TireDirt(vec3 c, vec3 p, vec3 nView, float ground)
@@ -547,6 +577,13 @@ void main()
     if (sky) {
         if (u_tod > 0.5)
             c = Sky(c, dir);
+        if (u_snow > 0.0) {
+            // Overcast: the blue goes grey, the clouds stay a little lighter, the sun is hidden.
+            float l = Luma(c);
+            vec3 overcast = vec3(l) * vec3(0.93, 0.97, 1.04) * 0.92 + u_snowFog * 0.08;
+            c = mix(c, overcast, 0.85 * u_snow);
+            c = mix(c, u_snowFog, 0.35 * u_snowfall * u_snow * (1.0 - smoothstep(0.0, 0.35, dot(dir, u_up))));
+        }
     } else {
         float z = -p.z;
         vec3 albedo = c;  // what the headlight lights: the surface before the sun's shadows
@@ -566,6 +603,8 @@ void main()
             }
             if (u_marks > 0.0 && ground > 0.5)
                 c = TireMarks(c, p, wp, nWorld);
+            if (u_snow > 0.0 && ground > 0.001)
+                c = Snow(c, wp, nWorld, z, ground, u_marks > 0.0 ? RutAt(p) : 0.0);
             // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
             // tire is in the terrain's depth too and counted as ground, and its mud came and went.
             // TireDirt keeps to the tire around its own axle.)
@@ -580,7 +619,8 @@ void main()
                 lit = min(lit, MapShadow(p, nView));
             ao = mix(1.0, ao, u_ao);
             albedo = c * ao;
-            c *= ao * mix(1.0, mix(0.42, 1.0, lit), u_shadow);
+            // (Overcast in the snow: the sun's shadows fade, the light comes from the whole sky.)
+            c *= ao * mix(1.0, mix(0.42, 1.0, lit), u_shadow * (1.0 - 0.65 * u_snow));
         }
         if (u_tod > 0.5) {
             c *= u_tint * u_exposure;
@@ -588,10 +628,107 @@ void main()
             if (u_depthOk > 0.5)
                 c = mix(c, HazeColour(dir), (1.0 - exp(-z / 350.0)) * u_haze);
         }
+        if (u_snow > 0.0) {
+            // A cold, grey day: the colours fade a little, and the falling snow hazes the distance.
+            c = mix(c, vec3(Luma(c)) * vec3(0.96, 0.99, 1.04), 0.25 * u_snow);
+            if (u_depthOk > 0.5)
+                c = mix(c, u_snowFog, (1.0 - exp(-z / (90.0 * u_metre))) * 0.7 * u_snowfall * u_snow);
+        }
         if (u_headlight > 0.0)
             c += Headlight(albedo, p, nView);
     }
     o_color = vec4(c, 1.0);
+}
+)GLSL";
+
+// ---- Snowfall (WEATHER): flakes around the camera, drawn into the HDR image after the composite ----
+// No buffers: each flake is 6 vertices of a quad, made from gl_VertexID. Every flake has its own
+// place in a box of u_box around the world (its corner a multiple of u_box), drifting with the wind
+// and falling at its own pace; the box wraps round the camera, so the same flakes are always around
+// you and fly past as you ride (true parallax, no streaks painted on the screen). They fade out near
+// the box's edge (no flake pops in where it wraps) and right in front of the lens, and are hidden
+// behind whatever is nearer (the scene's depth). A far flake is kept at least about a pixel and a
+// half across, fainter instead of smaller, so it doesn't shimmer.
+constexpr const char* kSnowVertex = R"GLSL(
+uniform mat4  u_proj;
+uniform mat3  u_viewRot;     // world -> view (rotation)
+uniform vec3  u_camBox;      // the camera in the box (world, wrapped to it)
+uniform float u_box;         // the box's size, game units
+uniform float u_time;        // s
+uniform vec3  u_fall;        // world: how far the snow falls in a second (each flake at its own pace)
+uniform vec3  u_drift;       // world: how far the wind has carried it (added up frame by frame, wrapped)
+uniform vec3  u_sway1, u_sway2;  // world: two directions across the fall, for each flake's wobble
+uniform float u_size;        // a flake's radius, game units
+uniform float u_pixel;       // game units per pixel at one unit away
+uniform float u_metre;
+out vec2  v_corner;
+out float v_alpha;
+out float v_z;
+
+uint Hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+float Random(uint flake, uint k) { return float(Hash(flake * 8u + k) & 0xffffffu) / 16777216.0; }
+
+void main()
+{
+    int flake = gl_VertexID / 6, corner = gl_VertexID - flake * 6;
+    vec2 c = vec2((corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0,
+                  (corner == 2 || corner == 4 || corner == 5) ? 1.0 : -1.0);
+    uint id = uint(flake);
+    vec3 base = vec3(Random(id, 0u), Random(id, 1u), Random(id, 2u)) * u_box;
+    float pace = 0.7 + 0.6 * Random(id, 3u);
+    float phase = Random(id, 4u) * 6.2831853;
+    float wobble = 0.12 * u_metre;
+    vec3 sway = (u_sway1 * sin(u_time * (0.9 + 0.8 * Random(id, 5u)) + phase) +
+                 u_sway2 * cos(u_time * (0.7 + 0.6 * Random(id, 6u)) + phase * 1.7)) * wobble;
+    vec3 at = base + u_fall * (pace * u_time) + u_drift + sway;
+    vec3 rel = (fract((at - u_camBox) / u_box + 0.5) - 0.5) * u_box;  // the nearest copy, around the camera
+    vec3 v = u_viewRot * rel;
+    float z = -v.z;
+    float r = u_size * (0.6 + 0.8 * Random(id, 7u));
+    float least = 0.75 * u_pixel * max(z, 0.0);  // at least ~1.5 pixels across
+    float shown = max(r, least);
+    v_alpha = (r / shown) * (r / shown)
+            * smoothstep(0.3 * u_metre, 0.9 * u_metre, z)              // not right in front of the lens
+            * (1.0 - smoothstep(0.38 * u_box, 0.5 * u_box, length(rel)));  // nor where the box wraps
+    v.xy += c * shown;
+    v_corner = c;
+    v_z = z;
+    gl_Position = u_proj * vec4(v, 1.0);
+}
+)GLSL";
+
+constexpr const char* kSnowFragment = R"GLSL(
+uniform sampler2D u_depth;   // the scene's
+uniform mat4  u_invProj;
+uniform vec2  u_texel;
+uniform float u_metre;
+uniform vec3  u_colour;      // a flake's colour, lit as the time of day lights the scene
+in vec2  v_corner;
+in float v_alpha;
+in float v_z;
+out vec4 o_color;
+
+void main()
+{
+    float r2 = dot(v_corner, v_corner);
+    if (r2 > 1.0 || v_alpha < 0.003)
+        discard;
+    float d = texture(u_depth, gl_FragCoord.xy * u_texel).r;
+    float seen = 1.0;
+    if (d < 0.999999) {
+        float n = d * 2.0 - 1.0;
+        float sceneZ = -(u_invProj[2][2] * n + u_invProj[3][2]) / (u_invProj[2][3] * n + u_invProj[3][3]);
+        seen = clamp((sceneZ - v_z) / (0.1 * u_metre + 0.02 * v_z), 0.0, 1.0);  // softly behind what's nearer
+    }
+    float a = (1.0 - r2);
+    a = a * a * v_alpha * seen;
+    o_color = vec4(u_colour * a, a);  // premultiplied
 }
 )GLSL";
 

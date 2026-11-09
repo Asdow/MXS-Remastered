@@ -11,6 +11,7 @@
 //     neutral   every effect at zero: the round trip through the pipeline must not change it
 //     dirt      dirt detail only: the ground gets detail, the object and the sky don't
 //     night     TimeOfDay=0: dark ground, a night sky, the HUD untouched, the sun turned
+//     snow      WEATHER Snow=1, Snowfall=1: white ground (the object isn't), a grey sky, flakes falling
 //     shadows   screen-space sun shadows only: the object shades the ground beside it
 //     offscreen shadow maps: a tower behind the camera shades the ground in view
 //     stadium   the same under a roof 120 m across: the roof is left out, the ground stays sunny
@@ -280,6 +281,10 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("DirtDetail=0"), 12, "DirtDetail=1");
     else if (mode == "night")
         settings = base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
+    else if (mode == "snow" || mode == "snowperf")
+        settings = base + "[Weather]\nSnow=1\nSnowfall=1\nWind=0.3\n";
+    else if (mode == "snowperf0")  // timing: the same scene without the weather
+        settings = base;
     else if (mode == "shadows")  // screen-space shadows alone
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=0");
     else if (mode == "offscreen" || stadium)  // shadow maps alone (the screen-space ones as short as they go)
@@ -373,6 +378,12 @@ int main(int argc, char** argv)
     if (!rc || !p_wglMakeCurrent(dc, rc)) {
         printf("no GL context\n");
         return 1;
+    }
+    // Timing: not held to the screen's refresh (every frame took exactly 1 / refresh otherwise).
+    if (mode == "shadowperf" || mode == "shadowperf0" || mode == "snowperf" || mode == "snowperf0") {
+        using PFN_SwapInterval = BOOL(WINAPI*)(int);
+        if (const auto swapInterval = reinterpret_cast<PFN_SwapInterval>(p_wglGetProcAddress("wglSwapIntervalEXT")))
+            swapInterval(0);
     }
 #define PROC(field, name) gl.field = reinterpret_cast<decltype(gl.field)>(p_wglGetProcAddress(name)); \
     if (!gl.field) { printf("missing %s\n", name); return 1; }
@@ -625,7 +636,8 @@ int main(int argc, char** argv)
         }
     };
 
-    const bool timing = mode == "shadowperf" || mode == "shadowperf0";
+    const bool snowTiming = mode == "snowperf" || mode == "snowperf0";  // timing: snow at 100% / off
+    const bool timing = mode == "shadowperf" || mode == "shadowperf0" || snowTiming;
     const bool hiddenWheels = mode == "tireshidden";
     // gatebox: the same bike, standing still for 3.4 s beside a box the game then stops drawing (like
     // the start gate): the box must not be taken for part of your bike.
@@ -926,7 +938,7 @@ int main(int argc, char** argv)
         }
 
         // Timing: a field of 800 small boxes around the camera, every one a shadow caster.
-        if (timing) {
+        if (timing && !snowTiming) {
             gl.UseProgram(object);
             gl.UniformMatrix4fv(oProj, 1, GL_FALSE, projection);
             gl.Uniform3fv(oLight, 1, sunEye);
@@ -1197,6 +1209,32 @@ int main(int argc, char** argv)
         Check(spread > 2.0, "the near ground has detail");
         Check(Near(box, drawnBox, 2), "the object is left alone (the ground mask works)");
         Check(Near(sky, drawnSky, 2), "the sky is left alone");
+    } else if (mode == "snow") {
+        printf("    ground %d %d %d (drawn %d %d %d), sky %d %d %d, box %d %d %d\n", ground.r, ground.g, ground.b,
+               drawnGround.r, drawnGround.g, drawnGround.b, sky.r, sky.g, sky.b, box.r, box.g, box.b);
+        Check(ground.r > drawnGround.r + 50 && std::abs(ground.r - ground.b) < 30, "the ground is white with snow");
+        Check(box.r > box.g + 60, "the object isn't (the snow stays on the ground)");
+        Check(std::abs(sky.b - sky.r) < std::abs(drawnSky.b - drawnSky.r) / 2, "the sky is overcast grey");
+        // Flakes: across the sky, pixels clearly lighter than the sky around them.
+        int flakes = 0;
+        for (int y = 10; y < 110; ++y)
+            for (int x = 0; x < W; x += 1) {
+                const Pixel q = At(x, y), r = At(x, y > 60 ? y - 8 : y + 8);
+                flakes += q.r > r.r + 18 && q.b > r.b + 18 ? 1 : 0;
+            }
+        printf("    %d snowflake pixels in the sky\n", flakes);
+        Check(flakes > 30, "snow is falling (flakes against the sky)");
+        std::string log;
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        Check(log.find("postfx: snowfall ready") != std::string::npos && log.find("snowfall couldn't be built") == std::string::npos,
+              "the snowfall's shaders compile");
     } else if (mode == "night") {
         // Corners on both sides of the screen's diagonals: every pass must cover the whole window.
         const Pixel skyLeft = At(20, 20), skyRight = At(W - 20, 20), groundLeft = At(20, H - 20), groundRight = At(W - 20, H - 20);
@@ -1320,6 +1358,9 @@ int main(int argc, char** argv)
         printf("    right in front of the plate %d\n", underPlate.r);
         Check(underPlate.r > 60, "the light starts right in front of the plate");
         Check(aside.r < 45, "a narrow beam is skinnier");
+    } else if (snowTiming) {
+        printf("    snow %s: %.3f ms per frame (%d frames)\n", mode == "snowperf" ? "at 100%, snowfall 100%" : "off",
+               timedMs / timedFrames, timedFrames);
     } else if (timing) {
         printf("    %s: %.3f ms per frame with 800 shadow casters (%d frames)\n",
                mode == "shadowperf" ? "drawn together" : "one at a time", timedMs / timedFrames, timedFrames);
