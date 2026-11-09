@@ -5,7 +5,7 @@
 //   object, then a scaled HUD element - and reads the frame back right after the HUD draw (the
 //   effects run just before it).
 //
-//   The DLL is copied into a folder of its own (under %TEMP%) with an mxcam.ini written for the
+//   The DLL is copied into a folder of its own (under %TEMP%) with an MXS_REMASTERED.ini written for the
 //   mode, so the shipped settings are never touched:
 //     off       Shaders=0: the picture must be exactly what was drawn
 //     neutral   every effect at zero: the round trip through the pipeline must not change it
@@ -19,7 +19,7 @@
 //     headlightup / headlightdown  the same aimed 15 degrees up / 20 down: it reaches further / not as far
 //     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
 //     tireshidden  the same at 5 m/s for ~3.5 s, its wheels no longer drawn after 1.4 s (as the game
-//               doesn't draw them out of view in first person): they must not be lost (mxcam.log)
+//               doesn't draw them out of view in first person): they must not be lost (MXS_REMASTERED.log)
 //     rival     another bike and rider 1 m beside yours (nearer the camera) at your speed, your rear wheel not drawn after 1.5 s: no marks of yours on its track
 //     wheeldrift  both wheels in view, learnt; the rear drawn 6 cm low after 1 s: what's learnt stays put
 //     backshadow  the bike standing still mid-view, rear wheel never drawn: the back of the bike's
@@ -265,7 +265,7 @@ int main(int argc, char** argv)
         printf("could not copy %s\n", argv[1]);
         return 1;
     }
-    const std::wstring ini = dir + L"mxcam.ini";
+    const std::wstring ini = dir + L"MXS_REMASTERED.ini";
     DeleteFileW(ini.c_str());
     const char* neutral =
         "[Graphics]\nShaders=1\nTimeOfDay=-1\nShadows=0\nAmbientOcclusion=0\nSunRays=0\nBloom=0\nExposure=0\n"
@@ -1158,7 +1158,7 @@ int main(int argc, char** argv)
                 Check(menuAt[k].g > 200 && menuAt[k].r < 60, (std::string("the game's menu is drawn ") + kWhen[k]).c_str());
         }
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1244,7 +1244,7 @@ int main(int argc, char** argv)
         const Pixel shaded = At(px[0], py[0]), sunny = At(px[1], py[1]);
         printf("    far tower's shadow: ground right %d %d %d, left %d %d %d\n", shaded.r, shaded.g, shaded.b, sunny.r, sunny.g, sunny.b);
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1414,7 +1414,7 @@ int main(int argc, char** argv)
         // What the log says about the wheels: found while drawn, and never lost after.
         std::string log;
         // The DLL still has it open for writing: share it.
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1517,7 +1517,7 @@ int main(int argc, char** argv)
             Check(gaps == 0, "the head's shadow joins the torso's (no gap at the neck)");
         }
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1551,7 +1551,7 @@ int main(int argc, char** argv)
         }
     } else if (rival) {
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1598,7 +1598,7 @@ int main(int argc, char** argv)
     } else if (wheelDrift) {
         std::string log, saved;
         for (int k = 0; k < 2; ++k) {
-            FILE* in = _wfsopen((dir + (k ? L"mxcam.ini" : L"mxcam.log")).c_str(), L"rb", _SH_DENYNO);
+            FILE* in = _wfsopen((dir + (k ? L"MXS_REMASTERED.ini" : L"MXS_REMASTERED.log")).c_str(), L"rb", _SH_DENYNO);
             if (!in)
                 continue;
             char buffer[4096];
@@ -1625,7 +1625,7 @@ int main(int argc, char** argv)
               "your bike isn't measured from another part of it (your wheels stay where they sit)");
     } else if (backShadow) {
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1637,7 +1637,7 @@ int main(int argc, char** argv)
               "shapes stand in for the back of your bike (see frame.bmp)");
     } else if (gateBox) {
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;
@@ -1655,7 +1655,7 @@ int main(int argc, char** argv)
               "a box standing beside you while you wait isn't taken for part of your bike");
     } else if (rearHidden) {
         std::string log;
-        FILE* in = _wfsopen((dir + L"mxcam.log").c_str(), L"rb", _SH_DENYNO);
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
         if (in) {
             char buffer[4096];
             size_t got;

@@ -1701,6 +1701,49 @@ TabLayout LayoutTab(int tab, float sectionH, float rowH)
     return layout;
 }
 
+// The Windows clipboard, for preset codes (shared as text: Discord and the like).
+bool CopyToClipboard(const std::string& text)
+{
+    HWND owner = g_hookedWindow ? g_hookedWindow : g_gameWindow.load();
+    if (!OpenClipboard(owner))
+        return false;
+    bool ok = false;
+    EmptyClipboard();
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (HGLOBAL memory = wide > 0 ? GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wide) * sizeof(wchar_t)) : nullptr) {
+        if (wchar_t* to = static_cast<wchar_t*>(GlobalLock(memory))) {
+            MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, to, wide);
+            GlobalUnlock(memory);
+            ok = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+        }
+        if (!ok)
+            GlobalFree(memory);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+std::string ClipboardText()
+{
+    std::string text;
+    HWND owner = g_hookedWindow ? g_hookedWindow : g_gameWindow.load();
+    if (!OpenClipboard(owner))
+        return text;
+    if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* from = static_cast<const wchar_t*>(GlobalLock(data))) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, from, -1, nullptr, 0, nullptr, nullptr);
+            if (bytes > 1 && bytes < (1 << 20)) {
+                text.resize(static_cast<size_t>(bytes));
+                WideCharToMultiByte(CP_UTF8, 0, from, -1, &text[0], bytes, nullptr, nullptr);
+                text.resize(static_cast<size_t>(bytes) - 1);
+            }
+            GlobalUnlock(data);
+        }
+    }
+    CloseClipboard();
+    return text;
+}
+
 void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
 {
     Config& cfg = EditConfig();
@@ -1712,7 +1755,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         rowsInTab += def.tab == g_panel.tab ? 1 : 0;
     const int presetItem = kFirstRowItem + rowsInTab;
     const int saveItem = presetItem + 1, defaultsItem = saveItem + 1, closeItem = saveItem + 2;
-    const int itemCount = closeItem + 1;
+    const int copyCodeItem = closeItem + 1, pasteCodeItem = closeItem + 2;
+    const int itemCount = pasteCodeItem + 1;
     if (g_panel.selected >= itemCount)
         g_panel.selected = itemCount - 1;
     if (in.nav)
@@ -2055,9 +2099,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                "Writes your settings and keybinds to MXS_REMASTERED.ini so they load next time.")) {
         if (SaveConfig()) {
             g_panel.dirty = false;
-            SetStatus("SAVED TO MXCAM.INI", now);
+            SetStatus("SAVED TO MXS_REMASTERED.INI", now);
         } else {
-            SetStatus("COULD NOT WRITE MXCAM.INI", now);
+            SetStatus("COULD NOT WRITE MXS_REMASTERED.INI", now);
         }
     }
     if (Button(defaultsItem, buttonsX + bw + gap, bw, "DEFAULTS", false,
@@ -2120,6 +2164,79 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             SetStatus(text, now);
         }
         hintX = sx0 + total + S(24);
+    }
+
+    // ---- Preset codes: COPY <TAB> CODE / PASTE CODE, beside the presets (first person and graphics
+    // have a code each; on the other tabs only PASTE CODE shows) ----
+    {
+        const float cw = S(150);
+        const char* tabName = kTabs[g_panel.tab];
+        const bool canCopy = HasPresetCode(g_panel.tab);
+        if (!canCopy && g_panel.selected == copyCodeItem)
+            g_panel.selected = pasteCodeItem;  // (moved onto with the keyboard or a controller: it isn't shown)
+        // Its label names the tab, as long as it fits beside PASTE CODE (shorter on a narrow screen).
+        const char* const kCameraLabels[] = { "COPY FIRST PERSON CODE", "COPY FIRST PERSON", "COPY CAMERA" };
+        const char* const kGraphicsLabels[] = { "COPY GRAPHICS CODE", "COPY GRAPHICS", "COPY GFX" };
+        const char* const* labels = g_panel.tab == 0 ? kCameraLabels : kGraphicsLabels;
+        const float room = buttonsX - S(12) - hintX - cw - gap;
+        const char* copyLabel = labels[2];
+        float copyW = cw;
+        for (int i = 0; i < 3; ++i) {
+            const float w = std::fmax(cw, TextWidth(kFontSmall, labels[i], S(2)) + S(36));
+            if (w <= room || i == 2) {
+                copyLabel = labels[i];
+                copyW = w;
+                break;
+            }
+        }
+        static char copyHelp[320];  // (the help box shows it after this block)
+        snprintf(copyHelp, sizeof copyHelp,
+                 "Copies your %s settings (this preset's) as a code, one line of text to share: paste it in Discord "
+                 "or anywhere. Whoever loads it with PASTE CODE gets your %s settings and keeps the rest of theirs.",
+                 g_panel.tab == 0 ? "first person camera" : "graphics", g_panel.tab == 0 ? "camera" : "graphics");
+        if (canCopy && Button(copyCodeItem, hintX, copyW, copyLabel, false, copyHelp)) {
+            const std::string code = PresetCode(g_panel.tab);
+            char text[112];
+            if (code.empty()) {
+                SetStatus("CODES ARE FOR THE FIRST PERSON AND GRAPHICS TABS - OPEN ONE TO COPY ITS CODE", now);
+            } else if (CopyToClipboard(code)) {
+                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %d, %d CHARACTERS) - PASTE IT TO SHARE", tabName,
+                         ActivePreset() + 1, static_cast<int>(code.size()));
+                SetStatus(text, now);
+                Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, tabName, code.c_str());
+            } else {
+                SetStatus("COULD NOT COPY TO THE CLIPBOARD", now);
+            }
+        }
+        const float pasteX = canCopy ? hintX + copyW + gap : hintX;
+        if (Button(pasteCodeItem, pasteX, cw, "PASTE CODE", false,
+                   "Copy someone's code first (from Discord or anywhere: the whole message is fine), then press "
+                   "this to load it into the preset in use. A first person code sets the first person settings, a "
+                   "graphics code the graphics: everything else stays yours. Press SAVE to keep it: quit without "
+                   "saving and the preset is as you last saved it.")) {
+            const PresetCodeResult r = LoadPresetCode(ClipboardText().c_str());
+            char text[128];
+            switch (r.status) {
+            case PresetCodeResult::NotFound:
+                SetStatus("NO CODE ON THE CLIPBOARD - COPY ONE FIRST (IT STARTS WITH MXS-REMASTERED-)", now);
+                break;
+            case PresetCodeResult::Damaged:
+                SetStatus("THAT CODE IS INCOMPLETE OR MISTYPED - COPY ALL OF IT", now);
+                break;
+            case PresetCodeResult::Newer:
+                SetStatus("THAT CODE IS FROM A NEWER MXS REMASTERED - UPDATE TO LOAD IT", now);
+                break;
+            case PresetCodeResult::Loaded:
+                camera::Reset();
+                g_panel.dirty = true;
+                snprintf(text, sizeof text, "%s CODE LOADED INTO PRESET %d%s - SAVE TO KEEP IT",
+                         r.tab >= 0 && r.tab < static_cast<int>(sizeof kTabs / sizeof kTabs[0]) ? kTabs[r.tab] : "",
+                         ActivePreset() + 1, r.unknown ? " (SOME NEWER SETTINGS LEFT OUT)" : "");
+                SetStatus(text, now);
+                break;
+            }
+        }
+        hintX = pasteX + cw + S(24);
     }
 
     {

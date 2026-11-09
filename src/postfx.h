@@ -107,6 +107,12 @@ void NoteWheelDrawnByGame(int i);
 // (piece = true: no torso shape).
 void NoteRiderPartCast(bool piece);
 
+// How many of your rider's own body pieces the game drew this frame (asked right before the held-back
+// casters are drawn). In its first person view the game draws 3 (no torso, no helmet: shapes of
+// postfx's own stand in for them in the shadow map); in third person, or with the camera close behind
+// or beside your rider, all of them (8), and then no stand-in is cast inside the real ones.
+void NoteRiderPiecesDrawn(int pieces);
+
 // Your wheels this frame, for the trace (F11): per wheel (rear, front) found, its part seen, the part
 // far from where the wheel sits, its axle on your bike (x, y, z); the tire dirt's stretch; bike found.
 const char* WheelTraceText();

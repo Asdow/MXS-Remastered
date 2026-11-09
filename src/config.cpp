@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -23,10 +25,21 @@ wchar_t g_path[1024] = L"";
 Config  g_presets[kPresetCount];
 int     g_activePreset = 0;
 const wchar_t* g_presetSection = nullptr;  // while reading / writing a preset's section
+// While reading a preset code (LoadPresetCode): its values by "Section.Key", read instead of the ini.
+const std::vector<std::pair<std::wstring, std::wstring>>* g_codeValues = nullptr;
 
 bool ReadRaw(const wchar_t* section, const wchar_t* key, wchar_t* buffer, DWORD size)
 {
-    if (g_presetSection) {
+    if (g_codeValues) {
+        wchar_t full[128];
+        swprintf_s(full, L"%s.%s", section, key);
+        buffer[0] = L'\0';
+        for (const auto& v : *g_codeValues)
+            if (v.first == full) {
+                wcsncpy_s(buffer, size, v.second.c_str(), _TRUNCATE);
+                break;
+            }
+    } else if (g_presetSection) {
         wchar_t full[128];
         swprintf_s(full, L"%s.%s", section, key);
         GetPrivateProfileStringW(g_presetSection, full, L"", buffer, size, g_path);
@@ -272,14 +285,14 @@ private:
 
 // Every setting the presets and DEFAULTS cover (CopyTunables), written into the usual sections,
 // or into a preset's own (keys "Section.Key").
-bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
+struct TunableValue {
+    const wchar_t* section;
+    const wchar_t* key;
+    double         value;
+};
+std::vector<TunableValue> Tunables(const Config& c)
 {
-    struct Value {
-        const wchar_t* section;
-        const wchar_t* key;
-        double         value;
-    };
-    const Value values[] = {
+    return {
         { L"Camera",    L"CustomCamera",         c.customCamera ? 1.0 : 0.0 },
         { L"Camera",    L"CameraAngleDeg",       c.cameraAngleDeg },
         { L"Camera",    L"HeadForward",          c.headForward },
@@ -369,9 +382,12 @@ bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
         { L"Other",     L"DabIndicator",         c.dabIndicator ? 1.0 : 0.0 },
         { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
     };
+}
 
+bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
+{
     bool ok = true;
-    for (const Value& v : values) {
+    for (const TunableValue& v : Tunables(c)) {
         wchar_t text[32];
         swprintf_s(text, L"%.6g", v.value);
         if (presetSection) {
@@ -896,6 +912,197 @@ void ReloadConfig()
     Log("config: shaders %s (time of day %s%.2f, shadows %.2f, AO %.2f, bloom %.2f, AA %d, %gx anisotropic, dirt %.2f, "
         "motion blur %.2f, DOF %.2f)", c.shaders ? "on" : "off", c.timeOfDay < 0 ? "game " : "", c.timeOfDay < 0 ? 0.0 : c.timeOfDay,
         c.shadows, c.ambientOcclusion, c.bloom, c.antiAliasing, c.anisotropy, c.dirtDetail, c.motionBlur, c.depthOfField);
+}
+
+// ---- Preset codes ----------------------------------------------------------------------------
+// One for the first person tab ("MXS-REMASTERED-CAM-") and one for the graphics tab
+// ("MXS-REMASTERED-GFX-"): the other tabs are preferences, not shared. Then, in base64url, a version
+// byte, the tab, and per setting of that tab
+// that isn't at its default a 3-byte name (FNV-1a of "Section.Key", so settings can be added or
+// reordered later) and its value (a little-endian float), and a checksum byte (a code cut short or
+// mistyped isn't loaded).
+namespace {
+
+constexpr char     kCodePrefix[] = "MXS-REMASTERED-";
+constexpr uint8_t  kCodeVersion  = 1;
+constexpr char     kBase64[]     = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+struct CodeTab { int tab; const char* tag; };
+constexpr CodeTab  kCodeTabs[] = { { 0, "CAM" }, { 1, "GFX" } };
+
+// The menu tab a setting is on (overlay.cpp's kTabs: 0 first person, 1 graphics, 2 replay, 4 other).
+int TabOf(const TunableValue& v)
+{
+    if (wcscmp(v.section, L"Graphics") == 0)
+        return 1;
+    if (wcscmp(v.section, L"Replay") == 0)
+        return 2;
+    if (wcscmp(v.section, L"Other") == 0)
+        return 4;
+    return 0;  // Camera, Smoothing, Leveling, Air, Look, Neck
+}
+
+const char* TagOf(int tab)
+{
+    for (const CodeTab& t : kCodeTabs)
+        if (t.tab == tab)
+            return t.tag;
+    return nullptr;
+}
+
+uint32_t NameHash(const TunableValue& v)
+{
+    uint32_t h = 2166136261u;
+    const auto Mix = [&](const wchar_t* s) {
+        for (; *s; ++s)
+            h = (h ^ static_cast<uint8_t>(*s)) * 16777619u;
+    };
+    Mix(v.section);
+    Mix(L".");
+    Mix(v.key);
+    return h & 0xFFFFFFu;
+}
+
+uint8_t Checksum(const std::vector<uint8_t>& bytes)
+{
+    uint8_t sum = 0x5A;
+    for (uint8_t b : bytes)
+        sum = static_cast<uint8_t>((sum << 1 | sum >> 7) ^ b);
+    return sum;
+}
+
+}  // namespace
+
+bool HasPresetCode(int tab)
+{
+    return TagOf(tab) != nullptr;
+}
+
+std::string PresetCode(int tab)
+{
+    const char* tag = TagOf(tab);
+    if (!tag)
+        return std::string();
+    const std::vector<TunableValue> now = Tunables(g_config), defaults = Tunables(Config{});
+    std::vector<uint8_t> bytes{ kCodeVersion, static_cast<uint8_t>(tab) };
+    for (size_t i = 0; i < now.size() && i < defaults.size(); ++i) {
+        const float value = static_cast<float>(now[i].value);
+        if (TabOf(now[i]) != tab || value == static_cast<float>(defaults[i].value))
+            continue;
+        const uint32_t h = NameHash(now[i]);
+        uint32_t bits;
+        std::memcpy(&bits, &value, 4);
+        for (int k = 0; k < 3; ++k)
+            bytes.push_back(static_cast<uint8_t>(h >> (8 * k)));
+        for (int k = 0; k < 4; ++k)
+            bytes.push_back(static_cast<uint8_t>(bits >> (8 * k)));
+    }
+    bytes.push_back(Checksum(bytes));
+    std::string code = kCodePrefix;
+    code += tag;
+    code += '-';
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        const uint32_t n = bytes[i] << 16 | (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                           (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+        const size_t chars = bytes.size() - i >= 3 ? 4 : bytes.size() - i + 1;
+        for (size_t k = 0; k < chars; ++k)
+            code += kBase64[(n >> (18 - 6 * k)) & 63];
+    }
+    return code;
+}
+
+PresetCodeResult LoadPresetCode(const char* text)
+{
+    PresetCodeResult result;
+    // The first "MXS-REMASTERED-XXX-" with a tag we know (a whole message pasted is fine).
+    const char* start = nullptr;
+    int tab = -1;
+    for (const char* at = text ? strstr(text, kCodePrefix) : nullptr; at && !start; at = strstr(at + 1, kCodePrefix)) {
+        const char* tagAt = at + sizeof kCodePrefix - 1;
+        for (const CodeTab& t : kCodeTabs)
+            if (_strnicmp(tagAt, t.tag, 3) == 0 && tagAt[3] == '-') {
+                start = tagAt + 4;
+                tab = t.tab;
+                break;
+            }
+    }
+    if (!start)
+        return result;
+    result.tab = tab;
+    // base64url, up to the first character that isn't
+    std::vector<uint8_t> bytes;
+    uint32_t n = 0;
+    int bits = 0;
+    for (const char* c = start; *c; ++c) {
+        const char* at = strchr(kBase64, *c);
+        if (!at)
+            break;
+        n = n << 6 | static_cast<uint32_t>(at - kBase64);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<uint8_t>(n >> bits));
+            n &= (1u << bits) - 1;
+        }
+    }
+    if (bytes.size() < 3 || (bytes.size() - 3) % 7 != 0) {
+        result.status = PresetCodeResult::Damaged;
+        return result;
+    }
+    const uint8_t sum = bytes.back();
+    bytes.pop_back();
+    if (Checksum(bytes) != sum || (bytes[0] == kCodeVersion && bytes[1] != tab)) {
+        result.status = PresetCodeResult::Damaged;
+        return result;
+    }
+    if (bytes[0] != kCodeVersion) {
+        result.status = PresetCodeResult::Newer;
+        return result;
+    }
+    // Every setting of its tab, as the ini would hold it: the code's value, or the default for one it
+    // doesn't name. Read the way the ini is (every value kept in range); the other tabs' are kept.
+    const std::vector<TunableValue> defaults = Tunables(Config{});
+    std::vector<std::pair<std::wstring, std::wstring>> values;
+    for (const TunableValue& v : defaults) {
+        if (TabOf(v) != tab)
+            continue;
+        wchar_t full[128], number[32];
+        swprintf_s(full, L"%s.%s", v.section, v.key);
+        swprintf_s(number, L"%.6g", v.value);
+        values.emplace_back(full, number);
+    }
+    for (size_t i = 2; i + 7 <= bytes.size(); i += 7) {
+        const uint32_t h = bytes[i] | bytes[i + 1] << 8 | bytes[i + 2] << 16;
+        uint32_t raw = 0;
+        for (int k = 0; k < 4; ++k)
+            raw |= static_cast<uint32_t>(bytes[i + 3 + k]) << (8 * k);
+        float value;
+        std::memcpy(&value, &raw, 4);
+        const TunableValue* name = nullptr;
+        for (const TunableValue& v : defaults)
+            if (TabOf(v) == tab && NameHash(v) == h) {
+                name = &v;
+                break;
+            }
+        if (!name || !std::isfinite(value)) {
+            ++result.unknown;  // (a setting from a newer version)
+            continue;
+        }
+        wchar_t full[128], number[32];
+        swprintf_s(full, L"%s.%s", name->section, name->key);
+        swprintf_s(number, L"%.6g", static_cast<double>(value));
+        for (auto& v : values)
+            if (v.first == full)
+                v.second = number;
+        ++result.settings;
+    }
+    g_codeValues = &values;
+    const Config loaded = ParseConfig(g_config);
+    g_codeValues = nullptr;
+    CopyTunables(loaded, g_config);
+    result.status = PresetCodeResult::Loaded;
+    Log("config: loaded a %s code into preset %d (%d setting(s) off their defaults%s)", TagOf(tab), g_activePreset + 1,
+        result.settings, result.unknown ? ", some from a newer version left out" : "");
+    return result;
 }
 
 }  // namespace mxcam

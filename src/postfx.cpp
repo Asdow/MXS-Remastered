@@ -4975,6 +4975,8 @@ bool WindowSize(int& w, int& h)
 // them in third person, the rear wheel's draw call) is cast instead (proc_hooks).
 bool  g_riderPartCast = false;     // this frame: your helmet's own model was cast
 bool  g_riderPieceCast = false;    // this frame: a body piece of your rider's own was cast
+int   g_riderPiecesDrawn = 0;      // this frame: your rider's body pieces the game drew (NoteRiderPiecesDrawn)
+bool  g_loggedWholeRider = false, g_wholeRiderWas = false;
 bool  g_wheelDrawnByGame[2] = { false, false };  // this frame: the game drew that wheel's call near you
 bool  g_haveHeadRest = false;
 Vec3  g_headRest;                  // the game's eye in your torso bone's own frame (first person)
@@ -5102,8 +5104,20 @@ void DrawStandIns()
                 ++g_headRestSamples;  // (then kept as it is: nothing can drag it away over a session)
             }
         }
-        head = g_haveHeadRest;  // (always: a part kept on your torso could be anything small)
-        torso = g_haveHeadRest;  // (always: a body piece of the game's own may be any small part)
+        // (Whenever the game leaves your torso and helmet out: a part kept on your torso could be
+        // anything small, a body piece of the game's own any small part. Not when it draws your whole
+        // rider - the camera close behind or beside you, not far enough off to count as third person:
+        // the shapes then sat inside the real helmet and body, and where they poked through, they
+        // shaded them in jagged patches.)
+        const bool whole = g_riderPiecesDrawn >= 5;
+        if (whole != g_wholeRiderWas && !g_loggedWholeRider) {
+            g_loggedWholeRider = whole;
+            Log("postfx: shadow map: the game draws your whole rider here (%d pieces): no helmet or torso shape stands in",
+                g_riderPiecesDrawn);
+        }
+        g_wholeRiderWas = whole;
+        head = g_haveHeadRest && !whole;
+        torso = g_haveHeadRest && !whole;
     }
     // Your wheels the game isn't drawing (placed from your bike, see OwnWheelCast): a tire for one it
     // has never drawn this session; the swingarm whenever the rear one isn't drawn (the game leaves
@@ -5258,6 +5272,7 @@ void Apply()
     int w = 0, h = 0;
     g_riderPartCast = false;
     g_riderPieceCast = false;
+    g_riderPiecesDrawn = 0;
     g_wheelDrawnByGame[0] = g_wheelDrawnByGame[1] = false;
     g_wheelMask.cleared = g_wheelMask.drawn = false;
     if (!WindowSize(w, h)) {
@@ -5846,6 +5861,11 @@ void NoteWheelDrawnByGame(int i)
 {
     if (i >= 0 && i < 2)
         g_wheelDrawnByGame[i] = true;
+}
+
+void NoteRiderPiecesDrawn(int pieces)
+{
+    g_riderPiecesDrawn = pieces;
 }
 
 void NoteRiderPartCast(bool piece)

@@ -3198,6 +3198,7 @@ void CastRiderPieces(const postfx::OwnAnchors& own)
             models.emplace_back(world, world + 16);
         }
     }
+    postfx::NoteRiderPiecesDrawn(static_cast<int>(mine.size()));  // (whole: no helmet or torso shape)
     if (mine.empty())
         return;  // your rider isn't drawn this frame
 

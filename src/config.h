@@ -3,6 +3,8 @@
 //   MXS_REMASTERED.ini; see that file for what each value does in practice.
 #pragma once
 
+#include <string>
+
 #include "gamepad.h"
 
 namespace mxcam {
@@ -204,5 +206,22 @@ void CopyTunables(const Config& from, Config& to);
 constexpr int kPresetCount = 3;
 int  ActivePreset();
 void SwitchPreset(int index);
+
+// Preset codes, to share settings as one line of text (on Discord): one for the first person tab and
+// one for the graphics tab (tab: overlay's kTabs, 0 or 1; the other tabs are preferences, with none).
+// "MXS-REMASTERED-CAM-" or "MXS-REMASTERED-GFX-" and that tab's settings that aren't at their defaults,
+// packed. PresetCode gives the active preset's (as it is now, saved or not); LoadPresetCode finds a
+// code anywhere in text (a whole message pasted is fine) and loads it into the active preset: every
+// setting of its tab to the code's (its default where the code doesn't name it), every other tab's
+// kept (not saved until SaveConfig).
+bool HasPresetCode(int tab);
+std::string PresetCode(int tab);
+struct PresetCodeResult {
+    enum Status { NotFound, Damaged, Newer, Loaded } status = NotFound;
+    int tab = -1;      // the tab it's for
+    int settings = 0;  // settings it set
+    int unknown = 0;   // settings it names that this version doesn't have (left out)
+};
+PresetCodeResult LoadPresetCode(const char* text);
 
 }  // namespace mxcam
