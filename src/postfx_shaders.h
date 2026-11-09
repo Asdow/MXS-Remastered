@@ -439,7 +439,6 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor,
     float gy = (MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0))) * wNear;
     float texel = u_markTexel;
     float k = u_marks;
-    float texel = u_markTexel;
     // The sides, from the height field's own slope two texels each way and over the height the
     // floor was really lowered here: the dug walls light as real slopes, and their shading
     // lines up with where main lowered this pixel.
