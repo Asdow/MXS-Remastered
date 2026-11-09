@@ -1,6 +1,6 @@
 // config.h
-//   Tunables, loaded from mxcam.ini next to the DLL. The defaults below match the shipped
-//   mxcam.ini; see that file for what each value does in practice.
+//   Tunables, loaded from MXS_REMASTERED.ini (see paths.h). The defaults below match the shipped
+//   MXS_REMASTERED.ini; see that file for what each value does in practice.
 #pragma once
 
 #include "gamepad.h"
@@ -129,6 +129,8 @@ struct Config {
     double headlightHeight  = -0.45;      // m: the same, up the bike (negative = below the eyes)
     double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
                                           // reaches further ahead; down: nearer)
+    bool   headlightEveryBike = true;     // a headlight on every bike around you too, not just yours (found
+                                          // by their wheels: lobby_wheels.h)
     double ambientOcclusion = 0.5;        // 0..1
     double aoRadius         = 0.8;        // m
     double sunRays          = 0.35;       // 0..1
@@ -147,6 +149,7 @@ struct Config {
     double dirtScale        = 1.0;        // size of the detail (2 = twice as big)
     double tireMarks        = 0.7;        // 0..1 grooves your tires leave in the dirt
     double markCacheSegs    = 40000.0;    // segments per wheel (10000..1000000) of your ruts kept
+    bool   marksEveryBike   = false;      // tire marks from every bike in the lobby, not just yours (lobby_wheels.h)
                                           // in memory: how far back along your ride they come
                                           // back exactly as they were (the panel shows the memory
                                           // it costs: kMarkSegBytes each, both wheels)
@@ -159,11 +162,12 @@ struct Config {
     double motionBlur       = 0.0;        // 0..1 camera motion blur
     double depthOfField     = 0.0;        // 0..1
     double dofFocus         = 0.0;        // m; 0 = auto-focus on the middle of the screen
-    bool   dumpShaders      = false;      // writes the game's shader sources to mxcam_shaders\ (diagnostics)
+    bool   dumpShaders      = false;      // writes the game's shader sources to MXS_REMASTERED_shaders\ (diagnostics)
 
     // [Other] quality of life
     bool   hideHud          = false;      // hide the game's HUD while riding (it shows again while you use the mouse)
     bool   hideCursor       = false;      // hide the game's mouse cursor while riding (same)
+    bool   dabIndicator     = false;      // bottom right: red standing, green while the game's Sit/Dab key sits you (dab.cpp)
     bool   fadeMenu         = true;       // fade this menu while a graphics setting is being adjusted
     bool   fullscreenWindow = false;      // windowed mode: the window made borderless, covering its monitor
                                           // (a display choice: not part of the presets or DEFAULTS)
@@ -185,7 +189,7 @@ void LoadConfig(const wchar_t* iniPath);
 void ReloadConfig();
 void SetEnabled(bool enabled);
 
-// Writes Enabled, MenuKey and the camera tunables back to mxcam.ini (comments and other keys are kept).
+// Writes Enabled, MenuKey and the camera tunables back to MXS_REMASTERED.ini (comments and other keys are kept).
 bool SaveConfig();
 
 // What the mod learnt about your bike, kept in the ini's [Learned] section between sessions

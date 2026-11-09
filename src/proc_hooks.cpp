@@ -33,7 +33,7 @@
 //     or that draws without depth testing (2D), so the effects run on the scene alone;
 //   - the sun can be turned by the time of day, before the eye-space correction above;
 //   - texture filtering (texfilter.h) also covers sampler objects.
-//   TraceKey (F11) records a per-frame trace (mxcam_trace.csv) for diagnosing jerks.
+//   TraceKey (F11) records a per-frame trace (MXS_REMASTERED_trace.csv) for diagnosing jerks.
 //   Uniform names are logged as the game looks them up, and every upload goes into the F10 dump.
 
 #include <windows.h>
@@ -54,8 +54,10 @@
 #include "bike.h"
 #include "camera.h"
 #include "config.h"
+#include "dab.h"
 #include "gamepad.h"
 #include "hooks.h"
+#include "lobby_wheels.h"
 #include "log.h"
 #include "overlay.h"
 #include "postfx.h"
@@ -270,6 +272,8 @@ struct NearDraw {
     GLfloat        projection[16];  // draws it again exactly so)
 };
 std::vector<NearDraw> g_nearDraws;
+double g_lobbyView[16] = {};   // this frame's raw camera view, for the lobby wheels (lobby_wheels.h)
+bool   g_haveLobbyView = false;
 constexpr size_t kMaxNearDraws = 512;
 constexpr float  kNearDrawRange = 60.0f;  // game units from the camera (~18 m in feet; the chase camera sits ~12 m back)
 struct KeptWheel {
@@ -389,7 +393,7 @@ constexpr int    kTraceRing    = 4096;  // frames; covers kTraceHistory at up to
 constexpr double kTraceHistory = 15.0;  // seconds kept before the key press
 struct TraceLine {
     double time = 0;
-    char   text[512];
+    char   text[1024];
 };
 TraceLine* g_traceRing   = nullptr;     // allocated on first use
 int    g_traceHead       = 0;
@@ -740,6 +744,8 @@ void NoteSceneMatrix(GLuint program, GLint location, GLsizei count, GLboolean tr
             raw[i] = m[i];
             rendered[i] = transpose ? m[i] : uploaded[i];  // transposed uploads are never corrected
         }
+        std::copy(raw, raw + 16, g_lobbyView);  // (lobby wheels: postfx's is gone by the frame's end)
+        g_haveLobbyView = true;
         postfx::NoteView(raw, rendered);
     }
 }
@@ -1795,7 +1801,7 @@ void APIENTRY Wrap_glDeleteSamplers(GLsizei count, const GLuint* samplers)
     real_glDeleteSamplers(count, samplers);
 }
 
-// DumpShaders=1: every shader source the game compiles goes to mxcam_shaders\shader_<id>.glsl.
+// DumpShaders=1: every shader source the game compiles goes to MXS_REMASTERED_shaders\shader_<id>.glsl.
 // ---- Tire dirt in the game's own drawing of your tires -----------------------------------------
 // The mud goes into the bike shader itself: its vertex shader passes each point's place in its own
 // model on (a wheel's turns with it), and its fragment shader mixes mud onto the dark rubber of the
@@ -1907,9 +1913,9 @@ void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* co
     }
     if (GetConfig().dumpShaders && strings && count > 0) {
         wchar_t path[1024];
-        swprintf_s(path, L"%smxcam_shaders", LogDirectory());
+        swprintf_s(path, L"%sMXS_REMASTERED_shaders", LogDirectory());
         CreateDirectoryW(path, nullptr);
-        swprintf_s(path, L"%smxcam_shaders\\shader_%u.glsl", LogDirectory(), shader);
+        swprintf_s(path, L"%sMXS_REMASTERED_shaders\\shader_%u.glsl", LogDirectory(), shader);
         if (FILE* file = _wfsopen(path, L"wb", _SH_DENYWR)) {
             for (GLsizei i = 0; i < count; ++i) {
                 if (!strings[i])
@@ -1918,7 +1924,7 @@ void APIENTRY Wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar* co
                 fwrite(strings[i], 1, length, file);
             }
             fclose(file);
-            Log("shaders: wrote shader %u's source to mxcam_shaders", shader);
+            Log("shaders: wrote shader %u's source to MXS_REMASTERED_shaders", shader);
         }
     }
     real_glShaderSource(shader, count, strings, lengths);
@@ -2120,7 +2126,7 @@ void StartTrace(double seconds)
     if (g_trace)
         return;
     wchar_t path[1024];
-    swprintf_s(path, L"%smxcam_trace.csv", LogDirectory());
+    swprintf_s(path, L"%sMXS_REMASTERED_trace.csv", LogDirectory());
     g_trace = _wfsopen(path, L"w", _SH_DENYWR);
     if (!g_trace) {
         Log("trace: could not create %ls", path);
@@ -2132,7 +2138,11 @@ void StartTrace(double seconds)
                      "cam_x,cam_y,cam_z,eye_dx,eye_dy,eye_dz,bike_x,bike_y,bike_z,"
                      "away_deg,ground_passes,ground_game,ground_filled,ground_open,ground_note,"
                      "rear_on,rear_seen,rear_far,rear_x,rear_y,rear_z,front_on,front_seen,front_far,front_x,front_y,front_z,"
-                     "tire_stretch,bike_found,whip,game_step_ms,bike_rest,camera_rest\n");
+                     "tire_stretch,bike_found,rear_grounded,front_grounded,lobby_segs,lobby_yours,lobby_clear,lobby_step,"
+                     "lobby_outside,lobby_pressed,lobby_near_rear_m,lobby_near_front_m,"
+                     "hl_mode,third_person,bike_pass,bike_object,objects,bike_carry_m,hl_ahead_m,hl_up_m,hl_across_m,"
+                     "dab_key,dab_sitting,speed_ms,"
+                     "whip,game_step_ms,bike_rest,camera_rest\n");
     // Times are relative to the key press: the history before it is negative.
     const double now = camera::ContentTime();
     g_traceFrames = 0;
@@ -2171,7 +2181,9 @@ void TraceFrame(bool captured)
         snprintf(line.text, sizeof line.text, "no camera,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,%s\n", postfx::WheelTraceText());
     } else if (replay::Current() != replay::Mode::Off) {
         replay::Describe(line.text, sizeof line.text - 1);
-        strcat_s(line.text, "\n");
+        // (Then the wheels' and the marks' columns, as on a riding row's end: after "|wheels,".)
+        const size_t used = strlen(line.text);
+        snprintf(line.text + used, sizeof line.text - used, "|wheels,%s\n", postfx::WheelTraceText());
     } else {
         snprintf(line.text, sizeof line.text,
             "%.2f,%.2f,%d,%d,%d,%d,%d,%d,%.2f,"
@@ -2195,7 +2207,7 @@ void TraceFrame(bool captured)
     if (now - g_traceStart > g_traceEnd) {
         fclose(g_trace);
         g_trace = nullptr;
-        Log("trace: %d frames written to mxcam_trace.csv", g_traceFrames);
+        Log("trace: %d frames written to MXS_REMASTERED_trace.csv", g_traceFrames);
         return;
     }
     fprintf(g_trace, "%.1f,%s", (now - g_traceStart) * 1000.0, line.text);
@@ -2989,7 +3001,15 @@ void PaintTireDirt(const DrawCall& draw)
     float want = 0.0f;
     double raw[16];
     const auto mv = g_programModelview.find(g_program);
-    if (cfg.shaders && cfg.tireDirt > 0.0 && !g_paintParts.empty() && postfx::FrameRawView(raw) && mv != g_programModelview.end() &&
+    // Every bike's tires (Config::marksEveryBike): every draw of a mesh the lobby's wheels found to be a
+    // wheel (lobby_wheels.h), whoever's bike, whatever its model. The mud is worked out in the tire's
+    // own model and its own texture's rubber, so nothing else about the wheel is needed.
+    if (cfg.shaders && cfg.tireDirt > 0.0 && cfg.marksEveryBike) {
+        const auto element = g_elementBuffers.find(g_vao);
+        if (lobby::IsWheel(g_program, g_vao, element != g_elementBuffers.end() ? element->second : 0, draw))
+            want = static_cast<float>(cfg.tireDirt);
+    }
+    if (want == 0.0f && cfg.shaders && cfg.tireDirt > 0.0 && !g_paintParts.empty() && postfx::FrameRawView(raw) && mv != g_programModelview.end() &&
         mv->second.frame == g_frameNumber) {
         const DeferredCaster id = MakeCaster(draw, -1, -1);
         double invRaw[16];
@@ -3517,6 +3537,20 @@ bool NoteDraw(const DrawCall& draw)
         if (LeaveOutGameOverlay(draw))
             return false;
         PrepareSkinnedDraw();
+        // Every bike's wheels (lobby_wheels.h): this rigid 3D draw, by its mesh and where it is.
+        {
+            const auto mv = g_programModelview.find(g_program);
+            if (mv != g_programModelview.end() && mv->second.frame == g_frameNumber && mv->second.kind == ModelviewKind::Scene &&
+                !mv->second.transposed && HasTranslation(mv->second.raw) && StaticDraw(draw)) {
+                const auto element = g_elementBuffers.find(g_vao);
+                const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
+                if (lobby::NoteRigidDraw(g_program, g_vao, elements, draw, mv->second.raw)) {
+                    DrawBounds bounds;  // (a wheel's shape: its axle's centre and its tire's radius)
+                    const bool ok = MeasureDraw(draw, bounds);
+                    lobby::GiveBounds(g_program, g_vao, elements, draw, ok, bounds.lo, bounds.hi);
+                }
+            }
+        }
         if (postfx::WantsShadowCasters() || postfx::WantsWheelMask())
             CastShadow(draw);
         PaintTireDirt(draw);
@@ -3583,7 +3617,7 @@ bool EndShaderFrame()
     // changed) turns the head for the next frame. Polled while the menu is open too, for binding.
     camera::Look look = camera::Look::Ahead;
     const Config& lookCfg = GetConfig();
-    if (lookCfg.controllerLook || OverlayPanelOpen()) {
+    if (lookCfg.controllerLook || OverlayPanelOpen() || (lookCfg.dabIndicator && dab::NeedsGamepad())) {
         gamepad::Poll();
         if (lookCfg.controllerLook) {
             const bool left = gamepad::IsDown(lookCfg.lookLeftControl);
@@ -3611,6 +3645,8 @@ bool EndShaderFrame()
     g_hudSkipped = g_cursorSkipped = 0;
     if (GetConfig().hideCursor)
         LearnCursor();
+    lobby::FrameEnd(g_haveLobbyView ? g_lobbyView : nullptr, camera::ContentTime());
+    g_haveLobbyView = false;
     ++g_frameNumber;
     g_shaderViewSet = false;
     g_camera.havePreview = false;

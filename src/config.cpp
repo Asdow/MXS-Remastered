@@ -359,12 +359,15 @@ bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
         { L"Graphics",  L"TireMarks",            c.tireMarks },
         { L"Graphics",  L"MarkCacheSegs",        c.markCacheSegs },
         { L"Graphics",  L"MarkDepth",            c.markDepth },
+        { L"Graphics",  L"MarksEveryBike",       c.marksEveryBike ? 1.0 : 0.0 },
+        { L"Graphics",  L"HeadlightEveryBike",   c.headlightEveryBike ? 1.0 : 0.0 },
         { L"Graphics",  L"TireDirt",             c.tireDirt },
         { L"Graphics",  L"MotionBlur",           c.motionBlur },
         { L"Graphics",  L"DepthOfField",         c.depthOfField },
         { L"Graphics",  L"DofFocus",             c.dofFocus },
         { L"Other",     L"HideHud",              c.hideHud ? 1.0 : 0.0 },
         { L"Other",     L"HideCursor",           c.hideCursor ? 1.0 : 0.0 },
+        { L"Other",     L"DabIndicator",         c.dabIndicator ? 1.0 : 0.0 },
         { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
     };
 
@@ -531,12 +534,15 @@ void CopyTunables(const Config& from, Config& to)
     to.tireMarks            = from.tireMarks;
     to.markCacheSegs        = from.markCacheSegs;
     to.markDepth            = from.markDepth;
+    to.marksEveryBike       = from.marksEveryBike;
+    to.headlightEveryBike   = from.headlightEveryBike;
     to.tireDirt             = from.tireDirt;
     to.motionBlur           = from.motionBlur;
     to.depthOfField         = from.depthOfField;
     to.dofFocus             = from.dofFocus;
     to.hideHud              = from.hideHud;
     to.hideCursor           = from.hideCursor;
+    to.dabIndicator         = from.dabIndicator;
     to.fadeMenu             = from.fadeMenu;
 }
 
@@ -757,12 +763,15 @@ Config ParseConfig(const Config& base)
     c.tireMarks        = ReadDouble(L"Graphics", L"TireMarks", c.tireMarks);
     c.markCacheSegs    = ReadDouble(L"Graphics", L"MarkCacheSegs", c.markCacheSegs);
     c.markDepth        = ReadDouble(L"Graphics", L"MarkDepth", c.markDepth);
+    c.marksEveryBike   = ReadInt(L"Graphics", L"MarksEveryBike", c.marksEveryBike) != 0;
+    c.headlightEveryBike = ReadInt(L"Graphics", L"HeadlightEveryBike", c.headlightEveryBike) != 0;
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
     c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
     c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);
     c.dofFocus         = ReadDouble(L"Graphics", L"DofFocus", c.dofFocus);
     c.hideHud          = ReadInt(L"Other", L"HideHud", c.hideHud) != 0;
     c.hideCursor       = ReadInt(L"Other", L"HideCursor", c.hideCursor) != 0;
+    c.dabIndicator     = ReadInt(L"Other", L"DabIndicator", c.dabIndicator) != 0;
     c.fadeMenu         = ReadInt(L"Other", L"FadeMenu", c.fadeMenu) != 0;
     c.fullscreenWindow = ReadInt(L"Other", L"FullscreenWindow", c.fullscreenWindow) != 0;
     c.dumpShaders      = ReadInt(L"Graphics", L"DumpShaders", c.dumpShaders) != 0;

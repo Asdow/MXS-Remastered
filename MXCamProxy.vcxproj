@@ -97,10 +97,13 @@
     <ClCompile Include="src\bike.cpp" />
     <ClCompile Include="src\camera.cpp" />
     <ClCompile Include="src\config.cpp" />
+    <ClCompile Include="src\dab.cpp" />
     <ClCompile Include="src\gamepad.cpp" />
+    <ClCompile Include="src\lobby_wheels.cpp" />
     <ClCompile Include="src\hooks.cpp" />
     <ClCompile Include="src\log.cpp" />
     <ClCompile Include="src\overlay.cpp" />
+    <ClCompile Include="src\paths.cpp" />
     <ClCompile Include="src\postfx.cpp" />
     <ClCompile Include="src\proc_hooks.cpp" />
     <ClCompile Include="src\proxy.cpp" />
@@ -115,11 +118,14 @@
     <ClInclude Include="src\motion.h" />
     <ClInclude Include="src\camera.h" />
     <ClInclude Include="src\config.h" />
+    <ClInclude Include="src\dab.h" />
     <ClInclude Include="src\gamepad.h" />
+    <ClInclude Include="src\lobby_wheels.h" />
     <ClInclude Include="src\hooks.h" />
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\mathlib.h" />
     <ClInclude Include="src\overlay.h" />
+    <ClInclude Include="src\paths.h" />
     <ClInclude Include="src\postfx.h" />
     <ClInclude Include="src\postfx_shaders.h" />
     <ClInclude Include="src\replay.h" />
@@ -130,21 +136,21 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="src\gl_exports.inl" />
-    <None Include="mxcam.ini">
+    <None Include="MXS_REMASTERED.ini">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Include="README.md" />
-    <!-- The engine sound packs (tools\engine_sounds), shipped in mxcam_sounds\ next to the DLL. -->
-    <None Include="mxcam_sounds\mxsr_engine_default125.pack">
+    <!-- The engine sound packs (tools\engine_sounds), shipped in MXS_REMASTERED_sounds\ next to the DLL. -->
+    <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default125.pack">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="mxcam_sounds\mxsr_engine_default250.pack">
+    <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default250.pack">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="mxcam_sounds\mxsr_engine_default250f.pack">
+    <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default250f.pack">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="mxcam_sounds\mxsr_engine_default450f.pack">
+    <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default450f.pack">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

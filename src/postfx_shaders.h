@@ -212,10 +212,12 @@ uniform float u_shadowTexel;      // one texel of the whole map (the cascades ar
 uniform float u_shadowBias[4];
 uniform vec3  u_lightView;      // toward the light, view space
 uniform float u_headlight;      // 0 = off
-uniform vec3  u_headPos;        // view space: the front plate
-uniform vec3  u_headDir;        // view space: where the beam points
-uniform vec3  u_headRight;      // view space: the beam's own right and up (across the bike)
-uniform vec3  u_headUp;
+uniform int   u_headCount;      // headlights: yours first, then the nearest other bikes'
+uniform vec3  u_headPos[12];    // view space: the front plate
+uniform vec3  u_headDir[12];    // view space: where the beam points
+uniform vec3  u_headRight[12];  // view space: the beam's own right and up (across the bike)
+uniform vec3  u_headUp[12];
+uniform float u_headPower[12];  // each one's strength (0..1: fading in and out as bikes are found and lost)
 uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of it below level, its half-height
 uniform float u_headReach;      // how far it reaches (1 = level; more aimed up, less aimed down)
 
@@ -266,15 +268,19 @@ float MapShadow(vec3 p, vec3 n)
 // distance. On the ground that makes an oval pool joined to the bike, brightest a few metres
 // ahead (a real headlight throws most of its light near the top of the beam); surfaces facing
 // the bike catch more of it. Nothing behind the plate or on the bike itself.
-vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
+float HeadlightOne(vec3 p, vec3 n, int i)
 {
-    vec3 l = u_headPos - p;
+    vec3 l = u_headPos[i] - p;
     float d = length(l);
+    if (d > 70.0 * u_headReach)
+        return 0.0;
     l /= max(d, 1e-4);
     vec3 q = -l * d;
-    float ahead = dot(q, u_headDir);
-    float side = atan(dot(q, u_headRight), max(ahead, 1e-4));
-    float down = atan(-dot(q, u_headUp), max(ahead, 1e-4));
+    float ahead = dot(q, u_headDir[i]);
+    if (ahead <= 0.0)
+        return 0.0;
+    float side = atan(dot(q, u_headRight[i]), max(ahead, 1e-4));
+    float down = atan(-dot(q, u_headUp[i]), max(ahead, 1e-4));
     vec2 e = vec2(side / u_headBeam.x, (down - u_headBeam.y) / u_headBeam.z);
     float cone = ahead > 0.0 ? smoothstep(1.0, 0.45, length(e)) : 0.0;
     float hot = mix(0.3, 1.0, smoothstep(0.8, 0.12, down));
@@ -282,7 +288,15 @@ vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
     float facing = mix(0.35, 1.0, clamp(dot(n, l) * 3.0, 0.0, 1.0)) * step(0.0, dot(n, l));
     float reach = (1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach))) *
                   (1.0 - smoothstep(45.0 * u_headReach, 70.0 * u_headReach, d));
-    return albedo * vec3(1.0, 0.97, 0.92) * (cone * hot * own * facing * reach * u_headlight * 2.6);
+    return cone * hot * own * facing * reach;
+}
+
+vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
+{
+    float sum = 0.0;
+    for (int i = 0; i < u_headCount; ++i)
+        sum += HeadlightOne(p, n, i) * u_headPower[i];
+    return albedo * vec3(1.0, 0.97, 0.92) * (sum * u_headlight * 2.6);
 }
 
 float Hash13(vec3 p)
@@ -421,6 +435,9 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor,
     float m = sNear.x * wNear, around = max(sNear.y * wNear, m);
     if (m < 0.004 && around < 0.004)
         return c;
+    float gx = (MarkNear(t + vec2(1.0, 0.0)) - MarkNear(t - vec2(1.0, 0.0))) * wNear;
+    float gy = (MarkNear(t + vec2(0.0, 1.0)) - MarkNear(t - vec2(0.0, 1.0))) * wNear;
+    float texel = u_markTexel;
     float k = u_marks;
     float texel = u_markTexel;
     // The sides, from the height field's own slope two texels each way and over the height the
@@ -842,7 +859,8 @@ uniform sampler2D u_ground;     // the terrain's depth, before anything stood on
 uniform float u_check;          // 1: check against it on screen
 uniform float u_fallback;       // this wheel's own answer, from its height in the world: 0 in the
                                 // air, presses nothing anywhere; 1: where the screen can see this
-                                // groove, the terrain's depth decides
+                                // groove, the terrain's depth decides; 2 (another bike's wheel, whose
+                                // air nothing else knows): pressed only where the screen says down
 uniform float u_groundTol;      // how far above the ground still counts as down
 uniform vec3  u_upView;
 
@@ -859,11 +877,20 @@ float OnGround(float t)
         vec2 uv = Project(c);
         if (OnScreen(uv)) {
             float d = textureLod(u_ground, uv, 0.0).r;
-            if (!IsSky(d))
-                return dot(c - ViewPos(uv, d), u_upView) < u_groundTol ? 1.0 : 0.0;
+            if (!IsSky(d)) {
+                vec3 g = ViewPos(uv, d);
+                if (u_fallback > 1.5) {
+                    // Another bike's wheel: the ground seen there must be at the tire, not past it -
+                    // as high within the tolerance either way, and near it along the line of sight.
+                    // (Only "no higher than it" pressed ruts under wheels in the air, wherever the
+                    // ground seen past them stood as high: a hill, a jump's face.)
+                    return abs(dot(c - g, u_upView)) < u_groundTol && length(c - g) < 10.0 * u_groundTol ? 1.0 : 0.0;
+                }
+                return dot(c - g, u_upView) < u_groundTol ? 1.0 : 0.0;
+            }
         }
     }
-    return u_fallback;
+    return u_fallback > 1.5 ? 0.0 : u_fallback;
 }
 
 // The ground's own unevenness: the hash read bilinear over a lattice nine texels wide (about
