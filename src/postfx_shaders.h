@@ -830,6 +830,13 @@ constexpr const char* kStamp = R"GLSL(
 uniform vec2  u_a, u_b;
 uniform float u_half;
 uniform float u_strength;
+uniform float u_arcA;             // how far this segment's first contact lies along the wheel's
+                                  // current run of ruts, in the map's texels of trail, counted from
+                                  // the run's own first contact (so 0: this is where it began)
+uniform float u_fadeOut;          // how far along that run its end turn has run out, the same for
+                                  // every segment of a run: past it nothing is pressed. Huge while
+                                  // the run is still going: the tire may still come down again
+uniform float u_fadeLen;          // how far either turn spreads over, in the same texels of trail
 uniform vec3  u_eyeA, u_eyeB;   // the two contacts (view space): pressed only where the tire is down
 uniform sampler2D u_ground;     // the terrain's depth, before anything stood on it
 uniform float u_check;          // 1: check against it on screen
@@ -881,9 +888,31 @@ void main()
         return;
     }
     vec2 ab = u_b - u_a;
-    float t = clamp(dot(p - u_a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    // Unclamped along the trail, and clamped only at the ends of it below: a neighbouring
+    // segment's rectangle reaches past this segment's contacts, and if the fade stopped at
+    // those it would hold the wrong share of the press there - the deeper of the two wins,
+    // which steps the ramp at every contact. Read along the trail it keeps on as the same
+    // line, so overlapping stamps agree and the fade comes out smooth.
+    float te = dot(p - u_a, ab) / max(dot(ab, ab), 1e-6);
+    float t = clamp(te, 0.0, 1.0);
     float d = length(p - (u_a + ab * t));
-    float x = clamp(d / max(u_half, 1e-3), 0.0, 1.0);
+    // Where this texel lies along the trail, in the same distance the run's turns are measured
+    // with. Read as a distance rather than as a share of this segment, and every segment of a
+    // run answers against the same two marks on the trail: where their rectangles overlap they
+    // hold the same value there, which is what lets a turn come out smooth under a max blend.
+    // A share of the segment would answer as a straight line of its own, and neighbouring
+    // segments reach full depth at different distances, so their lines disagree where they
+    // overlap and the deeper of the two steps the turn at every contact.
+    float arc = u_arcA + te * length(ab);
+    // How much of the press this holds: a wheel's run turns in over the first of it and out over
+    // the last of it. The end turn runs over ground beyond the tire's last contact, which the
+    // ground test below keeps to where that ground really is - over a jump's gap there is none,
+    // so a rut still ends at the lip, only without a straight cut across it.
+    float fade = min(clamp(arc / u_fadeLen, 0.0, 1.0), clamp((u_fadeOut - arc) / u_fadeLen, 0.0, 1.0));
+    // A tire enters and leaves the ground as a wedge, so where the press is shallow its face
+    // doesn't sit as wide either: the rut's beginning and its end narrow along with their depth.
+    float hw = max(u_half * (0.4 + 0.6 * fade), 1.5);
+    float x = clamp(d / max(hw, 1e-3), 0.0, 1.0);
     // The rut's cross-section: it goes down gradually from the undisturbed ground on either
     // side to the tire's own centre line, where the whole face was pressed deepest and is
     // deepest still. A rounded section, like a tire's channel in soft ground: the walls curve
@@ -891,7 +920,7 @@ void main()
     float profile = cos(x * 1.5707963 / 2.0);
     // A little wider than the deepest section, so the ground eases into the groove over the
     // last texels and its lips hold the faintest press.
-    float cover = 1.0 - smoothstep(u_half - 1.5, u_half + 0.5, d);
+    float cover = 1.0 - smoothstep(hw - 1.5, hw + 0.5, d);
     // And nothing on the ground is quite even, so a little unevenness rides on the whole depth.
     // This has to be a wobble over ground about half a metre across rather than texel to texel:
     // the march answers against this height field, and a field that changes at every texel is a
@@ -904,7 +933,7 @@ void main()
                                                         // it would only be flattened where the ray
                                                         // keeps to it, a plateau along the rut
     float down = OnGround(t);
-    o_color = vec4(cover * depth * u_strength * down);
+    o_color = vec4(cover * depth * u_strength * fade * down);
 }
 )GLSL";
 

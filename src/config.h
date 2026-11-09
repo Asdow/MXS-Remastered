@@ -7,9 +7,11 @@
 
 namespace mxcam {
 
-// What one cached rut segment costs in memory (postfx.cpp's MarkSeg: six doubles), so the
-// settings panel and the log can say what a segment count costs. The index that keeps big
-// counts cheap to re-press adds about 2 bytes a segment of boxes on top.
+// What one cached rut segment costs in memory (postfx.cpp's MarkSeg: four doubles for its two
+// contacts, and four floats for the rut's half width, for how far its first contact lies along
+// the wheel's run of ruts and for how far that run's end turn runs out), so the settings panel
+// and the log can say what a segment count costs. The index that keeps big counts cheap to
+// re-press adds about 2 bytes a segment of boxes on top.
 constexpr unsigned long long kMarkSegBytes = 48;
 
 struct Config {

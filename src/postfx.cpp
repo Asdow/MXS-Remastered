@@ -1297,6 +1297,10 @@ struct Wheel {
     int    trailSkipped = 0;  // frames on end its contact was off the trail sideways (not stamped)
     bool   haveLast = false;  // the last contact stamped into the tire marks
     double lastU = 0, lastV = 0;
+    double runArc = 0;        // how far it has pressed in its current run of ruts, in the mark
+                              // map's texels of trail, counted from the run's own first contact
+                              // (the turns at a run's ends are read off this - see kMarkRunFade
+                              // and u_arcA in postfx_shaders.h)
     double off = 0.0;         // seconds it has been off the tracker (the rut keeps joining up)
     // Where its tire is on the ground, in the world (see the ground field in the tire marks):
     // the marks' own test is the terrain's depth, which only exists where the game drew the
@@ -2755,10 +2759,35 @@ constexpr double kMarkCacheMax   = 1000000.0;  // ...and at most: the range the 
 constexpr size_t kMarkBlockSegs  = 64;         // segments kept in one block, sharing a box: the
                                                // index the re-press walks, about 2 bytes a
                                                // segment of boxes
+constexpr double kMarkRearStrength  = 1.0;   // how deep each wheel's rut goes: the rear carries
+constexpr double kMarkFrontStrength = 0.7;   // most of the rider and digs deeper. The re-press
+                                             // needs them as well, so they're kept here rather
+                                             // than written at both call sites
+// How far a wheel's run of ruts turns in and out along the trail, in m: the first of a run's
+// segments and its last hold less of the press, spread over this, so a rut that begins where the
+// tire touched down and ends where it left the ground fades in and out rather than being cut
+// straight across at either - and cut across is what a shoe sole looks like, not a tire. The end
+// turns over ground beyond the last contact, which the stamp's own test keeps to where that
+// ground really is: over the gap a jump left, nothing is pressed there.
+constexpr double kMarkRunFade  = 0.9;   // m of trail a wheel's run of ruts turns in and out over
+constexpr double kMarkTailStep = 0.15;  // ...and the end turns out in presses this long
+constexpr double kMarkNoFade   = 1e18;  // the distance along a run its end turn runs out at, far
+                                        // enough out to stand for "the run was still going": the
+                                        // turn is one shared function of that distance, so a
+                                        // segment can't hold a value of its own
 struct MarkSeg {
     double au, av, bu, bv;  // the two contacts, in the map's own (unwrapped) texels
-    double halfWidth = 0;   // m: the rut's half width (its true world width)
-    double strength  = 0;   // how deep: rear 1, front 0.7
+    float  halfWidth = 0;   // m: the rut's half width (its true world width)
+    float  arcA = 0;        // where its first contact lies along the wheel's run of ruts, in the
+                            // map's texels of trail counted from the run's own first contact
+    float  fadeOut = 1e18f; // how far along that run its end turn runs out (huge: the run was
+                            // still going when this was pressed). The turns are read off these
+                            // two as one shared function of the distance along the trail rather
+                            // than held as this segment's own shares at its ends, which is what
+                            // makes a cache re-press give the very same stamps AND keeps a turn
+                            // smooth where a run's segments overlap on the ground (a max blend
+                            // takes the deeper of two disagreeing straight lines, and they do
+                            // disagree, at every contact: see u_arcA and u_fadeOut in kStamp)
 };
 struct MarkBlock {
     std::vector<MarkSeg> segs;       // up to kMarkBlockSegs of one wheel's trail, oldest first
@@ -2769,6 +2798,9 @@ size_t                g_markCacheSize[2] = {};  // segments held per wheel (what
 struct MarkMap {
     int       size = 0;       // texels to a side (0: this map couldn't be made)
     double    texel = 0;      // one texel, in game units
+    double    fadeLen = 1;    // how far a wheel's run of ruts turns in and out at its ends, in this
+                              // map's texels of trail (kMarkRunFade over): the stamp reads a turn as
+                              // a distance along the trail, so it wants the spread in the same unit
     long long originU = 0, originV = 0;  // where the window's corner is, in unwrapped texels
     bool      set = false;    // the window has an origin
 };
@@ -2856,6 +2888,7 @@ bool EnsureMarks()
     g_res.marksCleared = false;
     g_mark.set = false;
     g_mark.texel = 0.04 * g_unitsPerMetre;
+    g_mark.fadeLen = kMarkRunFade * g_unitsPerMetre / g_mark.texel;
     const double reach = g_mark.size * g_mark.texel / 2.0 / g_unitsPerMetre;
     const size_t cap = MarkCacheCap();
     Log("postfx: tire marks map %dx%d of 4 cm %s: ruts reach %.0f m and fade out over the last %.0f; the whole session's ruts are kept in a cache of %d segments per wheel (%.1f MB) and re-pressed wherever ground is reused",
@@ -2865,8 +2898,11 @@ bool EnsureMarks()
 }
 
 // Writes value (blend off) or presses a groove (max blend) between a and b, in one map's own
-// texels (wrapped), over the rectangle x0, y0, w, h.
-void StampRect(Target& map, int x0, int y0, int w, int h, float ax, float ay, float bx, float by, float halfWidth, float strength)
+// texels (wrapped), over the rectangle x0, y0, w, h. How far the groove's ends lie along the
+// wheel's run of ruts comes through as well, which is what turns a rut's beginning and its end
+// in and out along the trail.
+void StampRect(Target& map, int x0, int y0, int w, int h, float ax, float ay, float bx, float by,
+               float halfWidth, float strength, float arcA, float fadeOut)
 {
     if (w <= 0 || h <= 0)
         return;
@@ -2875,19 +2911,28 @@ void StampRect(Target& map, int x0, int y0, int w, int h, float ax, float ay, fl
     g_gl.Uniform2f(p["u_b"], bx, by);
     g_gl.Uniform1f(p["u_half"], halfWidth);
     g_gl.Uniform1f(p["u_strength"], strength);
+    g_gl.Uniform1f(p["u_arcA"], arcA);
+    g_gl.Uniform1f(p["u_fadeOut"], fadeOut);
     g_gl.Scissor(x0, y0, w, h);
     Draw(map);
 }
 
 void ClearMarks(Target& map, int x0, int y0, int w, int h)
 {
-    StampRect(map, x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f);
+    StampRect(map, x0, y0, w, h, -1e6f, -1e6f, -1e6f, -1e6f, 1.0f, 0.0f, 0.0f, 0.0f);
 }
 
 // A groove from the last contact to this one, in the map's texels (wrapped), drawn once per
-// wrap-around copy it touches.
-void Groove(Target& map, const MarkMap& m, double au, double av, double bu, double bv, double halfWidth, double strength)
+// wrap-around copy it touches. How far its ends lie along the wheel's run of ruts comes through
+// as well, so a run's beginning and its end turn in and out the same way however often the
+// ground was re-pressed.
+void Groove(Target& map, const MarkMap& m, double au, double av, double bu, double bv, double halfWidth,
+            double strength, double arcA, double fadeOut)
 {
+    // The turns are read as a distance along the trail, so they want their spread in the same
+    // unit the stamp counts trail distances in: this map's texels.
+    Program& sp = g_res.programs[kStamp];
+    g_gl.Uniform1f(sp["u_fadeLen"], static_cast<float>(m.fadeLen));
     const double pu = MarkWrap(m.originU, m.size), pv = MarkWrap(m.originV, m.size);
     const double ax = au - m.originU + pu, ay = av - m.originV + pv;
     const double bx = bu - m.originU + pu, by = bv - m.originV + pv;
@@ -2905,7 +2950,7 @@ void Groove(Target& map, const MarkMap& m, double au, double av, double bu, doub
                 continue;
             StampRect(map, cx0, cy0, cx1 - cx0, cy1 - cy0, static_cast<float>(ax - ox), static_cast<float>(ay - oy),
                       static_cast<float>(bx - ox), static_cast<float>(by - oy), static_cast<float>(halfWidth),
-                      static_cast<float>(strength));
+                      static_cast<float>(strength), static_cast<float>(arcA), static_cast<float>(fadeOut));
         }
     }
 }
@@ -3393,7 +3438,8 @@ void RepressCache(int axis, long long from, long long count)
                 const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
                 if (hi < stripLo || lo > stripHi)
                     continue;
-                Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw, s.strength);
+                Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw,
+                       i == 0 ? kMarkRearStrength : kMarkFrontStrength, s.arcA, s.fadeOut);
             }
         }
     }
@@ -3545,8 +3591,10 @@ bool UpdateMarks(double dt)
             // keeps the wheel's last contact: coming back, the rut joins up instead of leaving
             // a gap. Only a wheel off for over three quarters of a second forgets it.
             w.off += dt;
-            if (w.off > 0.75)
+            if (w.off > 0.75) {
                 w.haveLast = false;
+                w.runArc = 0.0;  // the rut's forgotten: its run of ruts begins over with it
+            }
             w.fit.Reset();     // its contact isn't trusted while the wheel is off the tracker
             w.fallG = 0;
             w.heightAccel = 0;
@@ -3702,28 +3750,89 @@ bool UpdateMarks(double dt)
             const double step = std::hypot(tu - w.lastU, tv - w.lastV) * m.texel;
             if (step > 2.5 * g_unitsPerMetre) {  // a respawn: don't join it up
                 w.haveLast = false;
+                w.runArc = 0.0;  // ...and a run of ruts begins over with it
             } else if (step < 0.01 * g_unitsPerMetre) {
                 continue;  // standing still: keep the last contact
             } else {
                 // Rear: a 240 mm rut (the tire digs and throws dirt aside), front: 180 mm, shallower.
                 // Stamped at the rut's true world width: the map's texels are 4 cm, so it's
                 // several texels across and the fresh line comes out smooth by construction.
+                const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
+                const double strength = i == 0 ? kMarkRearStrength : kMarkFrontStrength;
+                // How far this wheel's run of ruts has gone, and how far this segment takes it to,
+                // in the map's texels of trail counted from the run's own first contact. A run is
+                // the stretch of ground the tire has been down on with no break, and its two ends
+                // turn in and out over the first and last kMarkRunFade metres of that trail: the
+                // turn is read as a distance along the trail rather than held as this segment's
+                // own share at its ends, so every segment of a run answers against the same marks
+                // on it and a max blend can't step a turn where they overlap on the ground - two
+                // straight lines of their own disagree there, and the deeper of the two wins.
+                const double arcA = w.runArc;
+                const double arcB = arcA + std::hypot(tu - w.lastU, tv - w.lastV);
+                // The last contact's own stamp reaches this far past the contact (the rut's half
+                // width, plus where the stamp's cover falls to nothing) and holds full depth over
+                // it, so the run's end turn is measured from the end of that reach: the run-out
+                // then starts where the last press stops, at full depth, and is one straight line
+                // down from there. That is why the stamps can't step it, and why a rut that ends
+                // where the tire left the ground still reaches to the lip it left off at.
+                const double plateau = halfWidth / m.texel + 0.5;
+                const double fadeOut = arcA + plateau + m.fadeLen;
+                if (w.grounded)
+                    w.runArc = arcB;  // this segment is part of the run
+                else
+                    w.runArc = 0.0;   // in the air: the run is over at here, its turn runs out below
+                g_gl.Uniform1f(stamp["u_fallback"], w.grounded ? 1.0f : 0.0f);
                 Vec(stamp, "u_eyeA", TransformPoint(g_frame.rendered, w.lastContact));
                 Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, contact));
-                const double halfWidth = (i == 0 ? 0.12 : 0.09) * g_unitsPerMetre;
-                const double strength = i == 0 ? 1.0 : 0.7;
-                // This wheel's own answer, which gates the whole groove: in the air it presses
-                // nothing, wherever the screen looks. Where it says down, the parts of the groove
-                // the screen can see are checked against the terrain's depth as well.
-                g_gl.Uniform1f(stamp["u_fallback"], w.grounded ? 1.0f : 0.0f);
-                Groove(g_res.marks, m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength);
+                Groove(g_res.marks, m, w.lastU, w.lastV, tu, tv, halfWidth / m.texel, strength, arcA,
+                       w.grounded ? kMarkNoFade : fadeOut);
                 // Into the cache too: when this ground comes back through the window's edge,
                 // the same segment is pressed again, so marks stay wherever you've ridden this
                 // session, however many times the window wrapped around since. Ruts the tires
                 // didn't really press aren't cached - they'd be re-pressed wherever the ground
                 // is reused. Oldest segments go only once the cap is reached.
                 if (w.grounded)
-                    PushMark(i, MarkSeg{ w.lastU, w.lastV, tu, tv, i == 0 ? 0.12 : 0.09, strength });
+                    PushMark(i, MarkSeg{ w.lastU, w.lastV, tu, tv, float(i == 0 ? 0.12 : 0.09),
+                                         float(arcA), static_cast<float>(kMarkNoFade) });
+                else if (arcA > 0.0) {
+                    // The run's end: its last metres of turn lie beyond the last contact, so they
+                    // are pressed on past it as a few short segments, each holding less of the
+                    // press (and, through the stamp, sitting narrower: a tire leaves the ground
+                    // as a wedge). They go on along the way the wheel was going, level with the
+                    // last contact, and the stamp's own ground test keeps them to where that
+                    // ground really is - over the gap a jump left there is none, so a rut still
+                    // ends at the lip it left off at, only without a straight cut across it.
+                    // They carry the same distance along the run and the same point its turn runs
+                    // out at as the run's other segments, so they turn over as one straight line
+                    // from the end of the last contact's reach; and they're cached like every other
+                    // segment, so ground coming back through the window's edge returns with the
+                    // same run-out.
+                    const double tailTexels = kMarkTailStep * g_unitsPerMetre / m.texel;
+                    const int tailSegs = static_cast<int>(
+                        std::ceil((plateau + m.fadeLen) / tailTexels));
+                    Vec3 along = contact - w.lastContact;
+                    along = along - up * Dot(along, up);  // the way it was going, in the ground
+                    if (Length(along) > 1e-6) {
+                        const Vec3 dirW = Normalize(along);
+                        double arc = arcA;  // how far along the run this stretch of trail lies
+                        for (int k = 0; k < tailSegs; ++k) {
+                            const Vec3 pa = w.lastContact + dirW * (kMarkTailStep * k);
+                            const Vec3 pb = w.lastContact + dirW * (kMarkTailStep * (k + 1));
+                            const double au = Dot(pa, u) / m.texel, av = Dot(pa, v) / m.texel;
+                            const double bu = Dot(pb, u) / m.texel, bv = Dot(pb, v) / m.texel;
+                            Vec(stamp, "u_eyeA", TransformPoint(g_frame.rendered, pa));
+                            Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, pb));
+                            // Out of the ground's own answer rather than the tire's: the run has
+                            // ended, so nothing gates these but the ground where they lie.
+                            g_gl.Uniform1f(stamp["u_fallback"], 1.0f);
+                            Groove(g_res.marks, m, au, av, bu, bv, halfWidth / m.texel, strength, arc,
+                                   fadeOut);
+                            PushMark(i, MarkSeg{ au, av, bu, bv, float(i == 0 ? 0.12 : 0.09),
+                                                 float(arc), static_cast<float>(fadeOut) });
+                            arc += std::hypot(bu - au, bv - av);
+                        }
+                    }
+                }
             }
         }
         w.lastU = tu;
