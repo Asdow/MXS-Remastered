@@ -129,7 +129,8 @@ uint64_t KeyOf(unsigned program, unsigned vao, unsigned elementBuffer, const Dra
 bool Enabled()
 {
     const Config& cfg = GetConfig();
-    return cfg.marksEveryBike && (cfg.tireMarks > 0.0 || cfg.tireDirt > 0.0);
+    return (cfg.marksEveryBike && (cfg.tireMarks > 0.0 || cfg.tireDirt > 0.0)) ||
+           (cfg.headlightEveryBike && cfg.headlight > 0.0 && cfg.timeOfDay >= 0.0);
 }
 
 void Invert(const double v[16], double out[16])  // a rigid view (rotation + translation), maybe scaled
@@ -402,6 +403,42 @@ void TakeSegments(std::vector<Segment>& out)
 {
     out.clear();
     out.swap(g_segments);
+}
+
+void CurrentWheels(const double rawView[16], std::vector<WheelNow>& out)
+{
+    out.clear();
+    if (!Enabled() || !rawView)
+        return;
+    double toWorld[16];
+    Invert(rawView, toWorld);
+    for (const auto& kv : g_meshes) {
+        const Mesh& m = kv.second;
+        if (!m.wheel || m.shape != 2)
+            continue;
+        const size_t copies = m.raws.size() / 16;
+        for (size_t i = 0; i < copies; ++i) {
+            double mv[16], w[16];
+            for (int k = 0; k < 16; ++k)
+                mv[k] = m.raws[i * 16 + k];
+            Mul(toWorld, mv, w);
+            WheelNow n;
+            double scale = 0;
+            for (int r = 0; r < 3; ++r) {
+                n.centre[r] = w[r] * m.centre[0] + w[4 + r] * m.centre[1] + w[8 + r] * m.centre[2] + w[12 + r];
+                n.axle[r] = w[r] * m.axle[0] + w[4 + r] * m.axle[1] + w[8 + r] * m.axle[2];
+                scale += n.axle[r] * n.axle[r];
+            }
+            scale = std::sqrt(scale);
+            if (scale < 1e-9)
+                continue;
+            for (double& v : n.axle)
+                v /= scale;
+            n.radius = m.radius * scale;
+            n.mesh = kv.first;
+            out.push_back(n);
+        }
+    }
 }
 
 }  // namespace lobby

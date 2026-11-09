@@ -39,5 +39,16 @@ struct Segment {
 // The segments made since the last call (moved into out).
 void TakeSegments(std::vector<Segment>& out);
 
+// This frame's wheels so far (the draws since the last FrameEnd), for a headlight on every bike:
+// each copy of a wheel mesh whose shape is known, its centre and axle (unit) in the world (game
+// units) and its tire's radius. rawView: the game's view this frame. (Every part that turns on an
+// axle counts as a wheel - the tire, a brake disc, a sprocket: the radius tells them apart.)
+struct WheelNow {
+    double centre[3], axle[3];
+    double radius;
+    unsigned long long mesh;  // which mesh it is (the same for every copy, from frame to frame)
+};
+void CurrentWheels(const double rawView[16], std::vector<WheelNow>& out);
+
 }  // namespace lobby
 }  // namespace mxcam

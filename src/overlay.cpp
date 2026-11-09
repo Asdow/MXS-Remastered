@@ -925,6 +925,9 @@ const RowDef kRows[] = {
     Slider(1, nullptr,           "Beam aim",             &Config::headlightAimDeg,  -20.0, 15.0,  0.5,    1.0,    1, "\xB0")
         .Help("Where the headlight is aimed. Up shows more of what's ahead (the light reaches further "
               "and lights up jump faces), down keeps it close in front of the bike. 0 is level."),
+    Toggle(1, nullptr,           "Every bike's headlight", &Config::headlightEveryBike)
+        .Help("A headlight on every bike around you too, not just yours: any model, found by its "
+              "wheels once it has ridden a moment. The nearest bikes' are drawn."),
     Slider(1, "GLOW",            "Sun rays",             &Config::sunRays,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Light shafts from the sun when it's on screen."),
     Slider(1, nullptr,           "Bloom",                &Config::bloom,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
@@ -1660,7 +1663,8 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.shadows <= 0 || !cfg.shadowMap;
         if (def.number == &Config::headlight)
             return cfg.timeOfDay < 0;
-        if (def.number == &Config::headlightBeamDeg || def.number == &Config::headlightAimDeg)
+        if (def.number == &Config::headlightBeamDeg || def.number == &Config::headlightAimDeg ||
+            def.flag == &Config::headlightEveryBike)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;

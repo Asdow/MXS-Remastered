@@ -127,6 +127,8 @@ struct Config {
     double headlightHeight  = -0.45;      // m: the same, up the bike (negative = below the eyes)
     double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
                                           // reaches further ahead; down: nearer)
+    bool   headlightEveryBike = true;     // a headlight on every bike around you too, not just yours (found
+                                          // by their wheels: lobby_wheels.h)
     double ambientOcclusion = 0.5;        // 0..1
     double aoRadius         = 0.8;        // m
     double sunRays          = 0.35;       // 0..1

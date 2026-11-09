@@ -1195,6 +1195,17 @@ struct SkeletonRecord {
 };
 std::vector<SkeletonRecord> g_skeletons;
 
+// Every rider out to kRiderPointRange (not just those near the camera, as above): where their hips
+// are and how their torso is turned, for a headlight on bikes that aren't found by their wheels (a
+// model whose wheels haven't been seen turning yet: everyone waiting at the gate).
+constexpr float kRiderPointRange = 500.0f;  // game units (~150 m)
+struct RiderPoint {
+    float viewModel[16];
+    float hips[3], torso[9];
+    bool  transposed;
+};
+std::vector<RiderPoint> g_riderPoints;
+
 // World transform of a record's model (camera -> world times its View * Model).
 bool RecordWorld(const SkeletonRecord& rec, double world[16])
 {
@@ -1710,18 +1721,39 @@ void NoteHeadlightMode(int mode, const Vec3& position)
         return;
     g_headlightMode = mode;
     static const char* const kModes[] = { "on your bike (bike tracker, first person)", "on your bike (found under your rider)",
-                                          "on your rider (bike not found)", "on the camera (no rider found yet)" };
+                                          "on your rider (bike not found)", "on the camera (no rider found yet)",
+                                          "on your bike where it was last found, carried along with your rider (lost for a moment)" };
     const Vec3 offset = position - CameraPosition(g_frame.raw);
     Log("postfx: headlight placed %s, %.2f m from the camera (rider's nearest bone %.2f m away; bike %s)", kModes[mode],
         Length(offset), g_rider.seen ? g_rider.nearestBone : -1.0,
         g_bikeModel.learned ? "learnt in first person" : "not learnt yet: ride in first person for a few seconds to teach it");
 }
 
+// The front plate on a bike, from its front axle (m): up the fork (raked back) and in front of it.
+constexpr double kPlateAboveAxle  = 0.62;
+constexpr double kPlateBehindAxle = 0.22;
+
 // The plate on the bike, in the bike's own space.
+//   First person: HeadlightForward / HeadlightHeight from your eyes, applied as they always have
+//   been (in the game's units, which are feet, though the settings say metres: from the eyes the
+//   light's start can't be seen, and the beam looks right, so it's kept exactly as it was).
+//   Third person, where the bike is in view: on the front plate itself, up the fork from your front
+//   axle (learnt on your bike), in metres. (From the eyes it sat 17 cm ahead of your rider's face.)
 Vec3 PlateOnBike()
 {
     const Config& cfg = GetConfig();
-    return g_bikeModel.eye + g_bikeModel.forward * cfg.headlightForward + g_bikeModel.up * cfg.headlightHeight;
+    const BikeModel& b = g_bikeModel;
+    if (!g_thirdPerson)
+        return b.eye + b.forward * cfg.headlightForward + b.up * cfg.headlightHeight;
+    const double u = g_unitsPerMetre;
+    const Wheel& front = g_wheels[1];
+    if (front.onBikeWeight > 0) {
+        Vec3 plate = front.onBike + b.up * (kPlateAboveAxle * u) - b.forward * (kPlateBehindAxle * u);
+        plate.x = b.eye.x;  // (on the bike's centre line)
+        return plate;
+    }
+    // Front axle not learnt yet: as far from the eyes as the plate usually is.
+    return b.eye + b.forward * (0.33 * u) - b.up * (0.65 * u);
 }
 
 void PoseFromBike(const double model[16], Vec3& position, Vec3& forward, Vec3& up)
@@ -1835,11 +1867,18 @@ bool FindBike(double model[16])
     g_bikeTrace.object = g_bikeTrace.pass = -1;
     g_bikeTrace.carry = -1;
     g_bikeTrace.objects = static_cast<int>(g_objects.size());
+    // How far your rider may be from their place on the bike (learnt in first person, an average):
+    // in third person they sit, stand, lean and slide fore and aft on it by more than 20 cm, and a
+    // limit of 0.7 game units (21 cm: the game's unit is the foot) lost the bike every few seconds,
+    // the headlight jumping off the plate each time. 50 cm let the swingarm (44 cm off, drawn with
+    // the same program, turned nearly the same way) be taken for it. In metres, whatever the unit.
+    const double carryLimit = (b.learned || b.loaded ? 0.35 : 0.45) * g_unitsPerMetre;
+    double nearestCarry = 1e9;  // (for the trace: how near the nearest was when none was taken)
     for (int pass = 0; pass < 2 && !found; ++pass) {
         const bool follow = pass == 0;
         if (follow && !g_haveLastBike)
             continue;
-        bestError = follow ? 1.6 : (b.learned || b.loaded ? 0.7 : 1.0);
+        bestError = follow ? 1.6 : carryLimit;
         for (const SceneObject& o : g_objects) {
             if (follow ? o.program != g_lastBikeProgram : (b.program && o.program != b.program))
                 continue;
@@ -1866,7 +1905,9 @@ bool FindBike(double model[16])
                 // nearest to where it was once kept a neighbouring part 44 cm off (every wheel, mark
                 // and bit of tire dirt measured on your bike went that far off with it).
                 const double carry = Length(TransformPoint(world, b.rider) - g_rider.position);
-                if (!same || carry > (b.learned || b.loaded ? 0.7 : 1.0))
+                if (same && carry < nearestCarry)
+                    nearestCarry = carry;
+                if (!same || carry > carryLimit)
                     continue;
                 if (!found && carry < bestError) {  // (the first drawn: see below)
                     bestError = carry;
@@ -1890,6 +1931,8 @@ bool FindBike(double model[16])
             // body turned a little about its pivot, can, and measured from it your front wheel was
             // 60 cm out of place and let go of.
             const double error = Length(TransformPoint(world, b.rider) - g_rider.position);
+            if (error < nearestCarry)
+                nearestCarry = error;
             if (!found && error < bestError) {
                 bestError = error;
                 std::copy(world, world + 16, model);
@@ -1902,6 +1945,8 @@ bool FindBike(double model[16])
         }
     }
     g_haveLastBike = found;
+    if (!found && nearestCarry < 1e9)
+        g_bikeTrace.carry = nearestCarry / g_unitsPerMetre;
     if (found) {
         g_lastBikeOrigin = Vec3{ model[12], model[13], model[14] };
         std::copy(model, model + 16, g_lastBikeWorld);
@@ -4014,6 +4059,42 @@ bool UpdateMarks(double dt)
 // World position of the front plate, the bike's forward and its up: always on your bike when
 // it can be found (first person: the bike tracker; third person: the object under your rider),
 // else on your rider, else on the game's camera.
+// Third person: the beam where the front plate faces. The plate turns with the bars (how far: the
+// front wheel's axle against the bike's own across, while the game draws the wheel), and the beam
+// is kept level across: aimed down along the bike's own up, as it was, a bike leaned into a turn
+// threw its pool of light out to the far side of the turn (lean left, light to the right).
+double g_steer = 0, g_steerSeenAt = -1e9, g_steerTime = -1e9;
+void LearnPlateFromHips(const Vec3& plate, double dt);  // (below, with every other bike's headlight)
+
+void AimLikeThePlate(Vec3& forward, Vec3& up, double now)
+{
+    const double dt = Clamp(now - g_steerTime, 0.0, 0.25);
+    g_steerTime = now;
+    const Wheel& front = g_wheels[1];
+    if (front.on && !front.fromBike && front.axleAxis >= 0 && front.axleAxis < 3) {
+        const Vec3 across = Normalize(Cross(forward, up));
+        Vec3 axle = front.axes[front.axleAxis];
+        axle = axle - up * Dot(axle, up);
+        if (Length(axle) > 1e-3) {
+            axle = Normalize(axle);
+            if (Dot(axle, across) < 0.0)
+                axle = axle * -1.0;
+            const double steer = std::atan2(Dot(Cross(across, axle), up), Dot(across, axle));
+            if (std::fabs(steer) < 50.0 * kDegToRad) {
+                g_steer = steer;
+                g_steerSeenAt = now;
+            }
+        }
+    }
+    if (now - g_steerSeenAt > 0.3)
+        g_steer *= std::exp(-dt / 0.2);  // (the wheel not drawn: back to straight, gently)
+    forward = Normalize(Rotate(AxisAngle(up, g_steer), forward));
+    const Vec3 worldUp = WorldUp();
+    const Vec3 level = worldUp - forward * Dot(worldUp, forward);
+    if (Length(level) > 1e-3)
+        up = Normalize(level);
+}
+
 bool HeadlightPose(Vec3& position, Vec3& forward, Vec3& up)
 {
     const Config& cfg = GetConfig();
@@ -4021,20 +4102,62 @@ bool HeadlightPose(Vec3& position, Vec3& forward, Vec3& up)
     if (!AffineInverse(g_frame.raw, invRaw))
         return false;
     const Vec3 worldUp = WorldUp();
+    // Third person: the bike last found, against your rider (where and which way they're going),
+    // to keep the light on it when it's lost for a moment (rather than jump to the rough place
+    // below, and back).
+    static double held[16];
+    static Vec3   heldRider, heldHeading;
+    static double heldAt = -1e9;
+    const double now = Seconds();
     if (g_bikeNow.found) {
         PoseFromBike(g_bikeNow.model, position, forward, up);
+        if (g_thirdPerson) {
+            AimLikeThePlate(forward, up, now);
+            if (g_bikeNow.how == 1)
+                LearnPlateFromHips(position, g_lastDt);  // (other riders' lights, placed from their hips)
+        }
         NoteHeadlightMode(g_bikeNow.how, position);
+        if (g_bikeNow.how == 1 && g_rider.seen && g_rider.haveHeading) {
+            std::copy(g_bikeNow.model, g_bikeNow.model + 16, held);
+            heldRider = g_rider.position;
+            heldHeading = g_rider.heading;
+            heldAt = now;
+        } else {
+            heldAt = -1e9;
+        }
+        return true;
+    }
+    if (g_thirdPerson && g_rider.seen && g_rider.haveHeading && now - heldAt < 1.5 &&
+        Length(g_rider.position - heldRider) < 10.0 * g_unitsPerMetre) {
+        // Carried with your rider: moved as far as they did, turned as far about the up as they did.
+        const double turn = std::atan2(Dot(Cross(heldHeading, g_rider.heading), worldUp), Dot(heldHeading, g_rider.heading));
+        const Quat q = AxisAngle(worldUp, turn);
+        double model[16];
+        std::copy(held, held + 16, model);
+        for (int c = 0; c < 3; ++c) {
+            const Vec3 axis = Rotate(q, Vec3{ held[c * 4], held[c * 4 + 1], held[c * 4 + 2] });
+            model[c * 4] = axis.x;
+            model[c * 4 + 1] = axis.y;
+            model[c * 4 + 2] = axis.z;
+        }
+        const Vec3 origin = g_rider.position + Rotate(q, Vec3{ held[12], held[13], held[14] } - heldRider);
+        model[12] = origin.x;
+        model[13] = origin.y;
+        model[14] = origin.z;
+        PoseFromBike(model, position, forward, up);
+        AimLikeThePlate(forward, up, now);
+        NoteHeadlightMode(4, position);
         return true;
     }
     if (g_rider.seen) {
-        // Ahead of the middle of the rider and bike, at about the height of the plate.
+        // Ahead of the middle of the rider and bike, at about the height of the plate (m).
         Vec3 flat = g_rider.haveHeading ? g_rider.heading : EyeToWorld(g_frame.raw, Vec3{ 0, 0, -1 });
         flat = flat - worldUp * Dot(flat, worldUp);
         if (Length(flat) < 1e-3)
             return false;
         forward = Normalize(flat);
         up = worldUp;
-        position = g_rider.position + forward * 0.75 + worldUp * 0.05;
+        position = g_rider.position + (forward * 0.75 + worldUp * 0.05) * (g_thirdPerson ? g_unitsPerMetre : 1.0);
         NoteHeadlightMode(2, position);
         return true;
     }
@@ -4048,6 +4171,368 @@ bool HeadlightPose(Vec3& position, Vec3& forward, Vec3& up)
     position = CameraPosition(g_frame.raw) + forward * cfg.headlightForward + up * cfg.headlightHeight;
     NoteHeadlightMode(3, position);
     return true;
+}
+
+// Every other bike's headlight (Config::headlightEveryBike), found two ways:
+//   By its wheels (lobby_wheels.h, any model): its two tires, a wheelbase apart on parallel axles,
+//   give where it is, which way it points (from the rear one to the front one), its lean and how far
+//   its bars are turned (the front axle against the rear). Which tire is the front: the way the bike
+//   moves, while it moves; standing still, its wheels' parts as moving bikes taught them (yours too:
+//   front or rear, per mesh), else its rims (a motocross bike's front rim is a 21", its rear a 19").
+//   The light sits on the front plate, up the fork from the front axle (as yours in third person).
+//   By its rider, when its wheels aren't known (a model whose wheels haven't been seen turning yet:
+//   everyone waiting at the gate): ahead of the rider's hips, the way their torso faces, as far as
+//   the plate is from yours (learnt from your bike in third person).
+// Aimed where the plate faces and kept level across. Each light is followed from frame to frame: it
+// fades in and out (no popping as bikes are found and lost), is held a moment where it was going
+// when its bike isn't found for a frame or two, and is smoothed a little (a wheel's centre wobbles).
+constexpr int    kMaxHeadlights   = 12;    // the shader's arrays (u_headPos[12]...): yours and the nearest others'
+constexpr double kTireMinMetres   = 0.2;   // a tire's or a rim's radius (a brake disc's or a sprocket's is smaller)
+constexpr double kTireMaxMetres   = 0.5;
+constexpr double kRimMaxMetres    = 0.3;   // a rim: 21" front 0.267 m, 19" rear 0.241 m (a tire's ~0.34)
+constexpr double kWheelbaseMin    = 1.15;  // m, axle to axle
+constexpr double kWheelbaseMax    = 1.8;
+constexpr double kWheelbaseUsual  = 1.48;
+constexpr double kOtherLightReach = 150.0; // m from the camera: further bikes' lights are left out
+constexpr double kLightFade       = 0.3;   // s to fade a light in or out
+constexpr double kLightHold       = 0.5;   // s a light is kept going when its bike isn't found
+
+struct OtherBike {
+    Vec3   mid, front;          // the middle of its axles and its front one, the last frame it was seen
+    bool   decided = false;     // which tire is the front is known
+    int    against = 0;         // frames on end moving towards what's taken for its rear
+    double seen = 0;
+};
+std::vector<OtherBike> g_otherBikes;
+std::unordered_map<unsigned long long, double> g_frontVotes;  // per wheel mesh: + seen at a moving bike's front, - its rear
+double g_otherLogAt = -1e9;
+int    g_otherLogged[4] = { -1, -1, -1, -1 };
+
+// The plate from a rider's hips (m): ahead, the way they face, and up. Learnt from yours.
+double g_plateAhead = 0.8, g_plateUp = -0.05;
+
+void LearnPlateFromHips(const Vec3& plate, double dt)
+{
+    if (!g_rider.seen || !g_rider.haveHeading)
+        return;
+    const Vec3 d = (plate - g_rider.hips) / g_unitsPerMetre;
+    const double ahead = Dot(d, g_rider.heading), up = Dot(d, WorldUp());
+    if (ahead < 0.2 || ahead > 1.6 || std::fabs(up) > 0.8)
+        return;
+    const double a = 1.0 - std::exp(-dt / 2.0);
+    g_plateAhead += (ahead - g_plateAhead) * a;
+    g_plateUp += (up - g_plateUp) * a;
+}
+
+struct ShownLight {
+    Vec3   position, forward, up, velocity;
+    double power = 0;     // 0..1: fading in and out
+    double seen = 0;      // the last time its bike was found
+    bool   updated = false;
+};
+std::vector<ShownLight> g_shownLights;
+
+int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, int max, double now, double dt)
+{
+    static std::vector<lobby::WheelNow> wheels;
+    lobby::CurrentWheels(g_frame.raw, wheels);
+    const double u = g_unitsPerMetre;
+    const Vec3 worldUp = WorldUp();
+    const Vec3 camera = CameraPosition(g_frame.raw);
+    // The tires, one per axle (a tire's meshes and its rim can each be a "wheel"): where the biggest
+    // part is (the tire: a smaller part's centre is further off its axle, and comes and goes).
+    struct Tire {
+        Vec3   centre, axle;
+        double biggest = 0;
+        double rim = 0;                    // its rim's radius (m), 0 if none was found
+        unsigned long long meshes[4] = {};  // the parts on this axle
+        int    meshCount = 0;
+        bool   used = false;
+    };
+    static std::vector<Tire> tires;
+    tires.clear();
+    for (const lobby::WheelNow& w : wheels) {
+        const double r = w.radius / u;
+        if (r < kTireMinMetres || r > kTireMaxMetres)
+            continue;
+        const Vec3 c{ w.centre[0], w.centre[1], w.centre[2] };
+        Tire* on = nullptr;
+        for (Tire& t : tires)
+            if (Length(t.centre - c) < 0.25 * u) {
+                on = &t;
+                break;
+            }
+        if (!on) {
+            if (tires.size() >= 256)
+                continue;
+            tires.push_back(Tire{});
+            on = &tires.back();
+        }
+        if (r > on->biggest) {
+            on->biggest = r;
+            on->centre = c;
+            on->axle = Vec3{ w.axle[0], w.axle[1], w.axle[2] };
+        }
+        if (r < kRimMaxMetres)
+            on->rim = std::max(on->rim, r);
+        if (on->meshCount < 4)
+            on->meshes[on->meshCount++] = w.mesh;
+    }
+    const auto Votes = [](const Tire& t) {
+        double sum = 0;
+        for (int k = 0; k < t.meshCount; ++k) {
+            const auto found = g_frontVotes.find(t.meshes[k]);
+            if (found != g_frontVotes.end())
+                sum += found->second;
+        }
+        return sum;
+    };
+    // Pairs: a wheelbase apart, axles parallel, one behind the other (not side by side).
+    struct Pair { int a, b; double score; };
+    static std::vector<Pair> pairs;
+    pairs.clear();
+    for (size_t i = 0; i < tires.size(); ++i)
+        for (size_t j = i + 1; j < tires.size(); ++j) {
+            const Vec3 d = tires[j].centre - tires[i].centre;
+            const double len = Length(d) / u;
+            if (len < kWheelbaseMin || len > kWheelbaseMax || std::fabs(Dot(tires[i].axle, tires[j].axle)) < 0.8 ||
+                std::fabs(Dot(d / (len * u), tires[i].axle)) > 0.35)
+                continue;
+            pairs.push_back(Pair{ static_cast<int>(i), static_cast<int>(j), std::fabs(len - kWheelbaseUsual) });
+        }
+    std::sort(pairs.begin(), pairs.end(), [](const Pair& x, const Pair& y) { return x.score < y.score; });
+
+    // This frame's lights, before they're matched to the ones shown.
+    struct Found { Vec3 position, forward, up; };
+    static std::vector<Found> found;
+    found.clear();
+    static std::vector<OtherBike> next;
+    next.clear();
+    std::vector<bool> taken(g_otherBikes.size(), false);
+    int bikesSeen = 0, bikesDecided = 0;
+    for (const Pair& pr : pairs) {
+        Tire& ta = tires[pr.a];
+        Tire& tb = tires[pr.b];
+        if (ta.used || tb.used)
+            continue;
+        ta.used = tb.used = true;
+        const Vec3 mid = (ta.centre + tb.centre) * 0.5;
+        // The same bike as last frame: the nearest middle, near enough.
+        int match = -1;
+        double best = 1.5 * u;
+        for (size_t k = 0; k < g_otherBikes.size(); ++k) {
+            const double d = Length(g_otherBikes[k].mid - mid);
+            if (!taken[k] && d < best) {
+                best = d;
+                match = static_cast<int>(k);
+            }
+        }
+        OtherBike bike;
+        const Tire* front = &ta;
+        const Tire* rear = &tb;
+        bool moving = false;
+        if (match >= 0) {
+            const OtherBike& was = g_otherBikes[match];
+            taken[match] = true;
+            bike.decided = was.decided;
+            bike.against = was.against;
+            if (Length(tb.centre - was.front) < Length(ta.centre - was.front))
+                std::swap(front, rear);
+            // Which way it's moving says which tire leads.
+            const Vec3 velocity = (mid - was.mid) / std::max(dt, 1e-3);
+            if (Length(velocity) / u > 1.5) {
+                moving = true;
+                if (Dot(velocity, front->centre - rear->centre) < 0.0) {
+                    if (!bike.decided || ++bike.against >= 5) {
+                        std::swap(front, rear);
+                        bike.decided = true;
+                        bike.against = 0;
+                    }
+                } else {
+                    bike.decided = true;
+                    bike.against = 0;
+                }
+            }
+        }
+        // Standing still and not yet known: its parts as moving bikes taught them, else its rims.
+        if (!bike.decided) {
+            const double votes = Votes(*front) - Votes(*rear);
+            if (std::fabs(votes) >= 30.0) {
+                if (votes < 0.0)
+                    std::swap(front, rear);
+                bike.decided = true;
+            } else if (front->rim > 0.0 && rear->rim > 0.0 && std::fabs(front->rim - rear->rim) > 0.008) {
+                if (rear->rim > front->rim)
+                    std::swap(front, rear);
+                bike.decided = true;
+            }
+        } else if (moving && bike.against == 0) {
+            // Moving, the right way round: what its parts are (front or rear) for bikes standing still.
+            for (int side = 0; side < 2; ++side) {
+                const Tire& t = side ? *rear : *front;
+                for (int k = 0; k < t.meshCount; ++k) {
+                    double& v = g_frontVotes[t.meshes[k]];
+                    v = Clamp(v + (side ? -1.0 : 1.0), -600.0, 600.0);
+                }
+            }
+        }
+        bike.mid = mid;
+        bike.front = front->centre;
+        bike.seen = now;
+        next.push_back(bike);
+        ++bikesSeen;
+        if (!bike.decided)
+            continue;
+        ++bikesDecided;
+        // Yours has its own light.
+        if (g_rider.seen && Length(mid - g_rider.position) < 1.5 * u)
+            continue;
+        const Vec3 forward = Normalize(front->centre - rear->centre);
+        Vec3 up = Normalize(Cross(rear->axle, forward));
+        if (Dot(up, worldUp) < 0.0)
+            up = up * -1.0;
+        if (Dot(up, worldUp) < 0.3)
+            continue;  // (down on its side)
+        Found f;
+        f.position = front->centre + up * (kPlateAboveAxle * u) - forward * (kPlateBehindAxle * u);
+        if (Length(f.position - camera) / u > kOtherLightReach)
+            continue;
+        // Where the plate faces: turned with the bars, then level across.
+        const Vec3 across = Normalize(Cross(forward, up));
+        Vec3 axle = front->axle - up * Dot(front->axle, up);
+        double steer = 0;
+        if (Length(axle) > 1e-3) {
+            axle = Normalize(axle);
+            if (Dot(axle, across) < 0.0)
+                axle = axle * -1.0;
+            steer = std::atan2(Dot(Cross(across, axle), up), Dot(across, axle));
+            if (std::fabs(steer) > 50.0 * kDegToRad)
+                steer = 0;
+        }
+        f.forward = Normalize(Rotate(AxisAngle(up, steer), forward));
+        const Vec3 level = worldUp - f.forward * Dot(worldUp, f.forward);
+        f.up = Length(level) > 1e-3 ? Normalize(level) : up;
+        found.push_back(f);
+    }
+    // Bikes not seen this frame are remembered a moment (a wheel out of view, a frame it wasn't drawn).
+    for (size_t k = 0; k < g_otherBikes.size(); ++k)
+        if (!taken[k] && now - g_otherBikes[k].seen < 1.0)
+            next.push_back(g_otherBikes[k]);
+    g_otherBikes.swap(next);
+
+    // Riders whose bikes weren't found by their wheels: from the rider.
+    const size_t byWheels = found.size();
+    int byRiders = 0;
+    double invRaw[16];
+    if (AffineInverse(g_frame.raw, invRaw)) {
+        for (const RiderPoint& r : g_riderPoints) {
+            double vm[16], world[16];
+            for (int i = 0; i < 16; ++i)
+                vm[i] = r.viewModel[i];
+            MatMul(invRaw, vm, world);
+            const Vec3 hips = TransformPoint(world, Vec3{ r.hips[0], r.hips[1], r.hips[2] });
+            if (g_rider.seen && (Length(hips - g_rider.hips) < 1.0 * u || Length(hips - g_rider.position) < 1.2 * u))
+                continue;  // you
+            const float* t = r.torso;
+            const Vec3 z = r.transposed ? Vec3{ t[2], t[5], t[8] } : Vec3{ t[6], t[7], t[8] };
+            Vec3 forward = TransformDirection(world, z) * -1.0;
+            forward = forward - worldUp * Dot(forward, worldUp);
+            if (Length(forward) < 1e-3)
+                continue;
+            forward = Normalize(forward);
+            Found f;
+            f.position = hips + forward * (g_plateAhead * u) + worldUp * (g_plateUp * u);
+            if (Length(f.position - camera) / u > kOtherLightReach)
+                continue;
+            bool lit = false;  // (found by its wheels already)
+            for (size_t i = 0; i < byWheels && !lit; ++i)
+                lit = Length(found[i].position - f.position) < 1.6 * u;
+            for (const OtherBike& b : g_otherBikes)
+                if (!lit && b.decided && now - b.seen < 1.0)
+                    lit = Length(b.mid - hips) < 1.5 * u;
+            if (lit)
+                continue;
+            f.forward = forward;
+            f.up = worldUp;
+            found.push_back(f);
+            ++byRiders;
+        }
+    }
+
+    // Matched to the lights shown: each to the nearest where it was going.
+    for (ShownLight& s : g_shownLights)
+        s.updated = false;
+    const double follow = 1.0 - std::exp(-dt * 25.0), turn = 1.0 - std::exp(-dt * 15.0);
+    for (const Found& f : found) {
+        ShownLight* best = nullptr;
+        double bestDistance = 2.0 * u;
+        for (ShownLight& s : g_shownLights) {
+            const double d = Length(s.position + s.velocity * dt - f.position);
+            if (!s.updated && d < bestDistance) {
+                bestDistance = d;
+                best = &s;
+            }
+        }
+        if (!best) {
+            ShownLight s;
+            s.position = f.position;
+            s.forward = f.forward;
+            s.up = f.up;
+            s.seen = now;
+            s.updated = true;
+            g_shownLights.push_back(s);
+            continue;
+        }
+        const Vec3 predicted = best->position + best->velocity * dt;
+        const Vec3 position = predicted + (f.position - predicted) * follow;
+        if (dt > 1e-4)
+            best->velocity = best->velocity + ((position - best->position) / dt - best->velocity) * follow;
+        best->position = position;
+        best->forward = Normalize(best->forward + (f.forward - best->forward) * turn);
+        best->up = Normalize(best->up + (f.up - best->up) * turn);
+        best->seen = now;
+        best->updated = true;
+    }
+    for (ShownLight& s : g_shownLights) {
+        if (s.updated) {
+            s.power = std::min(1.0, s.power + dt / kLightFade);
+        } else {
+            s.position = s.position + s.velocity * dt;
+            if (now - s.seen > kLightHold)
+                s.power -= dt / kLightFade;
+        }
+    }
+    g_shownLights.erase(std::remove_if(g_shownLights.begin(), g_shownLights.end(),
+                                       [](const ShownLight& s) { return s.power <= 0.0 && !s.updated; }),
+                        g_shownLights.end());
+    if (g_shownLights.size() > 64)
+        g_shownLights.resize(64);
+    std::sort(g_shownLights.begin(), g_shownLights.end(), [&camera](const ShownLight& x, const ShownLight& y) {
+        return Length(x.position - camera) < Length(y.position - camera);
+    });
+    int n = 0;
+    for (const ShownLight& s : g_shownLights) {
+        if (n >= max)
+            break;
+        if (s.power <= 0.0)
+            continue;
+        positions[n] = s.position;
+        forwards[n] = s.forward;
+        ups[n] = s.up;
+        powers[n] = s.power;
+        ++n;
+    }
+    // For the log: what was found (when it changes, at most every few seconds).
+    const int counts[4] = { bikesSeen, bikesDecided, byRiders, n };
+    if (now - g_otherLogAt > 3.0 && std::memcmp(counts, g_otherLogged, sizeof counts) != 0) {
+        g_otherLogAt = now;
+        std::memcpy(g_otherLogged, counts, sizeof counts);
+        Log("postfx: headlights on other bikes: %d wheel part(s) on %d axle(s): %d bike(s) found by their wheels (%d with "
+            "their front known); %d rider(s) seen, %d lit from the rider; %d light(s) shown",
+            static_cast<int>(wheels.size()), static_cast<int>(tires.size()), bikesSeen, bikesDecided,
+            static_cast<int>(g_riderPoints.size()), byRiders, n);
+    }
+    return n;
 }
 
 // ===========================================================================
@@ -4176,16 +4661,49 @@ void Render(int w, int h)
         Vec(p, "u_lightView", lightView);
         // The headlight: only when the time of day makes it dark enough to see.
         const double headlight = tod && depthOk ? cfg.headlight * Clamp(1.1 - sky.day, 0.0, 1.0) : 0.0;
-        Vec3 headPosition, headForward, headUp;
-        const bool headlightOn = headlight > 0.0 && HeadlightPose(headPosition, headForward, headUp);
+        // Yours first, then the nearest other bikes' (Config::headlightEveryBike).
+        Vec3 headPositions[kMaxHeadlights], headForwards[kMaxHeadlights], headUps[kMaxHeadlights];
+        double headPowers[kMaxHeadlights];
+        int headCount = 0;
+        if (headlight > 0.0 && HeadlightPose(headPositions[0], headForwards[0], headUps[0])) {
+            headPowers[0] = 1.0;
+            headCount = 1;
+        }
+        if (headlight > 0.0 && cfg.headlightEveryBike) {
+            headCount += OtherHeadlights(headPositions + headCount, headForwards + headCount, headUps + headCount,
+                                         headPowers + headCount, kMaxHeadlights - headCount, now, dt);
+        } else {
+            g_otherBikes.clear();
+            g_shownLights.clear();
+        }
+        const bool headlightOn = headCount > 0;
         g_gl.Uniform1f(p["u_headlight"], headlightOn ? static_cast<float>(headlight) : 0.0f);
+        g_gl.Uniform1i(p["u_headCount"], headCount);
         if (headlightOn) {
-            const Vec3 forwardEye = Normalize(WorldToEye(V, headForward));
-            const Vec3 upEye = Normalize(WorldToEye(V, headUp));
-            Vec(p, "u_headPos", TransformPoint(V, headPosition));
-            Vec(p, "u_headDir", forwardEye);
-            Vec(p, "u_headRight", Normalize(Cross(forwardEye, upEye)));
-            Vec(p, "u_headUp", upEye);
+            static const char* const kPos[kMaxHeadlights] = { "u_headPos[0]", "u_headPos[1]", "u_headPos[2]", "u_headPos[3]",
+                "u_headPos[4]", "u_headPos[5]", "u_headPos[6]", "u_headPos[7]", "u_headPos[8]", "u_headPos[9]",
+                "u_headPos[10]", "u_headPos[11]" };
+            static const char* const kDir[kMaxHeadlights] = { "u_headDir[0]", "u_headDir[1]", "u_headDir[2]", "u_headDir[3]",
+                "u_headDir[4]", "u_headDir[5]", "u_headDir[6]", "u_headDir[7]", "u_headDir[8]", "u_headDir[9]",
+                "u_headDir[10]", "u_headDir[11]" };
+            static const char* const kRight[kMaxHeadlights] = { "u_headRight[0]", "u_headRight[1]", "u_headRight[2]",
+                "u_headRight[3]", "u_headRight[4]", "u_headRight[5]", "u_headRight[6]", "u_headRight[7]", "u_headRight[8]",
+                "u_headRight[9]", "u_headRight[10]", "u_headRight[11]" };
+            static const char* const kUp[kMaxHeadlights] = { "u_headUp[0]", "u_headUp[1]", "u_headUp[2]", "u_headUp[3]",
+                "u_headUp[4]", "u_headUp[5]", "u_headUp[6]", "u_headUp[7]", "u_headUp[8]", "u_headUp[9]",
+                "u_headUp[10]", "u_headUp[11]" };
+            static const char* const kPower[kMaxHeadlights] = { "u_headPower[0]", "u_headPower[1]", "u_headPower[2]",
+                "u_headPower[3]", "u_headPower[4]", "u_headPower[5]", "u_headPower[6]", "u_headPower[7]", "u_headPower[8]",
+                "u_headPower[9]", "u_headPower[10]", "u_headPower[11]" };
+            for (int i = 0; i < headCount; ++i) {
+                g_gl.Uniform1f(p[kPower[i]], static_cast<float>(headPowers[i]));
+                const Vec3 forwardEye = Normalize(WorldToEye(V, headForwards[i]));
+                const Vec3 upEye = Normalize(WorldToEye(V, headUps[i]));
+                Vec(p, kPos[i], TransformPoint(V, headPositions[i]));
+                Vec(p, kDir[i], forwardEye);
+                Vec(p, kRight[i], Normalize(Cross(forwardEye, upEye)));
+                Vec(p, kUp[i], upEye);
+            }
             // The beam: a round cone seen from the plate, like a real headlight's, from its bottom
             // edge on the ground just in front of the front wheel (65 degrees down) up to its top
             // edge, HeadlightAimDeg above level (0 by default: out to the distance). Beam width
@@ -5161,6 +5679,48 @@ void TerrainPassDone()
     Restore(saved);
 }
 
+// A rider's skeleton (any distance): its hips and torso, once per rider (a rider takes several draws).
+void NoteRiderPoint(const float* centres, const float* positions, const float* rotations, bool transposed, int bones,
+                    const float modelview[16])
+{
+    if (bones < 8 || bones > 12 || g_riderPoints.size() >= 128)
+        return;
+    double halfSpan = 0;
+    for (int b = 0; b < bones; ++b)
+        halfSpan = std::fmax(halfSpan, std::fabs(double(centres[b * 3])));
+    int torso = -1, hips = -1, midline = 0;
+    for (int b = 0; b < bones; ++b) {
+        if (std::fabs(centres[b * 3]) > 0.05 * halfSpan)
+            continue;
+        ++midline;
+        if (torso < 0 || centres[b * 3 + 1] > centres[torso * 3 + 1])
+            torso = b;
+        if (hips < 0 || centres[b * 3 + 1] < centres[hips * 3 + 1])
+            hips = b;
+    }
+    if (halfSpan <= 0.05 || torso < 0 || hips < 0 || bones - midline < 6)
+        return;
+    // In view space (to know the same rider's other draws).
+    const float* m = modelview;
+    const float* h = positions + hips * 3;
+    const float hx = m[0] * h[0] + m[4] * h[1] + m[8] * h[2] + m[12], hy = m[1] * h[0] + m[5] * h[1] + m[9] * h[2] + m[13],
+                hz = m[2] * h[0] + m[6] * h[1] + m[10] * h[2] + m[14];
+    for (const RiderPoint& r : g_riderPoints) {
+        const float* n = r.viewModel;
+        const float rx = n[0] * r.hips[0] + n[4] * r.hips[1] + n[8] * r.hips[2] + n[12],
+                    ry = n[1] * r.hips[0] + n[5] * r.hips[1] + n[9] * r.hips[2] + n[13],
+                    rz = n[2] * r.hips[0] + n[6] * r.hips[1] + n[10] * r.hips[2] + n[14];
+        if ((rx - hx) * (rx - hx) + (ry - hy) * (ry - hy) + (rz - hz) * (rz - hz) < 1.0f)
+            return;
+    }
+    RiderPoint r;
+    std::copy(modelview, modelview + 16, r.viewModel);
+    std::copy(h, h + 3, r.hips);
+    std::copy(rotations + torso * 9, rotations + torso * 9 + 9, r.torso);
+    r.transposed = transposed;
+    g_riderPoints.push_back(r);
+}
+
 void NoteSkeleton(unsigned program, const float* centres, const float* positions, const float* rotations, bool transposed,
                   int bones, const float modelview[16])
 {
@@ -5173,7 +5733,10 @@ void NoteSkeleton(unsigned program, const float* centres, const float* positions
         const float x = positions[0], y = positions[1], z = positions[2];
         const float ex = m[0] * x + m[4] * y + m[8] * z + m[12], ey = m[1] * x + m[5] * y + m[9] * z + m[13],
                     ez = m[2] * x + m[6] * y + m[10] * z + m[14];
-        if (ex * ex + ey * ey + ez * ez > 60.0f * 60.0f)
+        const float distance2 = ex * ex + ey * ey + ez * ez;
+        if (distance2 < kRiderPointRange * kRiderPointRange)
+            NoteRiderPoint(centres, positions, rotations, transposed, bones, modelview);
+        if (distance2 > 60.0f * 60.0f)
             return;
     }
     // The same draw again (a rider takes several): skip it.
@@ -5413,6 +5976,7 @@ void FrameEnd(bool apply)
     g_lastFrame3D = g_frame.haveView;
     g_frame = Frame{};
     g_skeletons.clear();
+    g_riderPoints.clear();
     g_objects.clear();
     g_shadow = ShadowFrame{};
 }

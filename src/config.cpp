@@ -359,6 +359,7 @@ bool WriteTunables(IniBatch& ini, const Config& c, const wchar_t* presetSection)
         { L"Graphics",  L"TireMarks",            c.tireMarks },
         { L"Graphics",  L"MarkCacheSegs",        c.markCacheSegs },
         { L"Graphics",  L"MarksEveryBike",       c.marksEveryBike ? 1.0 : 0.0 },
+        { L"Graphics",  L"HeadlightEveryBike",   c.headlightEveryBike ? 1.0 : 0.0 },
         { L"Graphics",  L"TireDirt",             c.tireDirt },
         { L"Graphics",  L"MotionBlur",           c.motionBlur },
         { L"Graphics",  L"DepthOfField",         c.depthOfField },
@@ -532,6 +533,7 @@ void CopyTunables(const Config& from, Config& to)
     to.tireMarks            = from.tireMarks;
     to.markCacheSegs        = from.markCacheSegs;
     to.marksEveryBike       = from.marksEveryBike;
+    to.headlightEveryBike   = from.headlightEveryBike;
     to.tireDirt             = from.tireDirt;
     to.motionBlur           = from.motionBlur;
     to.depthOfField         = from.depthOfField;
@@ -759,6 +761,7 @@ Config ParseConfig(const Config& base)
     c.tireMarks        = ReadDouble(L"Graphics", L"TireMarks", c.tireMarks);
     c.markCacheSegs    = ReadDouble(L"Graphics", L"MarkCacheSegs", c.markCacheSegs);
     c.marksEveryBike   = ReadInt(L"Graphics", L"MarksEveryBike", c.marksEveryBike) != 0;
+    c.headlightEveryBike = ReadInt(L"Graphics", L"HeadlightEveryBike", c.headlightEveryBike) != 0;
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
     c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
     c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);

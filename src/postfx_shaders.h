@@ -211,10 +211,12 @@ uniform float u_shadowTexel;      // one texel of the whole map (the cascades ar
 uniform float u_shadowBias[4];
 uniform vec3  u_lightView;      // toward the light, view space
 uniform float u_headlight;      // 0 = off
-uniform vec3  u_headPos;        // view space: the front plate
-uniform vec3  u_headDir;        // view space: where the beam points
-uniform vec3  u_headRight;      // view space: the beam's own right and up (across the bike)
-uniform vec3  u_headUp;
+uniform int   u_headCount;      // headlights: yours first, then the nearest other bikes'
+uniform vec3  u_headPos[12];    // view space: the front plate
+uniform vec3  u_headDir[12];    // view space: where the beam points
+uniform vec3  u_headRight[12];  // view space: the beam's own right and up (across the bike)
+uniform vec3  u_headUp[12];
+uniform float u_headPower[12];  // each one's strength (0..1: fading in and out as bikes are found and lost)
 uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of it below level, its half-height
 uniform float u_headReach;      // how far it reaches (1 = level; more aimed up, less aimed down)
 
@@ -265,15 +267,19 @@ float MapShadow(vec3 p, vec3 n)
 // distance. On the ground that makes an oval pool joined to the bike, brightest a few metres
 // ahead (a real headlight throws most of its light near the top of the beam); surfaces facing
 // the bike catch more of it. Nothing behind the plate or on the bike itself.
-vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
+float HeadlightOne(vec3 p, vec3 n, int i)
 {
-    vec3 l = u_headPos - p;
+    vec3 l = u_headPos[i] - p;
     float d = length(l);
+    if (d > 70.0 * u_headReach)
+        return 0.0;
     l /= max(d, 1e-4);
     vec3 q = -l * d;
-    float ahead = dot(q, u_headDir);
-    float side = atan(dot(q, u_headRight), max(ahead, 1e-4));
-    float down = atan(-dot(q, u_headUp), max(ahead, 1e-4));
+    float ahead = dot(q, u_headDir[i]);
+    if (ahead <= 0.0)
+        return 0.0;
+    float side = atan(dot(q, u_headRight[i]), max(ahead, 1e-4));
+    float down = atan(-dot(q, u_headUp[i]), max(ahead, 1e-4));
     vec2 e = vec2(side / u_headBeam.x, (down - u_headBeam.y) / u_headBeam.z);
     float cone = ahead > 0.0 ? smoothstep(1.0, 0.45, length(e)) : 0.0;
     float hot = mix(0.3, 1.0, smoothstep(0.8, 0.12, down));
@@ -281,7 +287,15 @@ vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
     float facing = mix(0.35, 1.0, clamp(dot(n, l) * 3.0, 0.0, 1.0)) * step(0.0, dot(n, l));
     float reach = (1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach))) *
                   (1.0 - smoothstep(45.0 * u_headReach, 70.0 * u_headReach, d));
-    return albedo * vec3(1.0, 0.97, 0.92) * (cone * hot * own * facing * reach * u_headlight * 2.6);
+    return cone * hot * own * facing * reach;
+}
+
+vec3 Headlight(vec3 albedo, vec3 p, vec3 n)
+{
+    float sum = 0.0;
+    for (int i = 0; i < u_headCount; ++i)
+        sum += HeadlightOne(p, n, i) * u_headPower[i];
+    return albedo * vec3(1.0, 0.97, 0.92) * (sum * u_headlight * 2.6);
 }
 
 float Hash13(vec3 p)
