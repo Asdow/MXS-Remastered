@@ -18,6 +18,7 @@
 #include "config.h"
 #include "hooks.h"
 #include "log.h"
+#include "paths.h"
 #include "sound_packs.h"
 
 // ===========================================================================
@@ -94,7 +95,7 @@ void __cdecl UnresolvedExport()
 {
     Log("fatal: the game called an opengl32 export that the system DLL does not provide");
     MessageBoxW(nullptr, L"The game called an OpenGL function that the system opengl32.dll "
-                         L"does not provide. See mxcam.log.", L"MXCam", MB_ICONERROR);
+                         L"does not provide. See MXS_REMASTERED.log.", L"MXCam", MB_ICONERROR);
     ExitProcess(1);
 }
 
@@ -115,29 +116,17 @@ bool FindStubSection(HMODULE self, BYTE*& start, SIZE_T& size)
     return false;
 }
 
-// "C:\Games\MX Simulator\" for "C:\Games\MX Simulator\opengl32.dll".
-bool ModuleDirectory(HMODULE module, wchar_t* out, DWORD size)
-{
-    const DWORD length = GetModuleFileNameW(module, out, size);
-    if (length == 0 || length >= size)
-        return false;
-    wchar_t* slash = wcsrchr(out, L'\\');
-    if (!slash)
-        return false;
-    slash[1] = L'\0';
-    return true;
-}
-
 bool InitializeProxy(HMODULE self)
 {
-    wchar_t dir[1024];
     wchar_t path[1024];
-    if (ModuleDirectory(self, dir, _countof(dir))) {
-        swprintf_s(path, L"%smxcam.log", dir);
+    // (The game folder when it can be written to, the user's own folder when it can't.)
+    paths::Init();
+    if (paths::DataFolder()[0]) {
+        swprintf_s(path, L"%sMXS_REMASTERED.log", paths::DataFolder());
         LogOpen(path);
         Log("MXCam opengl32 proxy loaded (%s build)", sizeof(void*) == 8 ? "x64" : "x86");
-        swprintf_s(path, L"%smxcam.ini", dir);
-        LoadConfig(path);
+        Log("%s", paths::Note());
+        LoadConfig(paths::IniPath());
         // The engine sound packs installed (the panel's switches show them).
         soundpacks::Startup();
         Config& c = EditConfig();

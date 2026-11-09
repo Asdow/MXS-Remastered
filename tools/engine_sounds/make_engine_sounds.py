@@ -19,7 +19,7 @@ them.
 
 The 250 four-stroke pack is made from a sound mod's recordings instead: make_250f.py.
 
-Writes <out_dir>/mxsr_engine_<engine>.pack (a .saf, named so the game never loads it by itself)
+Writes <out_dir>/MXS_REMASTERED_engine_<engine>.pack (a .saf, named so the game never loads it by itself)
 and preview_<engine>.wav: each RPM's full-throttle sound, first stock, then the pack's, to listen to.
 """
 import glob
@@ -49,7 +49,7 @@ def stock_files(game_dir):
     first archive alphabetically that has a name wins, as the game's own patches are named)."""
     files = {}
     for path in sorted(glob.glob(os.path.join(game_dir, '*.saf'))):
-        if os.path.basename(path).lower().startswith('mxsr_'):
+        if os.path.basename(path).lower().startswith(('mxsr_', 'mxs_remastered_')):
             continue  # (a pack of ours, installed: not stock)
         want =lambda n: any(n == e + '.soundtable' or n.startswith(e + '/') for e in ENGINES) and n not in files
         try:
@@ -244,7 +244,7 @@ def make_pack(engine, files, out_dir):
             lines.append(' '.join(str(o) for o in order[row:row + 32]))
     soundtable = ('\n'.join(lines) + '\n').encode('latin1')
     archive = [(engine + '.soundtable', soundtable)] + pack_files
-    pack_path = os.path.join(out_dir, 'mxsr_engine_%s.pack' % engine)
+    pack_path = os.path.join(out_dir, 'MXS_REMASTERED_engine_%s.pack' % engine)
     saf.write(pack_path, archive)
     write_preview(engine, files, cells, rpms, loads, made, os.path.join(out_dir, 'preview_%s.wav' % engine))
     return pack_path, len(made), sum(len(d) for _, d in archive)
@@ -283,7 +283,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     game_dir = args[0]
-    out_dir = args[1] if len(args) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'mxcam_sounds')
+    out_dir = args[1] if len(args) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'MXS_REMASTERED_sounds')
     os.makedirs(out_dir, exist_ok=True)
     files = stock_files(game_dir)
     for engine, what in ENGINES.items():

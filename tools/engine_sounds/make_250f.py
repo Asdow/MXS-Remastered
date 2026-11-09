@@ -14,7 +14,7 @@ their top end softened, the way an engine sounds coasting.
 
     python make_250f.py "C:\\Games\\MX Simulator" "V:\\mx sim sound mods\\FC250" [out_dir]
 
-Writes <out_dir>/mxsr_engine_default250f.pack (installed from the mod's panel like the others) and
+Writes <out_dir>/MXS_REMASTERED_engine_default250f.pack (installed from the mod's panel like the others) and
 preview_default250f.wav: the sound mod's own recordings, then each row on the throttle and off it.
 Needs soundfile (pip install soundfile).
 """
@@ -290,7 +290,7 @@ def stock_tables(game_dir):
     """The stock 250 four-stroke soundtable and recordings, from the game's archives."""
     files = {}
     for path in sorted(glob.glob(os.path.join(game_dir, '*.saf'))):
-        if os.path.basename(path).lower().startswith('mxsr_'):
+        if os.path.basename(path).lower().startswith(('mxsr_', 'mxs_remastered_')):
             continue
         try:
             files.update(saf.extract(path, lambda n: (n == ENGINE + '.soundtable' or n.startswith(ENGINE + '/')) and n not in files))
@@ -304,7 +304,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     game_dir, mod_dir = sys.argv[1], sys.argv[2]
-    out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'mxcam_sounds')
+    out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'MXS_REMASTERED_sounds')
     os.makedirs(out_dir, exist_ok=True)
     from make_engine_sounds import parse_soundtable
 
@@ -397,7 +397,7 @@ def main():
             lines.append('%s %d @%s' % (cell['lead'], cycles, name))
     soundtable = ('\n'.join(lines) + '\n').encode('latin1')
     archive = [(ENGINE + '.soundtable', soundtable)] + pack_files
-    pack_path = os.path.join(out_dir, 'mxsr_engine_%s.pack' % ENGINE)
+    pack_path = os.path.join(out_dir, 'MXS_REMASTERED_engine_%s.pack' % ENGINE)
     saf.write(pack_path, archive)
     print('%s: %d rows (%s below %.0f rpm, the high-revs one above), %d recordings -> %s (%.1f MB)' % (
         ENGINE, len(rpms), 'the low-revs recording', split, len(pack_files), pack_path, sum(len(d) for _, d in archive) / 1e6))

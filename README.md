@@ -11,30 +11,31 @@ Open source and purely OpenGL based.
 
 ## How to install
 
-1. **Download `opengl32.dll`** from [`bin/x64/Release`](bin/x64/Release/opengl32.dll). It's the only file you need.
-   - Only if you run an old **32-bit** MX Simulator: use the one in [`bin/Win32/Release`](bin/Win32/Release/opengl32.dll) instead.
+1. **Download `opengl32.dll`** from the releases page on the right side. Latest version: v1.2
 2. **Open your MX Simulator folder**, the one with `mx.exe` in it. To find it, right-click your MX Simulator shortcut and pick **Open file location**.
 3. **Put `opengl32.dll` in that folder**, next to `mx.exe`. Don't put it in Windows' own folders.
 4. **Start the game** and get on a bike. Press **E** to open the menu.
 
-For the engine sound mods (OTHER tab), also put the **`mxcam_sounds`** folder from the same place next to `mx.exe`.
+For the engine sound mods (OTHER tab), also put the **`MXS_REMASTERED_sounds`** folder from the same place next to `mx.exe`.
 
-You don't need `mxcam.ini`. The mod starts with its default settings and creates `mxcam.ini` in the same folder the first time you press **SAVE** in the menu.
+You don't need `MXS_REMASTERED.ini`. The mod starts with its default settings and creates `MXS_REMASTERED.ini` in the same folder the first time you press **SAVE** in the menu.
+
+You never need to run the game as administrator. If your MX Simulator folder can't be written to without it (the game is installed under `C:\Program Files (x86)`), the mod keeps `MXS_REMASTERED.ini` and `MXS_REMASTERED.log` in `%LOCALAPPDATA%\MXS Remastered` instead, and puts the sound mods in the game's personal folder, `%LOCALAPPDATA%\MX Simulator`. Paste either path into the File Explorer address bar to open it.
 
 ### Uninstall
 
-Delete `opengl32.dll` from your MX Simulator folder. If you turned on any sound mods, turn them off first (or delete the `mxsr_engine_*.saf` files and the `mxcam_sounds` folder). To remove everything, also delete `mxcam.ini` and the `mxcam.log` / `mxcam_*.txt` files next to it.
+Delete `opengl32.dll` from your MX Simulator folder. If you turned on any sound mods, turn them off first (or delete the `MXS_REMASTERED_engine_*.saf` files and the `MXS_REMASTERED_sounds` folder; check `%LOCALAPPDATA%\MX Simulator` for them too). To remove everything, also delete `MXS_REMASTERED.ini` and the `MXS_REMASTERED.log` / `MXS_REMASTERED_*.txt` files next to it, and the `%LOCALAPPDATA%\MXS Remastered` folder if there is one.
 
 ### Not working?
 
-- **The menu doesn't open with E:** make sure `opengl32.dll` sits right next to `mx.exe` and not in a subfolder. Check that an `mxcam.log` file appears there after you start the game. If it doesn't, the game isn't loading the mod.
-- **Something else is wrong:** send `mxcam.log` from your MX Simulator folder with your bug report (see below).
+- **The menu doesn't open with E:** make sure `opengl32.dll` sits right next to `mx.exe` and not in a subfolder. Check that an `MXS_REMASTERED.log` file appears there (or in `%LOCALAPPDATA%\MXS Remastered`) after you start the game. If it doesn't, the game isn't loading the mod.
+- **Something else is wrong:** send `MXS_REMASTERED.log` from your MX Simulator folder (or from `%LOCALAPPDATA%\MXS Remastered`, if it's there instead) with your bug report (see below).
 
 ---
 
 ## Updating
 
-Download the new `opengl32.dll` and replace the old one in your MX Simulator folder. **Keep your `mxcam.ini`**: it holds your settings, keybinds and what the mod has learnt about your bike, and replacing it resets all of that.
+Download the new `opengl32.dll` and replace the old one in your MX Simulator folder. **Keep your `MXS_REMASTERED.ini`**: it holds your settings, keybinds and what the mod has learnt about your bike, and replacing it resets all of that. Coming from a version that used `mxcam.ini` and `mxcam_sounds`? The mod renames them to the new names by itself the first time it starts, so you keep everything; just don't copy a new `MXS_REMASTERED.ini` in next to your old `mxcam.ini`. (Coming from a version that used `mxcam.ini` and `mxcam_sounds`? The mod renames them to the new names by itself the first time it starts, so you keep everything. Just don't copy in the new `MXS_REMASTERED.ini` over your old settings.)
 
 ---
 
@@ -101,7 +102,7 @@ Quality of life options, on the **OTHER** tab:
 - **Hide cursor**: hides the game's mouse cursor while you ride or watch a replay. It comes back as soon as you move the mouse.
 - **Fullscreen window**: with the game in windowed mode, its window covers the whole screen with no border (borderless fullscreen), so Alt+Tab stays instant. Turn it off and the window goes back to how it was. It's shared by all three presets.
 - **Fade while adjusting**: the menu fade described above (on by default).
-- **Sound mods**: fuller engine sounds for the game's four stock engines (**125 two-stroke**, **250 two-stroke**, **250 four-stroke**, **450 four-stroke**). The stock sounds repeat a single recorded engine cycle over and over, which is why they sound flat. Each pack plays 16 cycles in a random order instead, made from the stock recordings with each cycle firing a little differently, the way a real engine does. Turn one on and it's installed as an `mxsr_engine_*.saf` file in your game folder; it's heard from the next time the game starts. Turn it off to go back to the stock sound. Bikes with their own custom sounds keep them. Needs the `mxcam_sounds` folder next to `opengl32.dll`.
+- **Sound mods**: fuller engine sounds for the game's four stock engines (**125 two-stroke**, **250 two-stroke**, **250 four-stroke**, **450 four-stroke**). The stock sounds repeat a single recorded engine cycle over and over, which is why they sound flat. Each pack plays 16 cycles in a random order instead, made from the stock recordings with each cycle firing a little differently, the way a real engine does. Turn one on and it's installed as an `MXS_REMASTERED_engine_*.saf` file in your game folder; it's heard from the next time the game starts. Turn it off to go back to the stock sound. Bikes with their own custom sounds keep them. Needs the `MXS_REMASTERED_sounds` folder next to `opengl32.dll`.
 
 ---
 
@@ -121,7 +122,7 @@ The mod also includes a free shader pack, built the same way as the camera: pure
 
 Only want the shaders? Turn off **First person mod** (FIRST PERSON tab, or F8): the game's own cameras come back and the shaders keep working.
 
-The HUD and menus are drawn after the effects, so they stay sharp and readable at night. If something looks wrong, set the effect to Off in the menu and send `mxcam.log` along with the bug report.
+The HUD and menus are drawn after the effects, so they stay sharp and readable at night. If something looks wrong, set the effect to Off in the menu and send `MXS_REMASTERED.log` along with the bug report.
 
 ---
 
@@ -129,4 +130,4 @@ The HUD and menus are drawn after the effects, so they stay sharp and readable a
 
 Join the Discord for updates, help and mod discussion: **[discord.gg/YvkUHCMFy6](https://discord.gg/YvkUHCMFy6)**
 
-Found a bug or have an idea? Post it in the Discord or DM me: **voaks**. Please attach your `mxcam.log` with bug reports.
+Found a bug or have an idea? Post it in the Discord or DM me: **voaks**. Please attach your `MXS_REMASTERED.log` with bug reports.

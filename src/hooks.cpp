@@ -6,7 +6,7 @@
 //   We mirror just enough of the fixed-function matrix state to know, at every modelview
 //   load, whether a perspective projection is active (3D scene) or not (HUD / menus / 2D).
 //   Each frame, the modelview loads made during perspective passes are numbered 0, 1, 2...
-//   Load number ViewMatrixIndex (mxcam.ini) is taken to be the camera's view matrix. Use the
+//   Load number ViewMatrixIndex (MXS_REMASTERED.ini) is taken to be the camera's view matrix. Use the
 //   frame dump (F10) to see what the game actually does and pick the right index.
 //
 //   How it is modified
