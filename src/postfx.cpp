@@ -4832,7 +4832,7 @@ void Render(int w, int h)
     const auto Wrap = [](double v) { const double m = std::fmod(v, 64.0); return m < 0 ? m + 64.0 : m; };
     const Vec3 camWrapped{ Wrap(eye.x), Wrap(eye.y), Wrap(eye.z) };
     // WEATHER: the light the snow is seen in (the time of day's, dim at night; a grey day's without it).
-    const bool snowOn = cfg.snow > 0.0;
+    const bool snowOn = cfg.snow;
     const double snowLight = tod ? std::fmax(sky.day, 0.03) * sky.exposure : 0.8;
     const Vec3 snowTint = tod ? sky.tint : Vec3{ 1.0, 1.0, 1.0 };
     const Vec3 snowFog{ 0.60 * snowTint.x * snowLight, 0.64 * snowTint.y * snowLight, 0.70 * snowTint.z * snowLight };
@@ -5021,7 +5021,7 @@ void Render(int w, int h)
         g_gl.Uniform1f(p["u_time"], static_cast<float>(std::fmod(now, 1000.0)));
         const double fovY = 2.0 * std::atan(1.0 / std::fmax(std::fabs(P[5]), 1e-3));
         g_gl.Uniform1f(p["u_pixelAngle"], static_cast<float>(fovY / h));
-        g_gl.Uniform1f(p["u_snow"], snowOn ? static_cast<float>(cfg.snow) : 0.0f);
+        g_gl.Uniform1f(p["u_snow"], snowOn ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_snowfall"], static_cast<float>(cfg.snowfall));
         Vec(p, "u_snowFog", snowFog);
         Draw(g_res.hdr);
@@ -5903,7 +5903,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
 void TerrainPassDone()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0 && cfg.snow <= 0.0) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
+    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0 && !cfg.snow) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
         g_res.failed || !LoadGL())
         return;
     GLint drawFb = 0;
@@ -6217,7 +6217,7 @@ void FrameEnd(bool apply)
         Apply();
     }
     // The dab indicator's rider, when the effects didn't look for it this frame (shaders off).
-    if (cfg.dabIndicator && g_frame.haveView && !g_riderThisFrame && LoadGL()) {
+    if ((cfg.dabIndicator || cfg.brakeSqueal > 0.0) && g_frame.haveView && !g_riderThisFrame && LoadGL()) {
         const double now = Seconds();
         const double dt = g_riderTime > 0 ? Clamp(now - g_riderTime, 1.0 / 1000.0, 0.25) : 1.0 / 60.0;
         FindOwnRider(dt);

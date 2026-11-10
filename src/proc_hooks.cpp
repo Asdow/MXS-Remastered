@@ -54,6 +54,7 @@
 #include "bike.h"
 #include "camera.h"
 #include "config.h"
+#include "brake.h"
 #include "dab.h"
 #include "gamepad.h"
 #include "hooks.h"
@@ -3618,7 +3619,8 @@ bool EndShaderFrame()
     // changed) turns the head for the next frame. Polled while the menu is open too, for binding.
     camera::Look look = camera::Look::Ahead;
     const Config& lookCfg = GetConfig();
-    if (lookCfg.controllerLook || OverlayPanelOpen() || (lookCfg.dabIndicator && dab::NeedsGamepad())) {
+    if (lookCfg.controllerLook || OverlayPanelOpen() || (lookCfg.dabIndicator && dab::NeedsGamepad()) ||
+        brake::NeedsGamepad()) {
         gamepad::Poll();
         if (lookCfg.controllerLook) {
             const bool left = gamepad::IsDown(lookCfg.lookLeftControl);
@@ -3629,6 +3631,12 @@ bool EndShaderFrame()
         }
     }
     camera::SetLook(look);
+    // The brake squeal (brake.h): the brakes just read, your speed as postfx follows your rider.
+    {
+        double speed = 0;
+        const bool haveSpeed = postfx::RiderSpeed(speed);
+        brake::Update(haveSpeed, speed);
+    }
 
     // No camera this frame (menu, effect off): don't carry a stale correction into the
     // next frame's sky.

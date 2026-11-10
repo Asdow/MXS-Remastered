@@ -806,8 +806,8 @@ RowDef PadRow(int tab, const char* section, const char* label, int Config::* con
     return def;
 }
 
-const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "REPLAY", "KEYBINDS", "OTHER", "WEATHER" };
-constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabReplay = 2, kTabKeybinds = 3, kTabOther = 4, kTabWeather = 5;
+const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "WEATHER", "REPLAY", "KEYBINDS", "OTHER" };
+constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabWeather = 2, kTabReplay = 3, kTabKeybinds = 4, kTabOther = 5;
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
 
 // Each tab's rows, column by column (.Col starts the next one).
@@ -1010,113 +1010,117 @@ const RowDef kRows[] = {
         .Help("Where depth of field focuses. Auto focuses on the middle of the screen, easing "
               "between distances like an eye."),
     // ======== REPLAY ========
-    Choice3(2, "REPLAY CAMERA",   "Camera",               &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
+    Choice3(3, "REPLAY CAMERA",   "Camera",               &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
         .Help("GAME is the replay's own camera, which faces one way while the rider swivels in front "
               "of it. 3RD PERSON locks the camera behind the rider. HELMET is a GoPro on the rider's "
               "helmet, on top or on its side.")
         .Col(0),
-    Slider(2, "3RD PERSON CAMERA", "Distance behind",      &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
+    Slider(3, "3RD PERSON CAMERA", "Distance behind",      &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
         .Help("3rd person replays: how far behind the rider the camera sits. Lower moves it forward, "
               "closer to the rider."),
-    Slider(2, nullptr,           "Height",               &Config::replayHeight,     -0.5,  5.0,   0.05,   1.0,    2, " m")
+    Slider(3, nullptr,           "Height",               &Config::replayHeight,     -0.5,  5.0,   0.05,   1.0,    2, " m")
         .Help("3rd person replays: how high above the rider the camera sits."),
-    Slider(2, nullptr,           "Pitch",                &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
+    Slider(3, nullptr,           "Pitch",                &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
         .Help("3rd person replays: how far the camera looks down. Negative looks up."),
-    Choice4(2, "HELMET CAMERA",   "Mount",                &Config::helmetMount, "TOP", "LEFT", "RIGHT", "CHEST")
+    Choice4(3, "HELMET CAMERA",   "Mount",                &Config::helmetMount, "TOP", "LEFT", "RIGHT", "CHEST")
         .Help("Helmet replays: TOP mounts the camera on top of the helmet, LEFT and RIGHT on its side, "
               "CHEST on the rider's chest (it turns with the body, not the head). Each keeps its own "
               "height, forward and tilt.")
         .Col(1),
-    Slider(2, nullptr,           "Mount height",         &Config::helmetHeight,     -1.5,  2.0,   0.01,   1.0,    2, " m")
+    Slider(3, nullptr,           "Mount height",         &Config::helmetHeight,     -1.5,  2.0,   0.01,   1.0,    2, " m")
         .Side(&Config::sideHeight).Chest(&Config::chestHeight)
         .Help("Helmet replays: how far above the rider's eyes the camera sits (chest mount: above the "
               "middle of the shoulders, negative is below them)."),
-    Slider(2, nullptr,           "Mount forward",        &Config::helmetForward,    -1.5,  1.5,   0.01,   1.0,    2, " m")
+    Slider(3, nullptr,           "Mount forward",        &Config::helmetForward,    -1.5,  1.5,   0.01,   1.0,    2, " m")
         .Side(&Config::sideForward).Chest(&Config::chestForward)
         .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet (chest mount: "
               "how far in front of the shoulders it sits)."),
-    Slider(2, nullptr,           "Mount out",            &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
+    Slider(3, nullptr,           "Mount out",            &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
         .Help("Side-mounted helmet replays: how far out to the side of the head the camera sits. Raise "
               "it if the camera ends up inside the helmet."),
-    Slider(2, nullptr,           "Tilt",                 &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
+    Slider(3, nullptr,           "Tilt",                 &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
         .Side(&Config::sideTiltDeg).Chest(&Config::chestTiltDeg)
         .Help("Helmet replays: how far the camera is angled down from where the helmet faces. More "
               "shows more of the bars and the bike, less shows more of the track ahead."),
-    Slider(2, nullptr,           "Stabilization",        &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(3, nullptr,           "Stabilization",        &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Helmet replays: smooths the camera's rotation, like a GoPro's stabilization. Off shakes "
               "with every jolt of the rider's head."),
-    Slider(2, nullptr,           "Horizon lock",         &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(3, nullptr,           "Horizon lock",         &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Helmet replays: how much of the rider's lean is taken out of the view. 0% leans with "
               "the head, 100% keeps the horizon level."),
     // ======== KEYBINDS ========
-    KeyRow(3, "KEYBINDS",       "Open / close this menu",    &Config::menuKey)
+    KeyRow(4, "KEYBINDS",       "Open / close this menu",    &Config::menuKey)
         .Help("Opens and closes this menu. Click the key, then press the new one. Esc cancels."),
-    KeyRow(3, nullptr,          "First person mod on / off", &Config::toggleKey)
+    KeyRow(4, nullptr,          "First person mod on / off", &Config::toggleKey)
         .Help("Turns the first-person camera mod on and off in game (the FIRST PERSON tab's First "
               "person mod switch). Click the key, then press the new one. Esc cancels."),
-    KeyRow(3, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
+    KeyRow(4, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
         .Help("Turns all the shaders on and off in game, for before / after comparisons (the GRAPHICS "
               "tab's Shaders switch). Click the key, then press the new one. Esc cancels."),
-    PadRow(3, "CONTROLLER",     "Look left",                 &Config::lookLeftControl)
+    PadRow(4, "CONTROLLER",     "Look left",                 &Config::lookLeftControl)
         .Help("Hold to look left (FIRST PERSON tab: Controller look, Side look angle). Click it, then "
               "press any button, trigger or paddle on your controller, or push a stick the way you want. "
               "Backspace clears it, Esc cancels."),
-    PadRow(3, nullptr,          "Look right",                &Config::lookRightControl)
+    PadRow(4, nullptr,          "Look right",                &Config::lookRightControl)
         .Help("Hold to look right. Click it, then press any button, trigger or paddle on your controller, "
               "or push a stick the way you want. Backspace clears it, Esc cancels."),
-    PadRow(3, nullptr,          "Look back",                 &Config::lookBackControl)
+    PadRow(4, nullptr,          "Look back",                 &Config::lookBackControl)
         .Help("Hold to look behind you (it wins over left and right). Click it, then press any button, "
               "trigger or paddle on your controller, or push a stick the way you want. Backspace clears "
               "it, Esc cancels. Paddles: an Xbox Elite controller's paddles work when they aren't mapped "
               "to another button in the Xbox Accessories app; other controllers' paddles work when they "
               "show up as buttons of their own."),
     // ======== OTHER ========
-    Toggle(4, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
+    Toggle(5, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
         .Help("Hides the game's HUD (timing, positions, chat) while you ride, spectate or watch a "
               "replay, for a clean view. Open the game's menu (Esc) and it's all there as usual; "
               "close it and the HUD goes again. Never hidden in the game's menus.")
         .Col(0),
-    Toggle(4, nullptr,          "Hide cursor",               &Config::hideCursor)
+    Toggle(5, nullptr,          "Hide cursor",               &Config::hideCursor)
         .Help("Hides the game's mouse cursor while you ride or watch a replay. It comes back as soon "
               "as you move the mouse, and is never hidden in the game's menus."),
-    Toggle(4, nullptr,          "Dab indicator",             &Config::dabIndicator)
+    Toggle(5, nullptr,          "Dab indicator",             &Config::dabIndicator)
         .Help("Shows at the bottom right, next to the speedometer, whether your rider is standing or "
               "sitting: a red rider standing on the bike, or a green one sitting with a foot down while "
               "you hold the game's Sit/Dab key. Follows the game's own settings: your Sit/Dab key or "
               "button and Dab When Stopped. Turning it on asks whether the game's Sticky Sit/Dab is on "
               "(turn it off and on again to change your answer)."),
-    Toggle(4, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
+    Toggle(5, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
         .Help("With the game in windowed mode, makes its window cover the whole screen with no border "
               "(borderless fullscreen): Alt+Tab stays instant. Off puts the window back as it was. "
               "Shared by all the presets."),
-    Toggle(4, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
+    Toggle(5, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
         .Help("While you drag a GRAPHICS slider (or step it with the arrow keys) the menu fades out, "
               "all but that slider, so you can see the whole picture change."),
-    Toggle(4, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
+    Toggle(5, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
         .Help("A fuller engine sound for every bike that uses the game's stock 125 two-stroke engine. "
               "The stock sounds repeat one recorded engine cycle over and over; this one plays 16 "
               "cycles in a random order, each firing a little differently, like a real engine. "
               "Heard from the next time the game starts.")
         .Col(1),
-    Toggle(4, nullptr,          "250 two-stroke",            &Config::soundPack250)
+    Toggle(5, nullptr,          "250 two-stroke",            &Config::soundPack250)
         .Help("A fuller engine sound for every bike that uses the game's stock 250 two-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
-    Toggle(4, nullptr,          "250 four-stroke",           &Config::soundPack250f)
+    Toggle(5, nullptr,          "250 four-stroke",           &Config::soundPack250f)
         .Help("A fuller engine sound for every bike that uses the game's stock 250 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
-    Toggle(4, nullptr,          "450 four-stroke",           &Config::soundPack450f)
+    Toggle(5, nullptr,          "450 four-stroke",           &Config::soundPack450f)
         .Help("A fuller engine sound for every bike that uses the game's stock 450 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts. "
               "Bikes with their own custom sounds keep them."),
+    Slider(5, nullptr,          "Brake squeal",              &Config::brakeSqueal,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Your brakes squeal when you brake hard: the game's own brake controls pressed most of "
+              "the way while you're moving and slowing down. Its loudness; heard right away, with "
+              "any bike."),
 
     // ======== WEATHER ========
-    Slider(5, "SNOW",           "Snow",                      &Config::snow,             0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Toggle(2, "SNOW",           "Snow",                      &Config::snow)
         .Help("Snow on the track: the ground turns white (thinner on steep slopes, your ruts dig "
               "through it to the dirt) under a grey, overcast sky. Needs the shaders on (GRAPHICS)."),
-    Slider(5, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(2, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
-    Slider(5, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
+    Slider(2, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
         .Help("How hard the wind blows the falling snow sideways."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
@@ -1686,9 +1690,9 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             def.flag == &Config::headlightEveryBike)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::snowfall)
-            return cfg.snow <= 0.0;
+            return !cfg.snow;
         if (def.number == &Config::snowWind)
-            return cfg.snow <= 0.0 || cfg.snowfall <= 0.0;
+            return !cfg.snow || cfg.snowfall <= 0.0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;
         if (def.number == &Config::markCacheSegs)
@@ -1722,6 +1726,16 @@ TabLayout LayoutTab(int tab, float sectionH, float rowH)
     for (float h : columnH)
         layout.height = std::fmax(layout.height, h);
     return layout;
+}
+
+// The whole panel's height at scale 1 (BuildPanel's sizes: the tallest tab's rows and everything
+// around them), with a margin above and below: what the scale has to fit in the window.
+float PanelHeightAtScale1()
+{
+    float contentH = 0;
+    for (int tab = 0; tab < kTabCount; ++tab)
+        contentH = std::fmax(contentH, LayoutTab(tab, 38.0f, 50.0f).height);
+    return 26.0f + 56.0f + 46.0f + contentH + 24.0f + 36.0f + 42.0f + 14.0f + 18.0f + 20.0f + 2.0f * 16.0f;
 }
 
 // The Windows clipboard, for preset codes (shared as text: Discord and the like).
@@ -2071,11 +2085,11 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     } else if (g_panel.tab == kTabWeather) {
         if (!cfg.shaders)
             snprintf(readout, sizeof readout, "WEATHER NEEDS THE SHADERS ON (GRAPHICS TAB)");
-        else if (cfg.snow <= 0.0)
-            snprintf(readout, sizeof readout, "NO WEATHER   ·   TURN UP SNOW TO MAKE IT SNOW");
+        else if (!cfg.snow)
+            snprintf(readout, sizeof readout, "NO WEATHER   \xB7   TURN ON SNOW TO MAKE IT SNOW");
         else
-            snprintf(readout, sizeof readout, "SNOW %.0f%%   ·   SNOWFALL %.0f%%   ·   WIND %.0f%%", cfg.snow * 100.0,
-                     cfg.snowfall * 100.0, cfg.snowWind * 100.0);
+            snprintf(readout, sizeof readout, "SNOW ON   \xB7   SNOWFALL %.0f%%   \xB7   WIND %.0f%%", cfg.snowfall * 100.0,
+                     cfg.snowWind * 100.0);
     } else if (g_panel.tab == kTabOther) {
         const char* status = GameOverlayStatusText();
         snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
@@ -2795,8 +2809,13 @@ void OverlayFrame(HDC dc)
     }
 
     // UI scale follows the window height (1080p = 1.0), held down on narrow windows so the panel
-    // still fits across, in 5% steps so the atlas isn't rebuilt for every pixel of a resize.
-    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;
+    // still fits across, in 5% steps so the atlas isn't rebuilt for every pixel of a resize. And
+    // held down so the whole panel fits top to bottom: the tallest tab grew past what 1080 holds at
+    // 1.0 (a window 1074 high cut the buttons off), and rounding to a step never takes it back over.
+    const float panelHeight = PanelHeightAtScale1();
+    float scale = std::round(Clamp(std::fmin(height / std::fmax(1080.0f, panelHeight), width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;
+    while (scale > 0.6f && scale * panelHeight > height)
+        scale -= 0.05f;
 
     SavedState saved;
     SaveState(saved);

@@ -28,6 +28,12 @@ void Poll();
 // Whether a control is held as of the last Poll(). A stick or trigger counts past half way.
 bool IsDown(Control control);
 
+// An axis's position as of the last Poll(), numbered as MX Simulator's controls file numbers them:
+// an Xbox-style pad's 0 / 1 left stick X / Y and 2 / 3 right stick X / Y (-1..1), 4 / 5 left / right
+// trigger (0..1); another controller's axes through the joystick API (-1..1). 0 with none.
+double XInputAxis(int axis);
+double JoyAxis(int axis);
+
 // Binding: StartCapture() notes what's held now; PollCapture() (after each Poll) then gives the
 // first control pressed since that wasn't held (a held one counts once it's been let go), or 0.
 void StartCapture();

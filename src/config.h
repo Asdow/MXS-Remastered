@@ -132,8 +132,8 @@ struct Config {
     double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
                                           // reaches further ahead; down: nearer)
     // WEATHER (postfx: the composite pass and the snowfall pass)
-    double snow             = 0.0;        // 0..1 snow on the ground (terrain only; your ruts dig through it to the
-                                          // dirt) and an overcast sky; 0 = no weather
+    bool   snow             = false;      // snow on the ground (terrain only; your ruts dig through it to the
+                                          // dirt) and an overcast sky; off = no weather
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
     double snowWind         = 0.2;        // 0..1 how hard the wind blows the falling snow
     bool   headlightEveryBike = true;     // a headlight on every bike around you too, not just yours (found
@@ -174,6 +174,7 @@ struct Config {
     // [Other] quality of life
     bool   hideHud          = false;      // hide the game's HUD while riding (it shows again while you use the mouse)
     bool   hideCursor       = false;      // hide the game's mouse cursor while riding (same)
+    double brakeSqueal      = 0.0;        // 0..1 the brake squeal's loudness (brake.cpp; 0 = off): OTHER, SOUND MODS
     bool   dabIndicator     = false;      // bottom right: red standing, green while the game's Sit/Dab key sits you (dab.cpp)
     int    dabSticky        = 0;          // the indicator's Sticky Sit/Dab: 0 = as the game's config file says, 1 = off
                                           // (held), 2 = on (a press switches). The game writes its file only now and

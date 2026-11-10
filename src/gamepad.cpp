@@ -402,6 +402,19 @@ void Poll()
 
 bool IsDown(Control control) { return control != kNone && Down(g_state, control); }
 
+double XInputAxis(int axis)
+{
+    if (!g_state.x)
+        return 0.0;
+    if (axis == 4)
+        return g_state.lt;
+    if (axis == 5)
+        return g_state.rt;
+    return axis >= 0 && axis < 4 ? g_state.axes[axis] : 0.0;
+}
+
+double JoyAxis(int axis) { return g_state.joy && axis >= 0 && axis < 6 ? g_state.joyAxis[axis] : 0.0; }
+
 void StartCapture()
 {
     ListControls();
