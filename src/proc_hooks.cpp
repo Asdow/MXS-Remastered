@@ -1814,6 +1814,7 @@ constexpr char kMudFragmentDecl[] =
     "in vec3 mx_pos;\n"
     "uniform float u_mx_mud;\n"
     "uniform float u_mx_metre;\n"
+    "uniform float u_mx_snow;\n"
     "highp float mx_hash(highp vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }\n"
     "highp float mx_noise(highp vec3 x) {\n"
     "    highp vec3 i = floor(x); highp vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);\n"
@@ -1833,6 +1834,11 @@ constexpr char kMudFragmentApply[] =
     "\t\tfloat mx_cover = mx_rubber * smoothstep(mx_edge, mx_edge + 0.1, mx_n);\n"
     "\t\tmx_cover = max(mx_cover, (1.0 - mx_rubber) * 0.3 * u_mx_mud * smoothstep(0.5, 0.75, mx_n));\n"
     "\t\tvec3 mx_mud = mix(vec3(0.24, 0.18, 0.13), vec3(0.37, 0.29, 0.21), mx_noise(mx_q * 0.45 + 3.0));\n"
+    "\t\tif (u_mx_snow > 0.0) {\n"
+    "\t\t\tfloat mx_fleck = smoothstep(0.82, 0.88, mx_noise(mx_q * 3.3 + 11.0));\n"
+    "\t\t\tfloat mx_lump = smoothstep(0.88, 0.93, mx_noise(mx_q * 1.2 + 23.0));\n"
+    "\t\t\tmx_mud = mix(mx_mud, vec3(0.86, 0.88, 0.92), max(mx_fleck, mx_lump) * 0.85);\n"
+    "\t\t}\n"
     "\t\tcolor.rgb = mix(color.rgb, mx_mud * (u_ambient.rgb + u_diffuse.rgb * ndl), mx_cover);\n"
     "\t}\n";
 bool g_loggedMudShader[2] = { false, false };
@@ -3037,15 +3043,22 @@ void PaintTireDirt(const DrawCall& draw)
             }
         }
     }
+    // (WEATHER: with snow on, flecks of it in the mud. Kept with the mud's amount, so turning the snow
+    // on or off sends it again as well.)
+    const float snow = want > 0.0f && cfg.snow ? 1.0f : 0.0f;
+    const float key = want + snow * 10.0f;
     float& set = g_mudSet[g_program];
-    if (want != set) {
+    if (key != set) {
         real_glUniform1f(at->second, want);
         if (want > 0.0f && real_glGetUniformLocation) {
             const GLint metre = real_glGetUniformLocation(g_program, "u_mx_metre");
             if (metre >= 0)
                 real_glUniform1f(metre, static_cast<float>(g_paintUnits));
+            const GLint snowAt = real_glGetUniformLocation(g_program, "u_mx_snow");
+            if (snowAt >= 0)
+                real_glUniform1f(snowAt, snow);
         }
-        set = want;
+        set = key;
     }
 }
 
