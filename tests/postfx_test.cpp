@@ -334,6 +334,15 @@ int main(int argc, char** argv)
         settings += "[Learned]\nRearWheelOnBike=0.000,6.102,-0.820\nFrontWheelOnBike=0.000,6.102,-5.676\n"
                     "BikeRider=0.000,7.874,-2.789\n";  // where your rider sits on the test bike
     }
+    // MXCAM_TEST_EXTRA_INI: more settings for any mode, to look at it another way (a scene with
+    // "[Weather]|Snow=1": '|' for a new line). Not for the checks: they're the mode's own.
+    if (const char* extra = getenv("MXCAM_TEST_EXTRA_INI")) {
+        std::string more = extra;
+        for (char& ch : more)
+            if (ch == '|')
+                ch = '\n';
+        settings += "\n" + more + "\n";
+    }
     if (!settings.empty()) {
         FILE* out = nullptr;
         if (_wfopen_s(&out, ini.c_str(), L"wb") == 0 && out) {
@@ -1235,6 +1244,7 @@ int main(int argc, char** argv)
         }
         Check(log.find("postfx: snowfall ready") != std::string::npos && log.find("snowfall couldn't be built") == std::string::npos,
               "the snowfall's shaders compile");
+        Check(log.find("shader failed") == std::string::npos, "every effect's shader compiles with the snow in it");
     } else if (mode == "night") {
         // Corners on both sides of the screen's diagonals: every pass must cover the whole window.
         const Pixel skyLeft = At(20, 20), skyRight = At(W - 20, 20), groundLeft = At(20, H - 20), groundRight = At(W - 20, H - 20);

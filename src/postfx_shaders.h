@@ -490,31 +490,73 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor,
     return col;
 }
 
-// How much rut your tires dug here (0..1): the map's own groove, as TireMarks reads it.
-float RutAt(vec3 p)
+)GLSL" R"GLSL(
+// The rut your tires dug here: how much groove (x) and the fullest groove beside it (y), as
+// TireMarks reads them (0..1, with the marks' strength). Where y is well above x is a rut's lip.
+vec2 RutStatsAt(vec3 p)
 {
     vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / u_markTexel;
     float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
-    return MarkNear(t) * smoothstep(0.0, kMarkBlend, inNear) * u_marks;
+    return MarkStatsNear(t) * (smoothstep(0.0, kMarkBlend, inNear) * u_marks);
+}
+
+// The snow's own relief, as a normal to light it by: ripples the wind laid across it (about every
+// 35 cm, wavering), soft lumps a couple of metres across and its fine grain (the detail texture, read
+// flat on the ground at two sizes). Faint, and gone into the distance, where it would only shimmer.
+vec3 SnowNormal(vec3 n, vec3 wp, vec3 dwx, vec3 dwy, float z)
+{
+    vec3 ax = normalize(cross(u_up, vec3(0.0, 0.0, 1.0)));
+    vec3 az = cross(ax, u_up);
+    vec2 g = vec2(dot(wp, ax), dot(wp, az)) / u_metre;  // metres across the ground
+    vec2 gx = vec2(dot(dwx, ax), dot(dwx, az)) / u_metre, gy = vec2(dot(dwy, ax), dot(dwy, az)) / u_metre;
+    float fade = 1.0 - smoothstep(15.0, 50.0, z / u_metre);
+    if (fade <= 0.0)
+        return n;
+    vec2 across = vec2(0.8, 0.6);
+    float warp = ValueNoise(vec3(g * 0.45, 0.0)) * 6.0;
+    float strength = 0.4 + 0.6 * ValueNoise(vec3(g * 0.18, 3.0));
+    vec2 slope = across * (cos(dot(g, across) * 18.0 + warp) * 0.05 * strength);
+    vec2 lumps = textureGrad(u_detail, g * 0.4, gx * 0.4, gy * 0.4).rg * 2.0 - 1.0;
+    vec2 grain = textureGrad(u_detail, g * 3.1, gx * 3.1, gy * 3.1).rg * 2.0 - 1.0;
+    slope += lumps * 0.16 + grain * 0.06 * (1.0 - smoothstep(4.0, 12.0, z / u_metre));
+    slope *= fade;
+    return normalize(n - ax * slope.x - az * slope.y);
 }
 
 // Snow on the ground (WEATHER): white, a little blue in it, thinner on steep slopes and in drifts
-// that come and go over the ground. Where a rut dug through
-// it, the dirt underneath shows: wet, darker. The ground's own shading (its baked light and bumps)
-// carries over gently. Lit afterwards like the ground (AO, the sun's shadows).
-vec3 Snow(vec3 c, vec3 wp, vec3 n, float z, float ground, float rut)
+// that come and go over the ground, its own ripples and lumps lit by the sun (the faces turned from
+// it a little bluer: the sky lights them). The ground's own shading (its baked light: the shadows of
+// trees) carries over gently. A rut through it is laid out by how deep it was dug: packed snow where
+// a tire only pressed it, grey slush deeper, where snow and dirt were churned together, and the wet
+// dirt itself at the bottom; along its edges, a lip of the snow it pushed aside. cover: how much of
+// this is snow (for the cold blue of its shadows, after the lighting).
+vec3 Snow(vec3 c, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, float z, float ground, vec2 rut, out float cover)
 {
     float upright = smoothstep(0.35, 0.8, dot(n, u_up));
     float drifts = ValueNoise(wp * (0.3 / u_metre)) * 0.65 + ValueNoise(wp * (1.6 / u_metre)) * 0.35;
     float depth = u_snow * (0.45 + 0.55 * upright) * (0.7 + 0.6 * drifts);
-    float cover = smoothstep(0.25, 0.6, depth);
-    float dug = smoothstep(0.12, 0.55, rut);
-    cover *= 1.0 - 0.92 * dug;
-    vec3 white = vec3(0.80, 0.84, 0.90) * (0.92 + 0.08 * ValueNoise(wp * (5.0 / u_metre)));
+    float settled = smoothstep(0.25, 0.6, depth);
+    // The game's own light on the ground, gently (its texture's blotches mostly left out).
     float shading = clamp(pow(max(Luma(c), 1e-4) / 0.2, 0.3), 0.65, 1.2);
-    vec3 snow = white * shading;  // (no glints: grains a pixel wide or more read as white dashes, and shimmer)
+    // The snow's own relief, lit as the ground is lit (against the ground's plain slope).
+    vec3 ns = SnowNormal(n, wp, dwx, dwy, z);
+    float before = max(dot(n, u_lightWorld), 0.0) * 0.7 + 0.4;
+    float after = max(dot(ns, u_lightWorld), 0.0) * 0.7 + 0.4;
+    float relief = clamp(after / before, 0.72, 1.28);
+    vec3 fresh = vec3(0.80, 0.84, 0.90) * (0.94 + 0.06 * ValueNoise(wp * (5.0 / u_metre)));
+    fresh *= mix(vec3(0.9, 0.95, 1.07), vec3(1.0), smoothstep(0.8, 1.05, relief));  // turned away: bluer
+    vec3 snow = fresh * shading * relief;  // (no glints: grains a pixel wide or more read as white dashes, and shimmer)
+    // The rut, by how deep it is.
+    float m = rut.x, lip = clamp(rut.y - rut.x, 0.0, 1.0);
+    float pressed = smoothstep(0.03, 0.2, m), slushy = smoothstep(0.15, 0.5, m), bare = smoothstep(0.45, 0.85, m);
     vec3 wet = c * mix(1.0, 0.62, u_snow);  // the dirt under it, damp
-    return mix(c, mix(wet, snow, cover), ground);
+    vec3 slush = mix(vec3(Luma(snow)) * vec3(0.95, 0.96, 0.99) * 0.55, wet, 0.45);
+    vec3 col = mix(snow, snow * vec3(0.88, 0.89, 0.9), pressed);  // pressed: duller, a little darker
+    col = mix(col, slush, slushy);
+    col = mix(col, wet, bare * 0.85);
+    col = mix(col, snow * 1.06, lip * (1.0 - slushy) * 0.8);  // the snow pushed aside, fresh and lit
+    cover = settled * (1.0 - slushy) * ground;
+    return mix(c, mix(wet, col, settled), ground);
 }
 
 // How far (in game units) this pixel's ray has to go down along the ray to reach the groove's
@@ -726,6 +768,7 @@ void main()
             vec2 lHere = vec2(1.0);
             if (u_lightOn > 0.5)
                 lHere = LightAt(v_uv, z);
+            float snowCover = 0.0;  // (WEATHER: how much of this is snow, for its shadows' cold blue)
             // Grooves sink the ground itself: where this pixel's ray reaches down into one, the
             // whole look of the surface (the scene's own colour, its detail, the marks) comes
             // from the groove floor the ray sees through this pixel - a point gd below the
@@ -787,7 +830,7 @@ void main()
             // (Snow on what this pixel shows of the ground: where a groove was dug, its floor - so a rut
             // that is dug into the ground also shows the dirt through the snow.)
             if (u_snow > 0.0 && ground > 0.001)
-                c = Snow(c, wpD, nFloor, z, ground, u_marks > 0.0 ? RutAt(pD) : 0.0);
+                c = Snow(c, wpD, dwx, dwy, nFloor, z, ground, u_marks > 0.0 ? RutStatsAt(pD) : vec2(0.0), snowCover);
             // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
             // tire is in the terrain's depth too and counted as ground, and its mud came and went.
             // TireDirt keeps to the tire around its own axle.)
@@ -799,6 +842,10 @@ void main()
             albedo = c * ao;
             // (Overcast in the snow: the sun's shadows fade, the light comes from the whole sky.)
             c *= ao * mix(1.0, mix(0.42, 1.0, lit), u_shadow * (1.0 - 0.65 * u_snow));
+            // Snow in shade (the sun's shadow, a crease) is lit by the sky alone: cold, blue-grey.
+            if (snowCover > 0.0)
+                c *= mix(vec3(1.0), vec3(0.84, 0.92, 1.1),
+                         snowCover * max((1.0 - lit) * u_shadow * (1.0 - 0.5 * u_snow), 1.0 - ao));
         }
         if (u_tod > 0.5) {
             c *= u_tint * u_exposure;
