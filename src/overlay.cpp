@@ -1108,6 +1108,10 @@ const RowDef kRows[] = {
         .Help("A fuller engine sound for every bike that uses the game's stock 450 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts. "
               "Bikes with their own custom sounds keep them."),
+    Toggle(5, nullptr,          "450 four-stroke (clear)",   &Config::soundPack450fClear)
+        .Help("The same 450 four-stroke sound, less muffled: everything but the rev limiter brighter, the "
+              "limiter very slightly more muffled. One 450 sound or the other: turning this on turns the "
+              "other off. Heard from the next time the game starts."),
     Slider(5, nullptr,          "Brake squeal",              &Config::brakeSqueal,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Your brakes squeal when you brake hard: the game's own brake controls pressed most of "
               "the way while you're moving and slowing down. Its loudness; heard right away, with "
@@ -1179,7 +1183,16 @@ void SetStatus(const char* text, double now);
 void UpdateSoundPacks(double now)
 {
     Config& cfg = EditConfig();
-    bool* const switches[soundpacks::kCount] = { &cfg.soundPack125, &cfg.soundPack250, &cfg.soundPack250f, &cfg.soundPack450f };
+    bool* const switches[soundpacks::kCount] = { &cfg.soundPack125, &cfg.soundPack250, &cfg.soundPack250f, &cfg.soundPack450f,
+                                                 &cfg.soundPack450fClear };
+    // The two 450 packs replace the same stock engine: turning one on turns the other off (removed
+    // first below, then the new one installed: its line is the one shown).
+    if (cfg.soundPack450f && cfg.soundPack450fClear) {
+        if (soundpacks::Installed(3))
+            cfg.soundPack450f = false;       // (the clear one was just turned on)
+        else
+            cfg.soundPack450fClear = false;  // (the plain one was)
+    }
     for (int i = 0; i < soundpacks::kCount; ++i) {
         if (*switches[i] == soundpacks::Installed(i))
             continue;

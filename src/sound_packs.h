@@ -13,7 +13,7 @@
 namespace mxcam {
 namespace soundpacks {
 
-constexpr int kCount = 4;
+constexpr int kCount = 5;  // 125, 250, 250F, 450F, and the 450F's clear one (one 450 or the other, not both)
 
 // The stock engine a pack replaces (its soundtable's name), and what it is.
 const char* Engine(int i);

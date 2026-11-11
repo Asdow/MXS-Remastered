@@ -134,6 +134,7 @@ bool InitializeProxy(HMODULE self)
         c.soundPack250 = soundpacks::Installed(1);
         c.soundPack250f = soundpacks::Installed(2);
         c.soundPack450f = soundpacks::Installed(3);
+        c.soundPack450fClear = soundpacks::Installed(4);
     }
 
     // Load the genuine DLL by full path - a bare "opengl32.dll" would resolve back to us.

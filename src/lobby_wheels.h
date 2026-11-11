@@ -26,6 +26,9 @@ void GiveBounds(unsigned program, unsigned vao, unsigned elementBuffer, const Dr
 // Whether this draw's mesh is known to be a wheel (for the tire dirt on every bike).
 bool IsWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw);
 
+// Whether it's running and has found wheels already (so a mesh it doesn't know as one isn't one).
+bool KnowsWheels();
+
 // The frame is done: rawView is the game's view for it (null if none was found).
 void FrameEnd(const double* rawView, double now);
 

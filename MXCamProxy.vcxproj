@@ -155,6 +155,9 @@
     <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default450f.pack">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="MXS_REMASTERED_sounds\MXS_REMASTERED_engine_default450f_clear.pack">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

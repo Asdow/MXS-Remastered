@@ -491,6 +491,31 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor,
 }
 
 )GLSL" R"GLSL(
+// Whether the game drew bare ground at this pixel, nothing standing on it: not your bike, not your
+// boots (the dug grooves borrow the ground's look from a little way off, and borrowing your tire there
+// put a copy of it in the rut). Its depth where the ground was expected (zExpect, when asked: < 0 not),
+// the ground the terrain left there before anything stood on it, to the millimetre, and not one of your
+// own wheels as the game drew them. And, asked with nExpect (view space; zero: not), facing the way
+// the ground here faces: where a tire or a boot touches the ground it's within a centimetre of it,
+// and the terrain's own depth can have your bike in it (drawn before the terrain pass ended), but the
+// bottom of a tire curves away underneath and a boot's side stands up - neither faces like the ground.
+bool BareGroundAt(vec2 uv, float zExpect, vec3 nExpect)
+{
+    float d = textureLod(u_depth, uv, 0.0).r;
+    if (IsSky(d))
+        return false;
+    float z = LinearZ(d);
+    if (zExpect > 0.0 && abs(z - zExpect) > 0.01 * zExpect + 0.03 * u_metre)
+        return false;
+    if (dot(nExpect, nExpect) > 0.5 && dot(NormalAt(u_depth, uv, ViewPos(uv, d)), nExpect) < 0.9)
+        return false;
+    if (u_haveTerrain > 0.5 && abs(LinearZ(textureLod(u_terrainDepth, uv, 0.0).r) - z) > 0.002 * z + 0.004)
+        return false;
+    if (u_wheelMaskOn > 0.5 && abs(LinearZ(textureLod(u_wheelMask, uv, 0.0).r) - z) < 0.006 * z + 0.02)
+        return false;
+    return true;
+}
+
 // The rut your tires dug here: how much groove (x) and the fullest groove beside it (y), as
 // TireMarks reads them (0..1, with the marks' strength). Where y is well above x is a rut's lip.
 vec2 RutStatsAt(vec3 p)
@@ -797,21 +822,34 @@ void main()
                     vec3 pF = p + transpose(u_viewToWorld) * (dir * along);  // the floor point, view space
                     vec2 suv = Project(pF + nView * gd);  // above it, back at the ground's level: where the game drew it
                     if (OnScreen(suv)) {
+                        // One pixel exactly (no filtering: blended with the next one, the edge of a
+                        // tire leaked in), and only bare ground: there and in the four pixels around
+                        // it, all or nothing. Taken from your tire or a boot instead, the rut showed a
+                        // copy of your bike beside the bike - a second tire, a second exhaust, smeared
+                        // gear - and, kept soft, a faint one where they touch the ground.
+                        suv = (floor(suv / u_texel) + 0.5) * u_texel;
                         float dS = textureLod(u_depth, suv, 0.0).r;
-                        vec3 cF = pow(max(texture(u_color, suv).rgb, vec3(0.0)), vec3(2.2));
+                        vec3 cF = pow(max(textureLod(u_color, suv, 0.0).rgb, vec3(0.0)), vec3(2.2));
+                        float zE = -(pF + nView * gd).z;
+                        bool bare = BareGroundAt(suv, zE, nView) &&
+                                    BareGroundAt(suv + vec2(u_texel.x, 0.0), -1.0, vec3(0.0)) &&
+                                    BareGroundAt(suv - vec2(u_texel.x, 0.0), -1.0, vec3(0.0)) &&
+                                    BareGroundAt(suv + vec2(0.0, u_texel.y), -1.0, vec3(0.0)) &&
+                                    BareGroundAt(suv - vec2(0.0, u_texel.y), -1.0, vec3(0.0));
+                        float onGround = bare ? 1.0 : 0.0;
                         // The lip's last part of the way takes a little of each: the depth
                         // there is a fraction of what this groove can reach at all, so the
                         // band stays a band whatever the depth slider says - taking all of
                         // one or none of the other makes that edge flip as you move.
-                        float wd = smoothstep(0.05 * relief, 0.3 * relief, gd);
+                        float wd = smoothstep(0.05 * relief, 0.3 * relief, gd) * onGround;
                         c = mix(c, cF, wd);
-                        if (gd > 0.5 * u_markTexel) {
+                        if (gd > 0.5 * u_markTexel && onGround > 0.5) {
                             pD = pF;
                             wpD = wp + dir * along;
                             dwxD = dFdx(wpD);
                             dwyD = dFdy(wpD);
                         }
-                        if (!IsSky(dS)) {
+                        if (onGround > 0.5) {
                             vec3 pv = ViewPos(suv, dS);  // the floor's own view point: its normal and its light
                             nFloor = NormalAt(u_depth, suv, pv);
                             if (u_lightOn > 0.5)

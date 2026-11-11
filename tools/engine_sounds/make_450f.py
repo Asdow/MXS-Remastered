@@ -20,11 +20,17 @@ tuning one pack can never change the other:
 Off the throttle: the mod's own off-throttle recordings (from a YZ250F, as the mod has them) where
 they're nearest; below them the idle, quieter and with its top end softened.
 
-    python make_450f.py "C:\\Games\\MX Simulator" "V:\\mx sim sound mods\\4t 450s\\YZ450" [out_dir]
+    python make_450f.py "C:\\Games\\MX Simulator" "V:\\mx sim sound mods\\4t 450s\\YZ450" [out_dir] [--clear]
 
 Writes <out_dir>/MXS_REMASTERED_engine_default450f.pack (installed from the mod's panel like the others) and
 preview_default450f.wav: the sound mod's own recordings, then each row on the throttle and off it.
 Needs soundfile (pip install soundfile).
+
+--clear makes the other 450 pack instead, MXS_REMASTERED_engine_default450f_clear.pack ("450 four-stroke
+(clear)" in the panel): the same, its tone changed - every row but the limiter less muffled (its top end
+lifted CLEAR_BRIGHTEN_DB), the limiter very slightly more (its top end trimmed CLEAR_LIMITER_TRIM_DB).
+Each row is still turned to the same loudness, so only the tone differs. The two replace the same stock
+engine: the panel has one or the other on, never both.
 """
 import glob
 import os
@@ -60,6 +66,22 @@ BRIGHTEN_TO_HZ = 4000.0
 DEEPEN_DB = 0.0
 DEEPEN_FULL_HZ = 120.0
 DEEPEN_TO_HZ = 350.0
+# --clear (the other 450 pack): every row but the limiter brightened this much more (the BRIGHTEN shelf),
+# and the limiter's top end trimmed this much (the TRIM shelf, as calm()'s), very slightly more muffled.
+CLEAR = '--clear' in sys.argv
+CLEAR_BRIGHTEN_DB = 4.0
+CLEAR_LIMITER_TRIM_DB = -2.5
+# ... and its pitch a little lower at the top of the revs only: the rows from CLEAR_PITCH_FULL_RPM up made
+# as if the engine turned CLEAR_PITCH as fast as their row (0.97: about half a semitone), easing in from
+# CLEAR_PITCH_FROM_RPM (no step in pitch revving through it); below, and the rev limiter, as they were.
+# (Lowered everywhere, idle to limiter, wasn't wanted.) The rows stay where they are: the game's mix
+# between them, and the limiter's row at the top, unchanged.
+# (0.97 was "not much lower than before", 0.93 still "didn't get any lower": 0.88. Eased in over a wider
+# span the deeper it goes, or the pitch would fall while the revs rise through it - the engine sounding
+# as if it slowed accelerating; the rows are checked for that below.)
+CLEAR_PITCH = 0.88
+CLEAR_PITCH_FROM_RPM = 8600.0
+CLEAR_PITCH_FULL_RPM = 10600.0
 
 # Loudness: the riding rows rise RISE_DB_PER_OCTAVE with every doubling of the RPM, as the YZ450 mod
 # does in MX Bikes (fitted to a video of it, accelerating: 6.0 dB). Set to the stock 450's level for
@@ -407,6 +429,25 @@ def brighten(loop, db=BRIGHTEN_DB):
     return np.fft.irfft(spectrum * 10.0 ** (db * shaped / 20.0), len(loop))
 
 
+def pitch_at(rpm, kind):
+    """--clear: how fast the cells of a row at rpm are made, of its RPM (1: as recorded; the rev limiter
+    always 1). Eased in on a log scale between CLEAR_PITCH_FROM_RPM and CLEAR_PITCH_FULL_RPM."""
+    if not CLEAR or kind == 'limiter':
+        return 1.0
+    t = np.clip(np.log(rpm / CLEAR_PITCH_FROM_RPM) / np.log(CLEAR_PITCH_FULL_RPM / CLEAR_PITCH_FROM_RPM), 0.0, 1.0)
+    return 1.0 + (CLEAR_PITCH - 1.0) * (0.5 - 0.5 * np.cos(np.pi * t))
+
+
+def trim(y, db):
+    """Its top end turned by db (a smooth shelf from TRIM_FROM_HZ to TRIM_TO_HZ, as calm()'s)."""
+    if db == 0:
+        return y
+    spectrum = np.fft.rfft(y)
+    f = np.fft.rfftfreq(len(y), 1.0 / RATE)
+    t = np.clip(np.log2(np.maximum(f, 1.0) / TRIM_FROM_HZ) / np.log2(TRIM_TO_HZ / TRIM_FROM_HZ), 0.0, 1.0)
+    return np.fft.irfft(spectrum * 10.0 ** (db * (0.5 - 0.5 * np.cos(np.pi * t)) / 20.0), len(y))
+
+
 def deepen(loop, db=DEEPEN_DB):
     """Its low end lifted (a shelf from DEEPEN_TO_HZ down, all of it below DEEPEN_FULL_HZ, none
     below 20 Hz). Added on top of the row's level."""
@@ -559,8 +600,16 @@ def main():
     if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
-    game_dir, mod_dir = sys.argv[1], sys.argv[2]
-    out_dir = sys.argv[3] if len(sys.argv) > 3 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'MXS_REMASTERED_sounds')
+    args = [a for a in sys.argv[1:] if a != '--clear']
+    game_dir, mod_dir = args[0], args[1]
+    out_dir = args[2] if len(args) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'MXS_REMASTERED_sounds')
+    variant = '_clear' if CLEAR else ''
+    rows_db = BRIGHTEN_DB + (CLEAR_BRIGHTEN_DB if CLEAR else 0.0)   # every row but the limiter
+    limiter_trim = CLEAR_LIMITER_TRIM_DB if CLEAR else 0.0
+    if CLEAR:
+        print('the clear 450: rows brightened %+.1f dB, the limiter trimmed %+.1f dB, pitched %.2f from %.0f rpm up '
+              '(easing in from %.0f; the limiter as it was)' % (CLEAR_BRIGHTEN_DB, limiter_trim, CLEAR_PITCH,
+                                                                CLEAR_PITCH_FULL_RPM, CLEAR_PITCH_FROM_RPM))
     os.makedirs(out_dir, exist_ok=True)
     from make_engine_sounds import parse_soundtable
 
@@ -651,7 +700,13 @@ def main():
     for table_map in (RIDING_ON_MAP, RIDING_OFF_MAP):
         line_up(sources, [name for _, name in table_map], [limit for limit, _ in table_map[:-1]])
 
-    folder = 'mxsr_' + ENGINE
+    # The pitch heard has to keep rising with the revs, row to row (the rev limiter aside).
+    heard = [rpm * pitch_at(rpm, 'on') for rpm, _ in table]
+    for k in range(1, len(heard)):
+        if heard[k] <= heard[k - 1]:
+            sys.exit('the pitch falls from %.0f to %.0f rpm (%.0f -> %.0f heard): ease it in over more' % (
+                table[k - 1][0], table[k][0], heard[k - 1], heard[k]))
+    folder = 'mxsr_' + ENGINE + variant
     made = {}   # (row, kind) -> (name, cycles, samples, source)
     pack_files = []
     lines = (['SOUNDTABLE %d %d' % (len(table), len(loads))] + ['%d' % round(rpm) for rpm, _ in table] +
@@ -673,30 +728,31 @@ def main():
                     src_name = pick(RIDING_ON_MAP if kind == 'on' else RIDING_OFF_MAP, rpm)
                     level, share = curve(rpm), (REAL_OFF_GAIN if kind == 'off' else 1.0)
                 source = sources[src_name]
+                pitch = pitch_at(rpm, kind)  # (the cells as if at this much of their row's RPM)
                 if src_name == 'idle':
                     # (Idle, where the revs and load sit still: the loop, as the 250F's. Its lumpy
                     # firing defeats the cycle cutting - the cuts came out ~12% short.)
                     count = source['cycles']
                     loop = source['loop']
                     if rpm < LOOP_BELOW_RPM:
-                        y = to_length(loop, int(round(count * 120.0 * RATE / rpm)))
+                        y = to_length(loop, int(round(count * 120.0 * RATE / (rpm * pitch))))
                     else:
                         y = zero_cut_row(np.concatenate([loop, loop]), loop_cycles(loop, count, LOOP_SNAP),
-                                         int(round(120.0 * RATE / rpm)))
+                                         int(round(120.0 * RATE / (rpm * pitch))))
                     if kind == 'off':
                         y = soften(y, OFF_TOP_HZ)
-                    y = brighten(y)
+                    y = brighten(y, rows_db)
                 elif kind != 'limiter':
                     count = 1
-                    y = average_cycle(source, rpm, row=r)
+                    y = average_cycle(source, rpm * pitch, row=r)
                     if src_name in CALM:
                         y = calm(y, 1, *CALM[src_name])
-                    y = zero_ends(brighten(y), 1)
+                    y = zero_ends(brighten(y, rows_db), 1)
                 else:
                     cut = source['cut']
                     count = len(cut)
-                    y = zero_cut_row(source['raw'], cut, int(round(120.0 * RATE / rpm)))
-                    y = zero_ends(brighten(y), count)
+                    y = zero_cut_row(source['raw'], cut, int(round(120.0 * RATE / (rpm * pitch))))
+                    y = zero_ends(trim(brighten(y), limiter_trim), count)
                 # As loud as meant (the stock row, or the riding curve; off the throttle less), never
                 # past full scale.
                 gain = (level * share) / (np.sqrt(np.mean(y ** 2)) + 1e-9)
@@ -721,7 +777,7 @@ def main():
             lines.append('%s %d @%s' % (cell['lead'], cycles, name))
     soundtable = ('\n'.join(lines) + '\n').encode('latin1')
     archive = [(ENGINE + '.soundtable', soundtable)] + pack_files
-    pack_path = os.path.join(out_dir, 'MXS_REMASTERED_engine_%s.pack' % ENGINE)
+    pack_path = os.path.join(out_dir, 'MXS_REMASTERED_engine_%s%s.pack' % (ENGINE, variant))
     saf.write(pack_path, archive)
     for r, (rpm, _) in enumerate(table):
         parts = []
@@ -743,7 +799,7 @@ def main():
             if (r, kind) in made:
                 y = made[(r, kind)][2]
                 out += [np.tile(y, int(np.ceil(RATE / len(y))))[:RATE], np.zeros(RATE // 8)]
-    with wave.open(os.path.join(out_dir, 'preview_%s.wav' % ENGINE), 'wb') as f:
+    with wave.open(os.path.join(out_dir, 'preview_%s%s.wav' % (ENGINE, variant)), 'wb') as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(RATE)

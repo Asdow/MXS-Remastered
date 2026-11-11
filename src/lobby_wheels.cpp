@@ -251,6 +251,16 @@ bool IsWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawC
     return found != g_meshes.end() && found->second.wheel;
 }
 
+bool KnowsWheels()
+{
+    if (!Enabled())
+        return false;
+    for (const auto& kv : g_meshes)
+        if (kv.second.wheel && kv.second.shape == 2)
+            return true;
+    return false;
+}
+
 void GiveBounds(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw, bool ok,
                 const float lo[3], const float hi[3])
 {

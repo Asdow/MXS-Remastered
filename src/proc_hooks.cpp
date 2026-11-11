@@ -2871,6 +2871,8 @@ struct WheelMember {
 std::vector<WheelMember> g_wheelMembers[2];
 double   g_lastWheelWorld[2][16] = {};
 bool     g_haveLastWheel[2] = { false, false };
+double   g_lastWheelInWorld[2][16] = {};          // the wheel last frame in the world itself (not on the bike)
+bool     g_haveLastWheelInWorld[2] = { false, false };
 unsigned g_memberFrame = 0;
 
 void FindWheelMembers(int i, const NearDraw& main, const double invRaw[16], const postfx::OwnAnchors& own,
@@ -2905,6 +2907,23 @@ void FindWheelMembers(int i, const NearDraw& main, const double invRaw[16], cons
     } else {
         g_haveLastWheel[i] = false;
     }
+    // And spinning in the world as well. Beside other bikes (at the gate, the same model a metre to
+    // the side) your bike was taken for one of them for a moment: the wheel then seemed to turn on
+    // "your bike" while it stood still, and your bike's body, standing just as still against it, was
+    // taken for a part of the wheel - and got its mud all over. A wheel that really spins turns in
+    // the world too; one only the mix-up turned doesn't.
+    bool spinning = false;
+    if (g_haveLastWheelInWorld[i]) {
+        double invLast[16], d[16];
+        if (InverseAffine(g_lastWheelInWorld[i], invLast)) {
+            Mul4(wheel, invLast, d);  // the turn since last frame, in the world
+            const double ax = d[6] - d[9], ay = d[8] - d[2], az = d[1] - d[4];
+            spinning = std::sqrt(ax * ax + ay * ay + az * az) > 0.1;
+        }
+    }
+    std::copy(wheel, wheel + 16, g_lastWheelInWorld[i]);
+    g_haveLastWheelInWorld[i] = true;
+    turning = turning && spinning;
     std::vector<WheelMember>& members = g_wheelMembers[i];
     std::vector<bool> taken(g_nearDraws.size(), false);
     const double reach = 4.0 * unitsPerMetre;
@@ -2985,6 +3004,8 @@ struct PaintPart {
     DeferredCaster id;
     double         axleLocal[3] = {};
     double         world[3] = {}, velocity[3] = {};
+    int            wheel = 0;         // 0 rear, 1 front
+    bool           member = false;    // kept on the wheel (FindWheelMembers), not one of the tracker's own parts
 };
 std::vector<PaintPart> g_paintParts;
 double g_paintTime = 0, g_paintUnits = 3.2808;
@@ -3037,8 +3058,27 @@ void PaintTireDirt(const DrawCall& draw)
                     d2 += (x - expected) * (x - expected);
                 }
                 if (d2 < (0.5 * g_paintUnits) * (0.5 * g_paintUnits)) {
-                    want = static_cast<float>(cfg.tireDirt);
-                    break;
+                    // Only a wheel's own parts: with every bike's wheels watched (lobby_wheels.h), a
+                    // mesh never seen spinning like a wheel isn't one, whatever got it onto your
+                    // wheel's list - next to other bikes at the gate, your bike's body did, and
+                    // was covered in mud. (Each part once in the log, kept or left out.)
+                    const auto element = g_elementBuffers.find(g_vao);
+                    const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
+                    const bool wheelMesh = !lobby::KnowsWheels() || lobby::IsWheel(g_program, g_vao, elements, draw);
+                    static std::vector<long long> logged;
+                    const long long key = (static_cast<long long>(draw.count) << 3) | (part.member ? 4 : 0) |
+                                          (part.wheel ? 2 : 0) | (wheelMesh ? 1 : 0);
+                    if (logged.size() < 40 && std::find(logged.begin(), logged.end(), key) == logged.end()) {
+                        logged.push_back(key);
+                        Log("postfx: tire dirt: %s a part on your %s wheel's list (%d indices, %s)%s",
+                            wheelMesh ? "mud on" : "LEFT OUT", part.wheel ? "front" : "rear", draw.count,
+                            part.member ? "kept on the wheel as it turned" : "one of the wheel tracker's own parts",
+                            wheelMesh ? "" : ": never seen spinning like a wheel");
+                    }
+                    if (wheelMesh) {
+                        want = static_cast<float>(cfg.tireDirt);
+                        break;
+                    }
                 }
             }
         }
@@ -3142,10 +3182,11 @@ void DrawWheelMasks(const postfx::OwnAnchors* own)
                 if (std::equal(d.raw, d.raw + 16, found[k]->raw))
                     draws.push_back(&d);
         }
+        const size_t membersFrom = draws.size();  // (the tracker's own parts before it, the ones kept on the wheel after)
         if (main && frame)
             FindWheelMembers(i, *main, invRaw, *own, draws);
         else
-            g_haveLastWheel[i] = false;
+            g_haveLastWheel[i] = g_haveLastWheelInWorld[i] = false;
         // For PaintTireDirt next frame: each of these draws, with the wheel's axle in its own model
         // (where it'll be checked for), the axle's place now and how fast it moves.
         if (main && frame) {
@@ -3167,6 +3208,8 @@ void DrawWheelMasks(const postfx::OwnAnchors* own)
                     continue;
                 PaintPart part;
                 part.id = draws[k]->caster;
+                part.wheel = i;
+                part.member = k >= membersFrom;
                 for (int r = 0; r < 3; ++r)
                     part.axleLocal[r] = inv[r] * axle[0] + inv[4 + r] * axle[1] + inv[8 + r] * axle[2] + inv[12 + r];
                 std::copy(axle, axle + 3, part.world);

@@ -17,16 +17,21 @@ namespace {
 struct Pack {
     const char*    engine;  // the stock soundtable it replaces
     const wchar_t* file;    // MXS_REMASTERED_sounds\<file>.pack, installed as <game folder>\<file>.saf
-    const wchar_t* oldFile; // what it was called before (mxcam_sounds\mxsr_*)
+    const wchar_t* oldFile; // what it was called before (mxcam_sounds\mxsr_*; one that never was: a name
+                            // no file has - never this pack's own name, RenameOld deletes that as a duplicate)
     const char*    label;
+    const char*    key;     // its own name in the ini (a removal left for next time): two packs replace the
+                            // 450F, so not the engine's
 };
 // (Named so they sort before the game's own archives (zzz*.saf): the first one that has a file is the
 // one read, the way the game's own patches over the years are named.)
 const Pack kPacks[kCount] = {
-    { "default125",  L"MXS_REMASTERED_engine_default125",  L"mxsr_engine_default125",  "125 two-stroke" },
-    { "default250",  L"MXS_REMASTERED_engine_default250",  L"mxsr_engine_default250",  "250 two-stroke" },
-    { "default250f", L"MXS_REMASTERED_engine_default250f", L"mxsr_engine_default250f", "250 four-stroke" },
-    { "default450f", L"MXS_REMASTERED_engine_default450f", L"mxsr_engine_default450f", "450 four-stroke" },
+    { "default125",  L"MXS_REMASTERED_engine_default125",  L"mxsr_engine_default125",  "125 two-stroke",  "default125" },
+    { "default250",  L"MXS_REMASTERED_engine_default250",  L"mxsr_engine_default250",  "250 two-stroke",  "default250" },
+    { "default250f", L"MXS_REMASTERED_engine_default250f", L"mxsr_engine_default250f", "250 four-stroke", "default250f" },
+    { "default450f", L"MXS_REMASTERED_engine_default450f", L"mxsr_engine_default450f", "450 four-stroke", "default450f" },
+    { "default450f", L"MXS_REMASTERED_engine_default450f_clear", L"mxsr_engine_default450f_clear", "450 four-stroke (clear)",
+      "default450f_clear" },
 };
 
 // Where a pack can be installed: the game folder, or - when that needs administrator rights to write
@@ -119,13 +124,13 @@ bool SameFile(const wchar_t* a, const wchar_t* b)
 void RememberRemoval(int i, bool pending)
 {
     wchar_t key[64];
-    swprintf_s(key, L"Remove_%hs", kPacks[i].engine);
+    swprintf_s(key, L"Remove_%hs", kPacks[i].key);
     WritePrivateProfileStringW(L"SoundMods", key, pending ? L"1" : nullptr, paths::IniPath());
 }
 bool RemovalPending(int i)
 {
     wchar_t key[64];
-    swprintf_s(key, L"Remove_%hs", kPacks[i].engine);
+    swprintf_s(key, L"Remove_%hs", kPacks[i].key);
     return GetPrivateProfileIntW(L"SoundMods", key, 0, paths::IniPath()) != 0;
 }
 

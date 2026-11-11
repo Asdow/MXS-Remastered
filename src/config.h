@@ -190,6 +190,7 @@ struct Config {
     bool   soundPack250     = false;
     bool   soundPack250f    = false;
     bool   soundPack450f    = false;
+    bool   soundPack450fClear = false;    // the 450F's other pack: the limiter a little more muffled, the rest less
 };
 
 const Config& GetConfig();
