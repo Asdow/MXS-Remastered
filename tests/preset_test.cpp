@@ -1,7 +1,8 @@
 // preset_test.cpp
 //   The settings presets (config.cpp): switching keeps each preset's settings apart, SAVE writes all
-//   three, and loading the ini brings back the one in use and the other two as saved. An ini from
-//   before presets loads with all three as its settings.
+//   five, and loading the ini brings back the one in use and the others as saved. An ini from
+//   before presets loads with all of them as its settings. Names: kept apart from the settings
+//   (DEFAULTS and a pasted code leave them), saved and loaded with the rest.
 //
 //   Build from a Developer Command Prompt:
 //     cl /nologo /EHsc /std:c++17 /W4 tests\preset_test.cpp src\config.cpp src\log.cpp user32.lib
@@ -90,6 +91,41 @@ int main()
     Check(Same(GetConfig().shadows, Config{}.shadows) && !GetConfig().customCamera, "DEFAULTS resets the preset in use");
     SwitchPreset(1);
     Check(Same(GetConfig().bloom, 0.1), "and leaves the other presets alone");
+
+    // Five of them; names of their own.
+    Check(kPresetCount == 5, "five presets");
+    SwitchPreset(4);
+    Check(ActivePreset() == 4, "switched to preset 5");
+    EditConfig().bloom = 0.33;
+    Check(PresetLabel(4) == "5" && PresetName(4).empty(), "a preset never named shows its number");
+    SetPresetName(4, "  Night \"race\" ");
+    SetPresetName(0, "My everyday settings for racing");
+    Check(PresetName(4) == "Night \"race\"", "a name is kept as typed (spaces at its ends trimmed)");
+    Check(static_cast<int>(PresetName(0).size()) == kPresetNameMax, "a name too long is cut to the most allowed");
+    SetPresetName(2, std::string("Wet\x01\xE9") + "!");
+    Check(PresetName(2) == "Wet!", "characters the menu can't draw are left out");
+    ResetTunables();
+    Check(PresetName(4) == "Night \"race\"", "DEFAULTS leaves the name alone");
+    EditConfig().bloom = 0.33;
+    // Someone else's code: their graphics, your name.
+    SwitchPreset(1);
+    const std::string theirs = PresetCode(1);  // preset 2's graphics (bloom 0.1)
+    SwitchPreset(4);
+    const PresetCodeResult loaded = LoadPresetCode(("look at mine: " + theirs).c_str());
+    Check(loaded.status == PresetCodeResult::Loaded && Same(GetConfig().bloom, 0.1), "a pasted code loads its settings");
+    Check(PresetName(4) == "Night \"race\"" && PresetName(1).empty(), "and changes no preset's name");
+    Check(SaveConfig(), "saved with names");
+    SetPresetName(4, "unsaved");
+    ReloadConfig();
+    Check(ActivePreset() == 4 && Same(GetConfig().bloom, 0.1), "preset 5 in use, as saved");
+    Check(PresetName(4) == "Night \"race\"" && PresetName(0) == "My everyday sett" && PresetName(2) == "Wet!" &&
+              PresetName(1).empty() && PresetName(3).empty(),
+          "the names come back as saved (quotes and all), the unnamed ones still unnamed");
+    SetPresetName(4, "   ");
+    Check(PresetName(4).empty() && PresetLabel(4) == "5", "a blank name goes back to the number");
+    SaveConfig();
+    ReloadConfig();
+    Check(PresetName(4).empty() && PresetName(0) == "My everyday sett", "and stays that way once saved");
 
     DeleteFileW(ini.c_str());
     if (g_failures) {

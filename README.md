@@ -48,7 +48,9 @@ While you drag a **GRAPHICS** or **WEATHER** slider (or step it with the arrow k
 
 ### Presets
 
-At the bottom left of the menu, **PRESET 1 / 2 / 3** switches between three setting profiles, for example one for racing, one for replays and one for night riding. Each preset has its own copy of every setting on the FIRST PERSON, GRAPHICS, WEATHER, REPLAY and OTHER tabs (keybinds are shared). Changes you make stay with the preset you made them in, and **DEFAULTS** only resets the preset in use. Press **SAVE** to keep all three, and the game starts on whichever preset was in use when you saved. A preset you haven't set up yet starts as a copy of your current settings.
+At the top right of the menu, **PRESET 1 / 2 / 3 / 4 / 5** switches between five setting profiles, for example one for racing, one for replays and one for night riding. Each preset has its own copy of every setting on the FIRST PERSON, GRAPHICS, WEATHER, REPLAY and OTHER tabs (keybinds are shared). Changes you make stay with the preset you made them in, and **DEFAULTS** only resets the preset in use. Press **SAVE** to keep them all, and the game starts on whichever preset was in use when you saved. A preset you haven't set up yet starts as a copy of your current settings.
+
+To rename a preset, click the one in use again (or press **F2** with the presets selected), type a name of up to 16 characters and press **Enter**. **Esc** leaves the old name, and an empty name goes back to the number. Press **SAVE** to keep it. Names are yours alone: pasting someone else's code never changes them.
 
 ### Preset codes
 
@@ -107,7 +109,7 @@ Quality of life options, on the **OTHER** tab:
 
 - **Hide HUD**: hides the game's HUD (timing, positions, chat) while you ride or watch a replay, for a clean view or clean videos. Move or click the mouse (or press Esc) and it comes back for a few seconds, so the game's menus still work. The game's menus are never hidden.
 - **Hide cursor**: hides the game's mouse cursor while you ride or watch a replay. It comes back as soon as you move the mouse.
-- **Fullscreen window**: with the game in windowed mode, its window covers the whole screen with no border (borderless fullscreen), so Alt+Tab stays instant. Turn it off and the window goes back to how it was. It's shared by all three presets.
+- **Fullscreen window**: with the game in windowed mode, its window covers the whole screen with no border (borderless fullscreen), so Alt+Tab stays instant. Turn it off and the window goes back to how it was. It's shared by all the presets.
 - **Dab indicator**: a small rider icon at the bottom right, next to the speedometer: red and standing normally, green and sitting while you dab. It follows the game's own Sit/Dab key or button and its Dab When Stopped setting. When you turn it on, it asks whether **Sticky Sit/Dab** is on in the game's settings (with it on, one press sits you and the next stands you up); turn it off and on again to change your answer.
 - **Fade while adjusting**: the menu fade described above (on by default).
 - **Sound mods**: fuller engine sounds for the game's four stock engines (**125 two-stroke**, **250 two-stroke**, **250 four-stroke**, **450 four-stroke**). The stock sounds repeat a single recorded engine cycle over and over, which is why they sound flat. Each pack plays 16 cycles in a random order instead, made from the stock recordings with each cycle firing a little differently, the way a real engine does. Turn one on and it's installed as an `MXS_REMASTERED_engine_*.saf` file in your game folder; it's heard from the next time the game starts. Turn it off to go back to the stock sound. Bikes with their own custom sounds keep them. Needs the `MXS_REMASTERED_sounds` folder next to `opengl32.dll`.

@@ -19,11 +19,12 @@ namespace {
 Config  g_config;
 wchar_t g_path[1024] = L"";
 
-// Presets: three whole sets of the settings (CopyTunables). The live settings (g_config, kept in
+// Presets: five whole sets of the settings (CopyTunables). The live settings (g_config, kept in
 // the ini's usual sections) are the active preset's; the others are kept here, and in the ini in
-// sections of their own ([Preset1] .. [Preset3]) with their keys as "Section.Key".
+// sections of their own ([Preset1] .. [Preset5]) with their keys as "Section.Key".
 Config  g_presets[kPresetCount];
 int     g_activePreset = 0;
+std::string g_presetNames[kPresetCount];  // (see PresetName: never part of a preset's settings)
 const wchar_t* g_presetSection = nullptr;  // while reading / writing a preset's section
 // While reading a preset code (LoadPresetCode): its values by "Section.Key", read instead of the ini.
 const std::vector<std::pair<std::wstring, std::wstring>>* g_codeValues = nullptr;
@@ -51,7 +52,7 @@ bool ReadRaw(const wchar_t* section, const wchar_t* key, wchar_t* buffer, DWORD 
 
 const wchar_t* PresetSection(int index)
 {
-    static const wchar_t* const kSections[kPresetCount] = { L"Preset1", L"Preset2", L"Preset3" };
+    static const wchar_t* const kSections[kPresetCount] = { L"Preset1", L"Preset2", L"Preset3", L"Preset4", L"Preset5" };
     return kSections[index];
 }
 
@@ -113,7 +114,7 @@ double NowSeconds()
 }
 
 // Edits to the ini made in memory and written out in one go. WritePrivateProfileString reads and
-// rewrites the whole file on every call: a save (~400 keys - the settings and three presets) took
+// rewrites the whole file on every call: a save (~400 keys - the settings and the presets) took
 // 1.4 s, the game frozen meanwhile (and the bike tracker took it for a pause). The same rules as
 // Windows': sections and keys match regardless of case and surrounding spaces, comments and other
 // keys stay as they are, a new key goes after the last line of its section, a new section at the
@@ -454,6 +455,18 @@ bool SaveConfig()
     swprintf_s(active, L"%d", g_activePreset + 1);
     ok = ini.Set(L"Presets", L"Active", active) && ok;
     for (int i = 0; i < kPresetCount; ++i) {
+        wchar_t key[16];
+        swprintf_s(key, L"Name%d", i + 1);
+        if (g_presetNames[i].empty()) {
+            ini.Set(L"Presets", key, nullptr);
+            continue;
+        }
+        // In quotes, so spaces at either end (and quotes of its own) read back as they are.
+        wchar_t value[kPresetNameMax + 8];
+        swprintf_s(value, L"\"%hs\"", g_presetNames[i].c_str());
+        ok = ini.Set(L"Presets", key, value) && ok;
+    }
+    for (int i = 0; i < kPresetCount; ++i) {
         if (i == g_activePreset) {
             ini.Set(PresetSection(i), nullptr, nullptr);  // it's the usual sections
             continue;
@@ -580,6 +593,40 @@ void ResetTunables()
 }
 
 int ActivePreset() { return g_activePreset; }
+
+namespace {
+std::string CleanPresetName(const std::string& name)
+{
+    std::string clean;
+    for (const char ch : name) {
+        if (ch >= 32 && ch <= 126 && static_cast<int>(clean.size()) < kPresetNameMax)
+            clean += ch;
+    }
+    const size_t first = clean.find_first_not_of(' ');
+    if (first == std::string::npos)
+        return std::string();
+    return clean.substr(first, clean.find_last_not_of(' ') - first + 1);
+}
+}  // namespace
+
+std::string PresetName(int index)
+{
+    return index >= 0 && index < kPresetCount ? g_presetNames[index] : std::string();
+}
+
+std::string PresetLabel(int index)
+{
+    const std::string name = PresetName(index);
+    return name.empty() ? std::to_string(index + 1) : name;
+}
+
+void SetPresetName(int index, const std::string& name)
+{
+    if (index < 0 || index >= kPresetCount)
+        return;
+    g_presetNames[index] = CleanPresetName(name);
+    Log("config: preset %d named '%s'", index + 1, g_presetNames[index].c_str());
+}
 
 void SwitchPreset(int index)
 {
@@ -907,6 +954,8 @@ Config ParseConfig(const Config& base)
 void ReloadConfig()
 {
     g_activePreset = 0;
+    for (std::string& name : g_presetNames)
+        name.clear();
     if (GetFileAttributesW(g_path) == INVALID_FILE_ATTRIBUTES) {
         Log("config: %ls not found, using built-in defaults", g_path);
         g_config = Config{};
@@ -921,6 +970,15 @@ void ReloadConfig()
     wchar_t buffer[16];
     GetPrivateProfileStringW(L"Presets", L"Active", L"1", buffer, _countof(buffer), g_path);
     g_activePreset = Clamp(_wtoi(buffer) - 1, 0, kPresetCount - 1);
+    for (int i = 0; i < kPresetCount; ++i) {
+        wchar_t key[16], name[64];
+        swprintf_s(key, L"Name%d", i + 1);
+        GetPrivateProfileStringW(L"Presets", key, L"", name, _countof(name), g_path);
+        char narrow[64];
+        WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, sizeof narrow, nullptr, nullptr);
+        narrow[sizeof narrow - 1] = '\0';
+        g_presetNames[i] = CleanPresetName(narrow);
+    }
     for (int i = 0; i < kPresetCount; ++i) {
         g_presets[i] = c;
         if (i == g_activePreset)

@@ -1159,6 +1159,11 @@ struct PanelState {
     // game's settings file can't be trusted for it: see Config::dabSticky). 0 OFF, 1 ON highlighted.
     bool   askSticky    = false;
     int    askChoice    = 0;
+    // A preset being renamed (its index, -1: none): what's typed so far, and when typing started
+    // (the caret blinks from then).
+    int    renaming     = -1;
+    std::string nameDraft;
+    double renameStarted = 0;
 };
 PanelState g_panel;
 
@@ -1304,6 +1309,7 @@ struct Input {
     int   nav = 0;   // -1 up, +1 down
     int   step = 0;  // -1 left, +1 right
     bool  activate = false, coarse = false;
+    bool  rename = false;  // F2: rename the preset in use (with the presets focused)
 
     bool Inside(float x, float y, float w, float h) const
     {
@@ -1316,7 +1322,7 @@ struct KeyState {
     double nextRepeat = 0;
 };
 struct Keys {
-    KeyState menu, escape, up, downArrow, left, right, enter, space, mouse;
+    KeyState menu, escape, up, downArrow, left, right, enter, space, mouse, f2;
 };
 Keys g_keys;
 
@@ -1429,8 +1435,12 @@ void OpenPanel(HWND window)
     Log("panel: opened");
 }
 
+void FinishRename(bool keep, double now);
+
 void ClosePanel()
 {
+    if (g_panel.renaming >= 0)
+        FinishRename(true, Seconds());
     g_panel.open = false;
     g_panel.dragging = -1;
     g_panel.listening = -1;
@@ -1447,6 +1457,7 @@ Input ReadInput(HWND window, bool focus, int width, int height, double now)
     const bool right = PollKey(g_keys.right, VK_RIGHT, true, now);
     const bool enter = PollKey(g_keys.enter, VK_RETURN, false, now);
     const bool space = PollKey(g_keys.space, VK_SPACE, false, now);
+    const bool f2    = PollKey(g_keys.f2, VK_F2, false, now);
     const bool wasDown = g_keys.mouse.down;
     PollKey(g_keys.mouse, VK_LBUTTON, false, now);
     if (!focus)
@@ -1464,6 +1475,7 @@ Input ReadInput(HWND window, bool focus, int width, int height, double now)
     in.nav      = (down ? 1 : 0) - (up ? 1 : 0);
     in.step     = (right ? 1 : 0) - (left ? 1 : 0);
     in.activate = enter || space;
+    in.rename   = f2;
     in.coarse   = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     return in;
 }
@@ -1499,6 +1511,98 @@ int PollNewKey()
         wasDown[vk] = down;
     }
     return pressed;
+}
+
+// ---- Renaming a preset ------------------------------------------------------------------------
+// Typed straight from the keyboard (the game's window may never be sent key messages), each key
+// made its character by the keyboard layout, with Shift, Caps Lock and AltGr. Enter keeps the name,
+// Esc (OverlayFrame) leaves it as it was, and clicking anywhere else keeps it.
+struct Typing {
+    bool   down[256] = {};
+    double repeatAt[256] = {};
+};
+Typing g_typing;
+
+bool TypingKey(int vk)
+{
+    return vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && vk != VK_CAPITAL && !(vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
+
+void StartRename(int preset, double now)
+{
+    g_panel.renaming = preset;
+    g_panel.nameDraft = PresetName(preset);
+    g_panel.renameStarted = now;
+    g_panel.listening = -1;
+    for (int vk = VK_BACK; vk < 0xFF; ++vk)  // keys already held (the F2 that got here) aren't typed
+        g_typing.down[vk] = TypingKey(vk) && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    Log("panel: renaming preset %d", preset + 1);
+}
+
+void FinishRename(bool keep, double now)
+{
+    const int preset = g_panel.renaming;
+    g_panel.renaming = -1;
+    if (preset < 0 || !keep || g_panel.nameDraft == PresetName(preset))
+        return;
+    SetPresetName(preset, g_panel.nameDraft);
+    g_panel.dirty = true;
+    char text[96];
+    snprintf(text, sizeof text, "PRESET %d IS NOW \"%s\" - SAVE TO KEEP IT", preset + 1, PresetLabel(preset).c_str());
+    SetStatus(text, now);
+}
+
+void TypeName(double now)
+{
+    BYTE state[256] = {};
+    const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0, alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        state[VK_SHIFT] = 0x80;
+    if (ctrl)
+        state[VK_CONTROL] = 0x80;
+    if (alt)
+        state[VK_MENU] = 0x80;
+    if (GetKeyState(VK_CAPITAL) & 1)
+        state[VK_CAPITAL] = 0x01;
+    for (int vk = VK_BACK; vk < 0xFF; ++vk) {
+        if (!TypingKey(vk))
+            continue;
+        const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        bool fire = false;
+        if (down && !g_typing.down[vk]) {
+            fire = true;
+            g_typing.repeatAt[vk] = now + 0.4;
+        } else if (down && now >= g_typing.repeatAt[vk]) {
+            fire = true;
+            g_typing.repeatAt[vk] = now + 0.05;
+        }
+        g_typing.down[vk] = down;
+        if (!fire || g_panel.renaming < 0 || vk == VK_ESCAPE)
+            continue;
+        std::string& draft = g_panel.nameDraft;
+        if (vk == VK_RETURN) {
+            FinishRename(true, now);
+            continue;
+        }
+        if (vk == VK_BACK) {
+            if (ctrl)
+                draft.clear();
+            else if (!draft.empty())
+                draft.pop_back();
+            continue;
+        }
+        if (vk == VK_DELETE) {
+            draft.clear();
+            continue;
+        }
+        if (ctrl && !alt)
+            continue;  // (Ctrl + a letter isn't one; Ctrl + Alt is AltGr)
+        wchar_t out[4];
+        const int n = ToUnicode(static_cast<UINT>(vk), MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC), state, out, 4,
+                                0x4 /* leave the keyboard's dead-key state alone */);
+        if (n == 1 && out[0] >= 32 && out[0] <= 126 && static_cast<int>(draft.size()) < kPresetNameMax)
+            draft += static_cast<char>(out[0]);
+    }
 }
 
 void StartListening(int row)
@@ -1879,6 +1983,116 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         return w;
     };
 
+    // ---- Presets (in the header, right of the title): PRESET  1 | 2 | 3 | 4 | 5, each its name ----
+    {
+        const char* label = "PRESET";
+        const float labelW = TextWidth(kFontSmall, label, S(2));
+        const float titleW = TextWidth(kFontTitle, "MXS Remastered", S(1));
+        const float segH = S(32), segY = std::round(y + S(2) + (LineHeight(kFontTitle) - segH) * 0.5f);
+        const float minW = S(46), padW = S(28), editW = S(150);
+        const float room = std::fmax(kPresetCount * minW, innerW - titleW - S(40) - labelW - S(14));
+        // Each segment fits its name; when they don't all fit, the one being renamed keeps its room
+        // and the rest share what's left (their names cut short).
+        std::string names[kPresetCount];
+        float w[kPresetCount], total = 0;
+        for (int p = 0; p < kPresetCount; ++p) {
+            names[p] = p == g_panel.renaming ? g_panel.nameDraft : PresetLabel(p);
+            w[p] = std::fmax(minW, TextWidth(kFontSmall, names[p].c_str(), S(2)) + padW);
+            if (p == g_panel.renaming)
+                w[p] = std::fmax(w[p] + S(6), editW);
+            total += w[p];
+        }
+        if (total > room) {
+            const bool editing = g_panel.renaming >= 0;
+            const float keep = editing ? std::fmin(w[g_panel.renaming], room - (kPresetCount - 1) * minW) : 0.0f;
+            const float share = std::floor((room - keep) / (editing ? kPresetCount - 1 : kPresetCount));
+            total = 0;
+            for (int p = 0; p < kPresetCount; ++p) {
+                w[p] = p == g_panel.renaming ? keep : std::fmin(w[p], share);
+                total += w[p];
+            }
+        }
+        const float sx0 = std::round(x + innerW - total), lx = sx0 - S(14) - labelW;
+        const bool focused = g_panel.selected == presetItem;
+        const bool areaHot = in.Inside(lx, segY, x + innerW - lx, segH);
+        OfferHelp("Five presets, each with its own copy of every setting (not the keybinds). Click one to switch "
+                  "to it: your changes stay with the preset you made them in. Click the one in use again (or press "
+                  "F2) to rename it: type the name, Enter keeps it, Esc leaves it as it was. A pasted code never "
+                  "changes a name. SAVE writes them all to MXS_REMASTERED.ini, and the game starts with the one in use.",
+                  segY, segY + segH, lx, x + innerW - lx, areaHot, focused);
+        if (focused)
+            Marker(lx - S(12), segY, segH);
+        Text(kFontSmall, lx, segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f), label, focused ? kLabel : kDim, S(2));
+        const int current = ActivePreset();
+        int wanted = current;
+        bool renameNow = false;
+        RoundedRect(sx0 - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, kBorder);
+        RoundedRect(sx0, segY, total, segH, segH * 0.5f, kPanelSolid);
+        float sx = sx0;
+        for (int p = 0; p < kPresetCount; ++p) {
+            const bool hot = in.Inside(sx, segY, w[p], segH);
+            const bool editing = p == g_panel.renaming;
+            if (hot && in.pressed && !editing) {
+                g_panel.selected = presetItem;
+                if (p == current)
+                    renameNow = true;
+                else
+                    wanted = p;
+            }
+            if (editing) {
+                RoundedRect(sx, segY, w[p], segH, segH * 0.5f, kBlueHot);
+                RoundedRect(sx + S(2), segY + S(2), w[p] - S(4), segH - S(4), segH * 0.5f - S(2), Rgba(20, 36, 66, 1.0f));
+            } else if (p == current) {
+                RoundedRect(sx, segY, w[p], segH, segH * 0.5f, hot ? kBlueHot : kBlue);
+            }
+            // The name, cut short with ".." if its segment is too narrow (while typing, its end shows).
+            std::string shown = names[p];
+            const float fit = w[p] - padW;
+            if (editing) {
+                while (!shown.empty() && TextWidth(kFontSmall, shown.c_str(), S(2)) > fit - S(6))
+                    shown.erase(0, 1);
+            } else if (TextWidth(kFontSmall, shown.c_str(), S(2)) > fit) {
+                while (shown.size() > 1 && TextWidth(kFontSmall, (shown + "..").c_str(), S(2)) > fit)
+                    shown.pop_back();
+                shown += "..";
+            }
+            const float textW = TextWidth(kFontSmall, shown.c_str(), S(2));
+            const float ty = segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f);
+            const float tx = std::round(sx + (w[p] - textW - (editing ? S(6) : 0.0f)) * 0.5f);
+            Text(kFontSmall, tx, ty, shown.c_str(), editing || p == current ? White(1.0f) : (hot ? kLabel : kDim), S(2));
+            if (editing && std::fmod(now - g_panel.renameStarted, 1.0) < 0.6)  // the caret
+                Rect(tx + textW + S(2), ty, S(2), LineHeight(kFontSmall), White(1.0f));
+            sx += w[p];
+        }
+        // A click anywhere but the name being typed keeps it (and does what it was for).
+        if (g_panel.renaming >= 0 && in.pressed) {
+            float ex = sx0;
+            for (int p = 0; p < g_panel.renaming; ++p)
+                ex += w[p];
+            if (!in.Inside(ex, segY, w[g_panel.renaming], segH))
+                FinishRename(true, now);
+            renameNow = false;
+        }
+        if (g_panel.renaming < 0) {
+            if (focused && in.step)
+                wanted = Clamp(current + (in.step > 0 ? 1 : -1), 0, kPresetCount - 1);
+            if (focused && in.activate)
+                wanted = (current + 1) % kPresetCount;
+            if (focused && in.rename)
+                renameNow = true;
+        }
+        if (wanted != current) {
+            SwitchPreset(wanted);
+            camera::Reset();
+            g_panel.dirty = true;
+            char text[64];
+            snprintf(text, sizeof text, "PRESET %s IN USE - SAVE TO KEEP IT", PresetLabel(wanted).c_str());
+            SetStatus(text, now);
+        } else if (renameNow && g_panel.renaming < 0) {
+            StartRename(current, now);
+        }
+    }
+
     y += headerH;
 
     // ---- Tabs ----
@@ -2181,55 +2395,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                "Closes the menu. Unsaved changes stay until you quit the game."))
         g_panel.closeRequest = true;
 
-    // ---- Presets (left): PRESET 1 | 2 | 3 ----
     float hintX = x;
-    {
-        const char* label = "PRESET";
-        const float labelW = TextWidth(kFontSmall, label, S(2));
-        const float segH = S(32), segW = S(46), segY = std::round(y + (buttonH - segH) * 0.5f);
-        const float sx0 = x + labelW + S(14), total = kPresetCount * segW;
-        const bool focused = g_panel.selected == presetItem;
-        const bool areaHot = in.Inside(x, y, sx0 + total - x, buttonH);
-        OfferHelp("Three presets, each with its own copy of every setting (not the keybinds). Click one to "
-                  "switch to it: your changes stay with the preset you made them in. SAVE writes all three "
-                  "to MXS_REMASTERED.ini, and the game starts with the one in use.",
-                  y, y + buttonH, x, sx0 + total - x, areaHot, focused);
-        if (focused)
-            Marker(px + S(10), segY, segH);
-        Text(kFontSmall, x, y + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), label, focused ? kLabel : kDim, S(2));
-        const int current = ActivePreset();
-        int wanted = current;
-        RoundedRect(sx0 - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, kBorder);
-        RoundedRect(sx0, segY, total, segH, segH * 0.5f, kPanelSolid);
-        for (int p = 0; p < kPresetCount; ++p) {
-            const float sx = sx0 + p * segW;
-            const bool hot = in.Inside(sx, segY, segW, segH);
-            if (hot && in.pressed) {
-                wanted = p;
-                g_panel.selected = presetItem;
-            }
-            if (p == current)
-                RoundedRect(sx, segY, segW, segH, segH * 0.5f, hot ? kBlueHot : kBlue);
-            char number[4];
-            snprintf(number, sizeof number, "%d", p + 1);
-            const float numberW = TextWidth(kFontSmall, number, S(2));
-            Text(kFontSmall, std::round(sx + (segW - numberW) * 0.5f), segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f),
-                 number, p == current ? White(1.0f) : (hot ? kLabel : kDim), S(2));
-        }
-        if (focused && in.step)
-            wanted = Clamp(current + (in.step > 0 ? 1 : -1), 0, kPresetCount - 1);
-        if (focused && in.activate)
-            wanted = (current + 1) % kPresetCount;
-        if (wanted != current) {
-            SwitchPreset(wanted);
-            camera::Reset();
-            g_panel.dirty = true;
-            char text[64];
-            snprintf(text, sizeof text, "PRESET %d IN USE - SAVE TO KEEP IT", wanted + 1);
-            SetStatus(text, now);
-        }
-        hintX = sx0 + total + S(24);
-    }
 
     // ---- Preset codes: COPY <TAB> CODE / PASTE CODE, beside the presets (first person and graphics
     // have a code each; on the other tabs only PASTE CODE shows) ----
@@ -2265,8 +2431,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             if (code.empty()) {
                 SetStatus("CODES ARE FOR THE FIRST PERSON AND GRAPHICS TABS - OPEN ONE TO COPY ITS CODE", now);
             } else if (CopyToClipboard(code)) {
-                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %d, %d CHARACTERS) - PASTE IT TO SHARE", tabName,
-                         ActivePreset() + 1, static_cast<int>(code.size()));
+                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %s, %d CHARACTERS) - PASTE IT TO SHARE", tabName,
+                         PresetLabel(ActivePreset()).c_str(), static_cast<int>(code.size()));
                 SetStatus(text, now);
                 Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, tabName, code.c_str());
             } else {
@@ -2277,7 +2443,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         if (Button(pasteCodeItem, pasteX, cw, "PASTE CODE", false,
                    "Copy someone's code first (from Discord or anywhere: the whole message is fine), then press "
                    "this to load it into the preset in use. A first person code sets the first person settings, a "
-                   "graphics code the graphics: everything else stays yours. Press SAVE to keep it: quit without "
+                   "graphics code the graphics: everything else stays yours, the preset's name too. Press SAVE to keep it: quit without "
                    "saving and the preset is as you last saved it.")) {
             const PresetCodeResult r = LoadPresetCode(ClipboardText().c_str());
             char text[128];
@@ -2294,9 +2460,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             case PresetCodeResult::Loaded:
                 camera::Reset();
                 g_panel.dirty = true;
-                snprintf(text, sizeof text, "%s CODE LOADED INTO PRESET %d%s - SAVE TO KEEP IT",
+                snprintf(text, sizeof text, "%s CODE LOADED INTO PRESET %s%s - SAVE TO KEEP IT",
                          r.tab >= 0 && r.tab < static_cast<int>(sizeof kTabs / sizeof kTabs[0]) ? kTabs[r.tab] : "",
-                         ActivePreset() + 1, r.unknown ? " (SOME NEWER SETTINGS LEFT OUT)" : "");
+                         PresetLabel(ActivePreset()).c_str(), r.unknown ? " (SOME NEWER SETTINGS LEFT OUT)" : "");
                 SetStatus(text, now);
                 break;
             }
@@ -2700,8 +2866,8 @@ void DabIndicatorFrame(HWND window)
 
 bool OverlayListeningForKey()
 {
-    // And a moment after: the key that answered may still be held.
-    return g_panel.listening >= 0 || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
+    // And a moment after: the key that answered may still be held. (Typing a preset's name too.)
+    return g_panel.listening >= 0 || g_panel.renaming >= 0 || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
 }
 
 bool OverlayPanelOpen() { return g_panel.open; }
@@ -2801,7 +2967,10 @@ void OverlayFrame(HDC dc)
         // Esc on the question: never mind (the indicator goes back off), the menu stays open.
         EditConfig().dabIndicator = false;
         g_panel.askSticky = false;
-    } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && !g_panel.askSticky && (menuKey || escape))) {
+    } else if (g_panel.renaming >= 0 && focus && escape) {
+        FinishRename(false, now);  // Esc while renaming: the name stays as it was, the menu open
+    } else if (g_panel.closeRequest ||
+               (focus && g_panel.listening < 0 && g_panel.renaming < 0 && !g_panel.askSticky && (menuKey || escape))) {
         g_panel.askSticky = false;
         ClosePanel();
         return;
@@ -2822,6 +2991,15 @@ void OverlayFrame(HDC dc)
             g_panel.listening = -1;
         in.nav = in.step = 0;
         in.activate = false;
+    }
+    if (g_panel.renaming >= 0) {
+        // Keys type the name: none of them move around the menu.
+        if (focus)
+            TypeName(now);
+        else
+            FinishRename(true, now);
+        in.nav = in.step = 0;
+        in.activate = in.rename = false;
     }
 
     // UI scale follows the window height (1080p = 1.0), held down on narrow windows so the panel

@@ -218,13 +218,21 @@ void ResetTunables();
 // tabs; not the keybinds or the detection settings).
 void CopyTunables(const Config& from, Config& to);
 
-// Presets: three whole sets of those settings to switch between. The live settings are always the
+// Presets: five whole sets of those settings to switch between. The live settings are always the
 // active preset's. Switching keeps them with the preset they belong to and loads the other's (not
-// written to the ini until SaveConfig, which writes all three). A preset never saved starts as a
+// written to the ini until SaveConfig, which writes them all). A preset never saved starts as a
 // copy of the settings in use.
-constexpr int kPresetCount = 3;
+constexpr int kPresetCount = 5;
 int  ActivePreset();
 void SwitchPreset(int index);
+
+// Each preset's name, as the menu shows it (yours to set: printable ASCII, up to kPresetNameMax
+// characters; empty: its number). Kept apart from the settings: switching, DEFAULTS and loading a
+// preset code never change it. In the ini's [Presets] (Name1 .. Name5), written by SaveConfig.
+constexpr int kPresetNameMax = 16;
+std::string PresetName(int index);         // as set ("" if never named)
+std::string PresetLabel(int index);        // as shown: the name, or its number
+void SetPresetName(int index, const std::string& name);
 
 // Preset codes, to share settings as one line of text (on Discord): one for the first person tab and
 // one for the graphics tab (tab: overlay's kTabs, 0 or 1; the other tabs are preferences, with none).
