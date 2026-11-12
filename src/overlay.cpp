@@ -275,7 +275,7 @@ struct AtlasImage {
     float w = 0, h = 0, u0 = 0, v0 = 0, u1 = 0, v1 = 0;
 };
 AtlasImage g_logo;
-constexpr float kLogoHeight = 52.0f;
+constexpr float kLogoHeight = 32.0f;
 
 // The logo's PNG (logo_png.h), decoded once: RGBA, straight alpha.
 struct DecodedImage {
@@ -1437,7 +1437,7 @@ constexpr int kFirstRowItem = 1;
 struct PanelState {
     bool   open         = false;
     int    tab          = 0;
-    int    selected     = kFirstRowItem;
+    int    selected     = kTabBarItem;  // (the tabs: their marker shows from the first time the menu opens)
     int    dragging     = -1;  // index into kRows of the slider being dragged with the mouse
     int    pressedItem  = -1;  // button the mouse went down on
     int    listening    = -1;  // index into kRows of the key row waiting for a key press
@@ -2414,12 +2414,24 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             total += w[p];
         }
         if (total > room) {
-            const bool editing = g_panel.renaming >= 0;
-            const float keep = editing ? std::fmin(w[g_panel.renaming], room - (kPresetCount - 1) * minW) : 0.0f;
-            const float share = std::floor((room - keep) / (editing ? kPresetCount - 1 : kPresetCount));
+            // The longest names are cut to one width, as wide as leaves them all fitting (the short
+            // ones keep theirs).
+            const int editing = g_panel.renaming;
+            if (editing >= 0)
+                w[editing] = std::fmin(w[editing], room - (kPresetCount - 1) * minW);
+            const float budget = room - (editing >= 0 ? w[editing] : 0.0f);
+            float lo = minW, hi = budget;
+            for (int step = 0; step < 24; ++step) {
+                const float cap = 0.5f * (lo + hi);
+                float sum = 0;
+                for (int p = 0; p < kPresetCount; ++p)
+                    sum += p == editing ? 0.0f : std::fmin(w[p], cap);
+                (sum > budget ? hi : lo) = cap;
+            }
             total = 0;
             for (int p = 0; p < kPresetCount; ++p) {
-                w[p] = p == g_panel.renaming ? keep : std::fmin(w[p], share);
+                if (p != editing && w[p] > lo)
+                    w[p] = std::floor(lo);
                 total += w[p];
             }
         }
