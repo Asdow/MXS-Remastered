@@ -180,6 +180,8 @@ uniform vec3  u_markU, u_markV; // the map's axes, view space
 uniform vec3  u_markUW, u_markVW; // and world space
 uniform float u_markTexel;      // m
 uniform float u_markSize;       // texels
+uniform float u_markBlend;      // m: the fade before the window's edge (kMarkBlend; a few m when the
+                                // window holds every rut ridden: postfx.cpp, kMarkFitMargin)
 uniform float u_tireDirt;       // 0..1
 uniform float u_metre;          // game units per metre (MX Simulator: feet)
 uniform float u_wheelOn[2];     // 0 rear, 1 front
@@ -210,6 +212,8 @@ uniform float u_shadowMapOn;
 uniform mat4  u_viewToShadow[4];  // view space -> each cascade's clip space (the sun's)
 uniform float u_shadowTexel;      // one texel of the whole map (the cascades are its 2 x 2 tiles)
 uniform float u_shadowBias[4];
+uniform float u_shadowTexelWorld[4];  // one texel of each cascade on the ground, game units
+uniform float u_shadowSoft;     // 0..1: how soft detailed shadows' edges are (Config::shadowSoftness)
 uniform vec3  u_lightView;      // toward the light, view space
 uniform float u_headlight;      // 0 = off
 uniform int   u_headCount;      // headlights: yours first, then the nearest other bikes'
@@ -227,8 +231,21 @@ uniform vec3  u_snowFog;        // that haze's colour (as bright as the light of
 // 1 = lit, 0 = in the shadow of something the sun's view saw first. 3 x 3 hardware-filtered
 // taps for soft edges; fades out at the edge of the map.
 // One cascade's shadow at q (1 = lit), and how far inside it q is (0 at its usable edge, up to 1).
-float CascadeShadow(int i, vec3 q, out float inside)
+float CascadeShadow(int i, vec3 p, vec3 n, float onGround, out float inside)
 {
+    // Pushed off the surface before it's looked up. The ground: 0.04 game units and a little more with
+    // distance, as it always was. Anything standing on it (a rider's gear, a bike): a texel and a half
+    // of this cascade (the nearest one's are 2.3 cm in the game; 0.04 of its feet is 1.2 cm, half of
+    // one, and a rider's curved gear shaded itself in blotches). Pushed further, thin shadows on the
+    // ground - where it isn't known as ground - thinned out.
+    // The ground: the same, but by how steeply the sun meets it - flat ground facing the sun keeps its
+    // small push (thin shadows on it stay whole), a berm's face the sun only grazes gets the most:
+    // pushed 1.2 cm, those faces shaded themselves in jagged stripes.
+    bool object = onGround < 0.5;
+    float facingSun = clamp(dot(n, u_lightView), 0.0, 1.0);
+    float grazing = sqrt(1.0 - facingSun * facingSun);
+    float push = max(0.04, 1.5 * u_shadowTexelWorld[i] * (object ? 1.0 : grazing * grazing));
+    vec3 q = p + n * (push + 0.0015 * -p.z);
     vec4 s = u_viewToShadow[i] * vec4(q, 1.0);
     vec3 c = s.xyz / s.w * 0.5 + 0.5;
     vec2 e = min(c.xy, 1.0 - c.xy);
@@ -237,22 +254,29 @@ float CascadeShadow(int i, vec3 q, out float inside)
         return 1.0;
     vec2 tile = vec2(float(i - (i / 2) * 2), float(i / 2)) * 0.5;  // each a quarter tile of the map
     vec2 uv = tile + c.xy * 0.5;
+    // (Softer on what stands on the ground: up close a rider's gear spans ten pixels to one of the
+    // map's texels, and its shadow on itself - an arm across the hoodie - came out in blocks.)
+    // On the ground, softer the more the sun grazes it: a low sun stretches each texel into a long
+    // strip across a berm's face, and its shadow's edge came out as a staircase. (The same nine taps.)
+    // (How soft, by the softness setting: half way, a little crisper than they've been - the extra
+    // on ground the sun grazes softened the riders' and bikes' shadows in a low sun as well.)
+    float spread = object ? mix(1.0, 2.0, u_shadowSoft)
+                          : mix(1.0, 1.5, u_shadowSoft) + 1.25 * u_shadowSoft * grazing * grazing;
     float sum = 0.0;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x)
-            sum += texture(u_shadowMap, vec3(uv + vec2(float(x), float(y)) * u_shadowTexel * 1.25, c.z - u_shadowBias[i]));
+            sum += texture(u_shadowMap, vec3(uv + vec2(float(x), float(y)) * u_shadowTexel * spread, c.z - u_shadowBias[i]));
     return sum / 9.0;
 }
 
-float MapShadow(vec3 p, vec3 n)
+float MapShadow(vec3 p, vec3 n, float onGround)
 {
-    vec3 q = p + n * (0.04 + 0.0015 * -p.z);  // pushed off the surface: no self-shadowing
     // The smallest (sharpest) cascade it's inside. Near that one's edge it blends into the next
     // one out, so there's no line where shadows suddenly turn softer (those lines go round with
     // the camera: they flickered). The biggest fades out at its edge.
     for (int i = 0; i < 4; ++i) {
         float inside;
-        float lit = CascadeShadow(i, q, inside);
+        float lit = CascadeShadow(i, p, n, onGround, inside);
         if (inside <= 0.0)
             continue;
         if (inside >= 1.0)
@@ -260,7 +284,7 @@ float MapShadow(vec3 p, vec3 n)
         if (i == 3)
             return mix(1.0, lit, inside);
         float outerInside;
-        float outer = CascadeShadow(i + 1, q, outerInside);
+        float outer = CascadeShadow(i + 1, p, n, onGround, outerInside);
         return mix(mix(1.0, outer, outerInside), lit, smoothstep(0.0, 1.0, inside));
     }
     return 1.0;
@@ -386,7 +410,7 @@ float ValueNoise(vec3 p)
 // pressed in a cache and re-presses them into the fresh strip the window lets in, with the
 // very same stamps a rut gets when it's first dug - so a mark never ends on a line where
 // ground is reused, and last lap's ruts come back whole after a U-turn.
-const float kMarkBlend = 60.0;
+float MarkBlend() { return max(u_markBlend, 1.0); }
 
 float MarkNear(vec2 t) { return texture(u_markMap, (t + u_markPhys) / u_markSize).r; }
 
@@ -431,7 +455,7 @@ vec3 TireMarks(vec3 c, vec3 p, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, vec2 lFloor,
     // How far inside the window this is (m), and how much of the map counts there: the last
     // kMarkBlend metres before its edge fade out.
     float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
-    float wNear = smoothstep(0.0, kMarkBlend, inNear);
+    float wNear = smoothstep(0.0, MarkBlend(), inNear);
     if (wNear < 0.004)
         return c;
     vec2 sNear = MarkStatsNear(t);
@@ -522,7 +546,7 @@ vec2 RutStatsAt(vec3 p)
 {
     vec2 t = u_markCam + vec2(dot(p, u_markU), dot(p, u_markV)) / u_markTexel;
     float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (u_markTexel / u_metre);
-    return MarkStatsNear(t) * (smoothstep(0.0, kMarkBlend, inNear) * u_marks);
+    return MarkStatsNear(t) * (smoothstep(0.0, MarkBlend(), inNear) * u_marks);
 }
 
 // The snow's own relief, as a normal to light it by: ripples the wind laid across it (about every
@@ -609,7 +633,7 @@ float GrooveDepth(vec3 p, vec3 n, vec3 dirW)
     // How far inside the window this is: the depth fades out over the last kMarkBlend metres
     // with the map, so the floor can't slide past the fade into the strip the window cleared.
     float inNear = min(min(t.x, u_markSize - t.x), min(t.y, u_markSize - t.y)) * (texel / u_metre);
-    float wNear = smoothstep(0.0, kMarkBlend, inNear);
+    float wNear = smoothstep(0.0, MarkBlend(), inNear);
     if (wNear < 0.004)
         return 0.0;
     vec2 sNear = MarkStatsNear(t);
@@ -874,8 +898,13 @@ void main()
             // TireDirt keeps to the tire around its own axle.)
             // (Tire dirt: drawn by the bike shader itself on your tires, see proc_hooks PaintTireDirt.)
             float ao = lHere.x, lit = lHere.y;  // gathered above, beside the groove itself
-            if (u_shadowMapOn > 0.5 && dot(nView, u_lightView) > 0.0)
-                lit = min(lit, MapShadow(p, nView));
+            // On what stands on the ground, eased in as the surface turns to the sun rather than cut at
+            // facing it: the normal read from the depth is noisy on small curved things (a rider's gear),
+            // and pixel by pixel it flipped in and out of the map's shadow - pixelated patches.
+            float towards = dot(nView, u_lightView);
+            float facing = ground > 0.5 ? step(1e-6, towards) : smoothstep(0.0, 0.2, towards);
+            if (u_shadowMapOn > 0.5 && facing > 0.0)
+                lit = min(lit, mix(1.0, MapShadow(p, nView, ground), facing));
             ao = mix(1.0, ao, u_ao);
             albedo = c * ao;
             // (Overcast in the snow: the sun's shadows fade, the light comes from the whole sky.)
@@ -1086,6 +1115,15 @@ uniform float u_fallback;       // this wheel's own answer, from its height in t
                                 // air nothing else knows): pressed only where the screen says down
 uniform float u_groundTol;      // how far above the ground still counts as down
 uniform vec3  u_upView;
+uniform float u_fill;           // 1: the first of a groove's two passes (min blend): the ruts already
+                                // there are filled in to what this tire leaves of them (see main)
+
+// A tire pressing a fresh rut pushes the dirt aside: ruts already beside it, within kLipReach of its
+// half-width, are filled in to kLipFill of their depth (the one under it, to its own new shape). Each
+// rut was once a near-flat channel kept by the deepest press anywhere, and a lobby riding much the
+// same line merged a dozen of them into one flat trench a couple of metres wide: one huge tire mark.
+const float kLipReach = 2.2;
+const float kLipFill  = 0.35;
 
 // Both answers must agree. The terrain's depth is the exact one but exists only where the game drew
 // the terrain under this wheel, and as the wheel rises the camera rises with it, so in first person
@@ -1167,7 +1205,9 @@ void main()
     // side to the tire's own centre line, where the whole face was pressed deepest and is
     // deepest still. A rounded section, like a tire's channel in soft ground: the walls curve
     // in, they don't drop, so nothing here stands above the ground it came out of.
-    float profile = cos(x * 1.5707963 / 2.0);
+    // (Rounded down to nothing at its edge: a channel still 70% deep there, as this was, left no
+    // ridge between ruts side by side - they merged into one flat trench.)
+    float profile = sqrt(max(cos(x * 1.5707963), 0.0));
     // A little wider than the deepest section, so the ground eases into the groove over the
     // last texels and its lips hold the faintest press.
     float cover = 1.0 - smoothstep(hw - 1.5, hw + 0.5, d);
@@ -1183,7 +1223,16 @@ void main()
                                                         // it would only be flattened where the ray
                                                         // keeps to it, a plateau along the rut
     float down = OnGround(t);
-    o_color = vec4(cover * depth * u_strength * fade * down);
+    float press = cover * depth * u_strength * fade * down;
+    if (u_fill > 0.5) {
+        // Beside this segment (not past its ends, where the same rut carries on): the ruts there
+        // are filled in to kLipFill, easing back to untouched at kLipReach; under the tire, to its
+        // own new shape. Where nothing is pressed (in the air, a run's ends) nothing is filled.
+        float level = te >= 0.0 && te <= 1.0 ? mix(kLipFill, 1.0, smoothstep(hw, hw * kLipReach, d)) : 1.0;
+        o_color = vec4(mix(1.0, max(press, level), fade * down));
+        return;
+    }
+    o_color = vec4(press);
 }
 )GLSL";
 

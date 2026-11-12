@@ -23,6 +23,7 @@
 #include <GL/gl.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -96,6 +97,9 @@ constexpr GLenum kBlendEquationRgb          = 0x8009;
 constexpr GLenum kBlendEquationAlpha        = 0x883D;
 constexpr GLenum kFuncAdd                   = 0x8006;
 constexpr GLenum kFuncMax                   = 0x8008;
+constexpr GLenum kFuncMin                   = 0x8007;
+constexpr GLenum kPixelPackBuffer         = 0x88EB;  // GL_PIXEL_PACK_BUFFER
+constexpr GLenum kPixelPackBufferBinding  = 0x88ED;
 constexpr GLenum kR8                        = 0x8229;
 constexpr GLenum kFramebufferSrgb           = 0x8DB9;
 constexpr GLenum kSampleAlphaToCoverage     = 0x809E;
@@ -179,6 +183,11 @@ struct GLApi {
     decltype(&::glScissor)             Scissor;
     // Optional (GL 3.2): reading the depth back without waiting for it (FillTerrainFromDepth).
     void*  (APIENTRY* FenceSync)(GLenum, GLbitfield);
+    void   (APIENTRY* GenQueries)(GLsizei, GLuint*);           // (optional: the trace's GPU timings)
+    void   (APIENTRY* BeginQuery)(GLenum, GLuint);
+    void   (APIENTRY* EndQuery)(GLenum);
+    void   (APIENTRY* GetQueryObjectiv)(GLuint, GLenum, GLint*);
+    void   (APIENTRY* GetQueryObjectui64v)(GLuint, GLenum, unsigned long long*);
     GLenum (APIENTRY* ClientWaitSync)(void*, GLbitfield, unsigned long long);
     void   (APIENTRY* DeleteSync)(void*);
     void   (APIENTRY* GetBufferSubData)(GLenum, ptrdiff_t, ptrdiff_t, void*);
@@ -274,6 +283,11 @@ bool LoadGL()
 #undef MXCAM_LOAD
     g_gl.BindSampler = reinterpret_cast<decltype(g_gl.BindSampler)>(GetRealGLFunction("glBindSampler"));
     g_gl.FenceSync = reinterpret_cast<decltype(g_gl.FenceSync)>(GetRealGLFunction("glFenceSync"));
+    g_gl.GenQueries = reinterpret_cast<decltype(g_gl.GenQueries)>(GetRealGLFunction("glGenQueries"));
+    g_gl.BeginQuery = reinterpret_cast<decltype(g_gl.BeginQuery)>(GetRealGLFunction("glBeginQuery"));
+    g_gl.EndQuery = reinterpret_cast<decltype(g_gl.EndQuery)>(GetRealGLFunction("glEndQuery"));
+    g_gl.GetQueryObjectiv = reinterpret_cast<decltype(g_gl.GetQueryObjectiv)>(GetRealGLFunction("glGetQueryObjectiv"));
+    g_gl.GetQueryObjectui64v = reinterpret_cast<decltype(g_gl.GetQueryObjectui64v)>(GetRealGLFunction("glGetQueryObjectui64v"));
     g_gl.ClientWaitSync = reinterpret_cast<decltype(g_gl.ClientWaitSync)>(GetRealGLFunction("glClientWaitSync"));
     g_gl.DeleteSync = reinterpret_cast<decltype(g_gl.DeleteSync)>(GetRealGLFunction("glDeleteSync"));
     g_gl.GetBufferSubData = reinterpret_cast<decltype(g_gl.GetBufferSubData)>(GetRealGLFunction("glGetBufferSubData"));
@@ -1208,6 +1222,7 @@ struct RiderPoint {
     bool  transposed;
 };
 std::vector<RiderPoint> g_riderPoints;
+std::vector<Vec3>       g_lastRiderHips;  // last frame's riders' hips (world), for NearAnyRiderEye
 
 // World transform of a record's model (camera -> world times its View * Model).
 bool RecordWorld(const SkeletonRecord& rec, double world[16])
@@ -2892,6 +2907,8 @@ struct MarkBlock {
 std::deque<MarkBlock> g_markCache[3];  // each wheel's ruts this session, oldest block first
 size_t                g_markCacheSize[3] = {};  // segments held per wheel (what the cap counts)
 constexpr double kOthersStroke = 0.5;   // m: every other bike's ruts cached in strokes this long
+constexpr double kOthersAtGround = 0.6;  // m: another bike's tire this close to the ground seen there is down on it
+constexpr double kMarkSegMaxMetres = 3.0;  // a cached segment longer than this is no tire's path: dropped
 constexpr int    kOthersCapTimes = 4;   // their cache: this many times one of your wheels' (a full gate's
                                         // ~44 wheels lay down strokes ~50 times as fast as yours)
 struct MarkMap {
@@ -2914,12 +2931,47 @@ size_t CacheCapOf(int i) { return i == 2 ? MarkCacheCap() * kOthersCapTimes : Ma
 
 // Nothing the cache holds any more: its segments are placed in the texels the map was laid out
 // with, so a new layout starts them over.
+// Strips of the window cleared for fresh ground, still to have their cached ruts pressed back
+// (ProcessRepress): a few hundred grooves a frame rather than every one at once - in a full lobby,
+// every stroke of every bike's laps crossing a strip the width of the map was pressed in the frame
+// the window moved. The strips are at the window's far edge (well past where the ruts have faded
+// out), so pressing them over a few frames can't be seen.
+struct RepressStrip {
+    int       axis = 0;          // 0: columns (u), 1: rows (v)
+    long long lo = 0, hi = 0;    // [lo, hi) unwrapped texels
+    int       cache = 0;         // where the walk through the caches is: this cache,
+    size_t    block = 0;         // ...this block (counted from the cache's first ever: g_markPopped)
+    unsigned  queued = 0;        // g_markFrameNo when it was queued
+};
+std::deque<RepressStrip> g_repress;
+// The ground every cached rut lies on (the map's unwrapped texels): while it fits in the window with
+// kMarkFitMargin to spare, the window holds still around it - every rut there is in the map, so
+// nothing is ever cleared or pressed back. (Following the camera, a lobby's whole session of ruts
+// crossing each strip the window let in was pressed back as you rode: the frame rate halved.)
+// Bigger than that (a track wider than the map), the window follows the camera as before.
+struct RiddenBox { bool have = false; double loU = 0, hiU = 0, loV = 0, hiV = 0; };
+RiddenBox g_ridden;
+bool      g_markFit = false;          // the window holds still around g_ridden (for the trace, the fade)
+unsigned  g_markFrameNo = 0;          // UpdateMarks' frames (a strip's age)
+constexpr double kMarkFitMargin = 25.0;   // m of ground kept round the ruts (and the camera) when it holds still
+constexpr long long kRepressChunk = 128;  // texels (5 m): thin strips the window lets in are joined up to
+                                          // this before their ruts are pressed back - a stroke crossing a
+                                          // few of them was pressed back for each
+size_t g_markPopped[3] = {};      // blocks dropped off the front of each cache (over its cap) so far
+int    g_markRepressed = 0;       // grooves pressed back this frame (for the trace)
+double g_markMs = 0;              // ms UpdateMarks took this frame (for the trace)
+constexpr int    kRepressGrooves = 256;    // grooves pressed back a frame, at most (more with a backlog)
+constexpr size_t kRepressWalk    = 40000;  // cached segments looked at a frame, at most (likewise)
+
 void ClearMarkCache()
 {
     for (int i = 0; i < 3; ++i) {
         g_markCache[i].clear();
         g_markCacheSize[i] = 0;
+        g_markPopped[i] = 0;
     }
+    g_repress.clear();
+    g_ridden = RiddenBox{};
 }
 
 // One rut segment more at the back of a wheel's cache, kept in a block with its neighbours on
@@ -2928,9 +2980,26 @@ void ClearMarkCache()
 // strides whatever the count).
 void PushMark(int i, const MarkSeg& s)
 {
+    // (No tire goes this far between two contacts on the ground: whatever joined them, it isn't a rut.)
+    if (std::hypot(s.bu - s.au, s.bv - s.av) * g_mark.texel > kMarkSegMaxMetres * g_unitsPerMetre) {
+        static int logged = 0;
+        if (logged < 5) {
+            ++logged;
+            Log("postfx: tire marks: dropped a %.1f m segment from the %s cache (no tire's path)",
+                std::hypot(s.bu - s.au, s.bv - s.av) * g_mark.texel / g_unitsPerMetre,
+                i == 0 ? "rear wheel's" : i == 1 ? "front wheel's" : "other bikes'");
+        }
+        return;
+    }
     std::deque<MarkBlock>& blocks = g_markCache[i];
     const double loU = std::fmin(s.au, s.bu), hiU = std::fmax(s.au, s.bu);
     const double loV = std::fmin(s.av, s.bv), hiV = std::fmax(s.av, s.bv);
+    if (!g_ridden.have)
+        g_ridden = RiddenBox{ true, loU, hiU, loV, hiV };
+    g_ridden.loU = std::fmin(g_ridden.loU, loU);
+    g_ridden.hiU = std::fmax(g_ridden.hiU, hiU);
+    g_ridden.loV = std::fmin(g_ridden.loV, loV);
+    g_ridden.hiV = std::fmax(g_ridden.hiV, hiV);
     if (blocks.empty() || blocks.back().segs.size() >= kMarkBlockSegs)
         blocks.push_back(MarkBlock{ { s }, loU, hiU, loV, hiV });
     else {
@@ -2946,6 +3015,7 @@ void PushMark(int i, const MarkSeg& s)
     while (g_markCacheSize[i] > cap && blocks.size() > 1) {
         g_markCacheSize[i] -= blocks.front().segs.size();
         blocks.pop_front();
+        ++g_markPopped[i];
     }
 }
 
@@ -2957,6 +3027,94 @@ void PlaneAxes(Vec3& u, Vec3& v)
 }
 
 int MarkWrap(long long t, int size) { return static_cast<int>(((t % size) + size) % size); }
+
+bool g_markDumpWanted = false;
+
+// The map around the camera (1024 texels: 41 m to a side) as a grey picture, deeper ruts brighter,
+// the camera a red dot and your wheels' contacts green. The map's own axes: u to the right, v up.
+void DumpMarks(long long cu, long long cv)
+{
+    const MarkMap& m = g_mark;
+    constexpr int kSide = 1024;
+    if (!m.set || m.size < kSide || !g_res.marks.fbo)
+        return;
+    std::vector<unsigned char> grey(static_cast<size_t>(kSide) * kSide, 0);
+    long long x0 = cu - kSide / 2 - m.originU, y0 = cv - kSide / 2 - m.originV;  // window texels
+    x0 = std::max<long long>(0, std::min<long long>(x0, m.size - kSide));
+    y0 = std::max<long long>(0, std::min<long long>(y0, m.size - kSide));
+    GLint readFbo = 0, packBuffer = 0;
+    g_gl.GetIntegerv(kReadFramebufferBinding, &readFbo);
+    g_gl.GetIntegerv(kPixelPackBufferBinding, &packBuffer);
+    g_gl.BindBuffer(kPixelPackBuffer, 0);
+    g_gl.BindFramebuffer(kReadFramebuffer, g_res.marks.fbo);
+    g_gl.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<unsigned char> row(kSide);
+    for (int y = 0; y < kSide; ++y) {
+        const int py = MarkWrap(m.originV + y0 + y, m.size);
+        const int px = MarkWrap(m.originU + x0, m.size);
+        const int first = std::min(kSide, m.size - px);
+        g_gl.ReadPixels(px, py, first, 1, kRed, GL_UNSIGNED_BYTE, row.data());
+        if (first < kSide)
+            g_gl.ReadPixels(0, py, kSide - first, 1, kRed, GL_UNSIGNED_BYTE, row.data() + first);
+        std::copy(row.begin(), row.end(), grey.begin() + static_cast<std::ptrdiff_t>(y) * kSide);
+    }
+    g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
+    g_gl.BindFramebuffer(kReadFramebuffer, static_cast<GLuint>(readFbo));
+    g_gl.BindBuffer(kPixelPackBuffer, static_cast<GLuint>(packBuffer));
+    int deep = 0, any = 0;
+    for (unsigned char g : grey) {
+        any += g > 10;
+        deep += g > 128;
+    }
+    // 24-bit BMP, bottom row first (v up).
+    std::vector<unsigned char> rgb(static_cast<size_t>(kSide) * kSide * 3);
+    for (size_t i = 0; i < grey.size(); ++i)
+        rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = grey[i];
+    const auto Spot = [&](long long tu, long long tv, unsigned char r, unsigned char g, unsigned char b) {
+        const long long x = tu - m.originU - x0, y = tv - m.originV - y0;
+        for (long long dy = -4; dy <= 4; ++dy)
+            for (long long dx = -4; dx <= 4; ++dx)
+                if (x + dx >= 0 && x + dx < kSide && y + dy >= 0 && y + dy < kSide) {
+                    const size_t i = static_cast<size_t>((y + dy) * kSide + (x + dx)) * 3;
+                    rgb[i] = b;
+                    rgb[i + 1] = g;
+                    rgb[i + 2] = r;
+                }
+    };
+    Vec3 u, v;
+    PlaneAxes(u, v);
+    for (const Wheel& w : g_wheels)
+        if (w.on)
+            Spot(static_cast<long long>(std::floor(Dot(w.contact, u) / m.texel)),
+                 static_cast<long long>(std::floor(Dot(w.contact, v) / m.texel)), 0, 255, 0);
+    Spot(cu, cv, 255, 0, 0);
+    wchar_t path[1024];
+    swprintf_s(path, L"%sMXS_REMASTERED_marks.bmp", LogDirectory());
+    FILE* out = _wfsopen(path, L"wb", _SH_DENYWR);
+    if (!out)
+        return;
+    const uint32_t imageBytes = static_cast<uint32_t>(rgb.size()), fileBytes = 54 + imageBytes;
+    unsigned char header[54] = { 'B', 'M' };
+    const auto Put32 = [&](int at, uint32_t v32) {
+        for (int k = 0; k < 4; ++k)
+            header[at + k] = static_cast<unsigned char>(v32 >> (8 * k));
+    };
+    Put32(2, fileBytes);
+    Put32(10, 54);
+    Put32(14, 40);
+    Put32(18, kSide);
+    Put32(22, kSide);
+    header[26] = 1;
+    header[28] = 24;
+    Put32(34, imageBytes);
+    fwrite(header, 1, 54, out);
+    fwrite(rgb.data(), 1, rgb.size(), out);
+    fclose(out);
+    Log("postfx: tire marks: wrote MXS_REMASTERED_marks.bmp (41 m around you: %.1f%% of it rutted, %.1f%% deeper than half; "
+        "window %s, %d strips waiting, %d of other bikes' strokes cached)",
+        100.0 * any / grey.size(), 100.0 * deep / grey.size(), g_markFit ? "holding still" : "following you",
+        static_cast<int>(g_repress.size()), static_cast<int>(g_markCacheSize[2]));
+}
 
 bool EnsureMarks()
 {
@@ -3036,9 +3194,14 @@ void Groove(Target& map, const MarkMap& m, double au, double av, double bu, doub
     const double pu = MarkWrap(m.originU, m.size), pv = MarkWrap(m.originV, m.size);
     const double ax = au - m.originU + pu, ay = av - m.originV + pv;
     const double bx = bu - m.originU + pu, by = bv - m.originV + pv;
-    const double pad = halfWidth + 2.0;
+    const double pad = halfWidth * 2.2 + 2.0;  // (the fill reaches the shader's kLipReach half-widths)
     const double minX = std::fmin(ax, bx) - pad, maxX = std::fmax(ax, bx) + pad;
     const double minY = std::fmin(ay, by) - pad, maxY = std::fmax(ay, by) + pad;
+    // Two passes: the ruts already here filled in where this tire pushes the dirt aside (min), then
+    // this one pressed (max). The callers have the max blend on; it's left that way.
+    for (int pass = 0; pass < 2; ++pass) {
+    g_gl.BlendEquationSeparate(pass == 0 ? kFuncMin : kFuncMax, pass == 0 ? kFuncMin : kFuncMax);
+    g_gl.Uniform1f(sp["u_fill"], pass == 0 ? 1.0f : 0.0f);
     for (int sx = 0; sx < 2; ++sx) {
         for (int sy = 0; sy < 2; ++sy) {
             const double ox = sx * m.size, oy = sy * m.size;
@@ -3053,6 +3216,7 @@ void Groove(Target& map, const MarkMap& m, double au, double av, double bu, doub
                       static_cast<float>(strength), static_cast<float>(arcA), static_cast<float>(fadeOut));
         }
     }
+    }  // (each pass)
 }
 
 // Clears the texel columns (axis 0) or rows (axis 1) [from, from + count) of one map, wrapped.
@@ -3451,8 +3615,6 @@ bool PlaceSamples(const float* samples, const double invP[16], const double view
     return true;
 }
 
-constexpr GLenum kPixelPackBuffer         = 0x88EB;  // GL_PIXEL_PACK_BUFFER
-constexpr GLenum kPixelPackBufferBinding  = 0x88ED;
 constexpr GLenum kStreamRead              = 0x88E1;
 constexpr GLenum kSyncGpuCommandsComplete = 0x9117;
 constexpr GLenum kAlreadySignaled         = 0x911A;
@@ -3593,7 +3755,39 @@ bool FillTerrainFromDepth()
 // carries a lap's ruts across many wrap-arounds.
 void RepressCache(int axis, long long from, long long count)
 {
-    if (!g_mark.set)
+    if (!g_mark.set || count <= 0)
+        return;
+    // Joined to the last strip of this axis while that one hasn't been started and is still thin.
+    for (auto it = g_repress.rbegin(); it != g_repress.rend(); ++it) {
+        if (it->axis != axis)
+            continue;
+        if (it->cache == 0 && it->block == 0 && it->hi - it->lo < kRepressChunk) {
+            if (it->hi == from) {
+                it->hi = from + count;
+                return;
+            }
+            if (it->lo == from + count) {
+                it->lo = from;
+                return;
+            }
+        }
+        break;
+    }
+    RepressStrip strip;
+    strip.axis = axis;
+    strip.lo = from;
+    strip.hi = from + count;
+    strip.queued = g_markFrameNo;
+    g_repress.push_back(strip);
+}
+
+// Presses back what the queued strips are owed, a budget's worth a frame (see RepressStrip). Each
+// strip is held to the window as it is now: ground that has left the window since isn't pressed
+// (it would land, wrapped, on the ground at the window's other side).
+void ProcessRepress()
+{
+    g_markRepressed = 0;
+    if (!g_mark.set || g_repress.empty())
         return;
     MarkMap& m = g_mark;
     Program& stamp = g_res.programs[kStamp];
@@ -3602,28 +3796,77 @@ void RepressCache(int axis, long long from, long long count)
     g_gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
     g_gl.Uniform1f(stamp["u_check"], 0.0f);  // the cache only holds ruts the tires really pressed
     g_gl.Uniform1f(stamp["u_fallback"], 1.0f);
-    const double stripLo = static_cast<double>(from), stripHi = static_cast<double>(from + count);
     // A block's box holds its segments' contacts only, so the test is widened by the widest
     // rut's half (the rear's, the wider of the two): a segment reaching into the strip from
     // outside the box still gets pressed. In the map's texels.
     const double widest = 0.12 * g_unitsPerMetre / m.texel;
-    for (int i = 0; i < 3; ++i) {
-        for (const MarkBlock& b : g_markCache[i]) {
-            const double bLo = axis == 0 ? b.minU - widest : b.minV - widest;
-            const double bHi = axis == 0 ? b.maxU + widest : b.maxV + widest;
-            if (bHi < stripLo || bLo > stripHi)
-                continue;  // the whole block is clear of the strip: its segments can't be in it
-            for (const MarkSeg& s : b.segs) {
-                const double hw = s.halfWidth * g_unitsPerMetre / m.texel;
-                const double lo = axis == 0 ? std::fmin(s.au, s.bu) - hw : std::fmin(s.av, s.bv) - hw;
-                const double hi = axis == 0 ? std::fmax(s.au, s.bu) + hw : std::fmax(s.av, s.bv) + hw;
-                if (hi < stripLo || lo > stripHi)
-                    continue;
-                Groove(g_res.marks, m, s.au, s.av, s.bu, s.bv, hw,
-                       i == 0 ? kMarkRearStrength : kMarkFrontStrength, s.arcA, s.fadeOut);
-            }
+    // (A backlog - riding fast past a lot of ruts - gets through faster.)
+    const size_t scale = std::min<size_t>(1 + g_repress.size() / 8, 3);
+    const int grooveBudget = static_cast<int>(kRepressGrooves * scale);
+    const size_t walkBudget = kRepressWalk * scale;
+    int grooves = 0;
+    size_t walked = 0;
+    bool out = false;
+    for (size_t at = 0; at < g_repress.size() && !out;) {
+        RepressStrip& st = g_repress[at];
+        const long long wLo = st.axis == 0 ? m.originU : m.originV;
+        const double stripLo = static_cast<double>(std::max(st.lo, wLo));
+        const double stripHi = static_cast<double>(std::min(st.hi, wLo + m.size));
+        if (stripHi <= stripLo) {
+            g_repress.erase(g_repress.begin() + static_cast<std::ptrdiff_t>(at));  // (its ground has left the window)
+            continue;
         }
+        // Still being joined (the last of its axis, thin, and young): left for a later frame.
+        bool newest = true;
+        for (size_t k = at + 1; k < g_repress.size() && newest; ++k)
+            newest = g_repress[k].axis != st.axis;
+        if (newest && st.cache == 0 && st.block == 0 && st.hi - st.lo < kRepressChunk && g_markFrameNo - st.queued < 30) {
+            ++at;
+            continue;
+        }
+        // (Every other bike's ruts first, then your front's, your rear's last: each groove fills in
+        // the ruts beside it, so yours come out on top, as they were ridden last where you are.)
+        static constexpr int kOrder[3] = { 2, 1, 0 };
+        for (; st.cache < 3 && !out; ++st.cache, st.block = 0) {
+            const int ci = kOrder[st.cache];
+            const std::deque<MarkBlock>& blocks = g_markCache[ci];
+            st.block = std::max(st.block, g_markPopped[ci]);
+            for (; st.block < g_markPopped[ci] + blocks.size(); ++st.block) {
+                if (grooves >= grooveBudget || walked >= walkBudget) {
+                    out = true;
+                    break;
+                }
+                const MarkBlock& b = blocks[st.block - g_markPopped[ci]];
+                const double bLo = st.axis == 0 ? b.minU - widest : b.minV - widest;
+                const double bHi = st.axis == 0 ? b.maxU + widest : b.maxV + widest;
+                if (bHi < stripLo || bLo > stripHi)
+                    continue;  // the whole block is clear of the strip: its segments can't be in it
+                walked += b.segs.size();
+                for (const MarkSeg& sg : b.segs) {
+                    const double hw = sg.halfWidth * g_unitsPerMetre / m.texel;
+                    const double lo = st.axis == 0 ? std::fmin(sg.au, sg.bu) - hw : std::fmin(sg.av, sg.bv) - hw;
+                    const double hi = st.axis == 0 ? std::fmax(sg.au, sg.bu) + hw : std::fmax(sg.av, sg.bv) + hw;
+                    if (hi < stripLo || lo > stripHi)
+                        continue;
+                    // Nor one off the window the other way: it would wrap round onto the ground at
+                    // the window's opposite side and press a rut there that was never ridden.
+                    const double oLo = st.axis == 0 ? std::fmin(sg.av, sg.bv) - hw : std::fmin(sg.au, sg.bu) - hw;
+                    const double oHi = st.axis == 0 ? std::fmax(sg.av, sg.bv) + hw : std::fmax(sg.au, sg.bu) + hw;
+                    const double oWin = static_cast<double>(st.axis == 0 ? m.originV : m.originU);
+                    if (oHi < oWin || oLo > oWin + m.size)
+                        continue;
+                    Groove(g_res.marks, m, sg.au, sg.av, sg.bu, sg.bv, hw,
+                           ci == 0 ? kMarkRearStrength : kMarkFrontStrength, sg.arcA, sg.fadeOut);
+                    ++grooves;
+                }
+            }
+            if (out)
+                break;  // (keep the cache this strip's walk is in)
+        }
+        if (!out)
+            g_repress.erase(g_repress.begin() + static_cast<std::ptrdiff_t>(at));
     }
+    g_markRepressed = grooves;
     g_gl.Disable(GL_BLEND);
 }
 
@@ -3680,6 +3923,7 @@ bool UpdateMarks(double dt)
     const Config& cfg = GetConfig();
     if (cfg.tireMarks <= 0.0 || !g_frame.haveView || !EnsureMarks())
         return false;
+    const auto started = std::chrono::steady_clock::now();
     g_markTime += dt;  // the clock the fits' samples are stamped with
     Program& p = Use(kStamp);
     (void)p;
@@ -3728,30 +3972,71 @@ bool UpdateMarks(double dt)
         m.originV = cv - m.size / 2;
         m.set = true;
         ClearMarks(g_res.marks, 0, 0, m.size, m.size);
+        g_repress.clear();  // (the strips queued were of the window as it was)
     }
     // Stay centred on the camera, and move only as far as that asks, at most a sixteenth of the
     // map at a time (the old snap to the centre at every threshold cleared up to a quarter of
     // the map in one go, of ground only a quarter behind you - visible again straight after a
     // U-turn). Whatever the clearing wipes there, the cache re-presses right after, so a mark
     // can never be cut where ground is reused: a U-turn comes back to last lap's ruts whole.
+    // Unless every rut ridden so far fits in the window with room to spare (g_ridden): then it holds
+    // still around them - re-centred on them only when they've outgrown where it is - and nothing
+    // the cache holds ever needs pressing back.
+    ++g_markFrameNo;
     const long long slack = m.size / 16;
-    const long long du = cu - m.originU, dv = cv - m.originV;
-    if (du < m.size / 2 - slack || du > m.size / 2 + slack) {
-        const long long shift = du > m.size / 2 + slack ? du - (m.size / 2 + slack) : du - (m.size / 2 - slack);
-        const long long from = shift > 0 ? m.originU + m.size : m.originU + shift;
-        const long long count = shift > 0 ? shift : -shift;
+    long long shiftU = 0, shiftV = 0;
+    const long long margin = static_cast<long long>(kMarkFitMargin * g_unitsPerMetre / m.texel);
+    bool fit = false;
+    if (g_ridden.have) {
+        const auto Place = [&](double lo, double hi, long long cam, long long origin, long long& want) {
+            if (std::ceil(hi) - std::floor(lo) + 2 * margin > m.size)
+                return false;
+            const auto Holds = [&](long long o) {
+                return o <= std::floor(lo) - margin && o + m.size >= std::ceil(hi) + margin &&
+                       cam >= o + margin && cam <= o + m.size - margin;
+            };
+            want = Holds(origin) ? origin : static_cast<long long>(std::floor(0.5 * (lo + hi))) - m.size / 2;
+            return Holds(want);  // (the camera off past the ruts: followed instead)
+        };
+        long long wantU = 0, wantV = 0;
+        fit = Place(g_ridden.loU, g_ridden.hiU, cu, m.originU, wantU) && Place(g_ridden.loV, g_ridden.hiV, cv, m.originV, wantV);
+        if (fit) {
+            shiftU = wantU - m.originU;
+            shiftV = wantV - m.originV;
+        }
+    }
+    if (!fit) {
+        // Following the camera: stay centred on it, and move only as far as that asks, at most a
+        // sixteenth of the map at a time (the old snap to the centre at every threshold cleared up
+        // to a quarter of the map in one go, of ground only a quarter behind you - visible again
+        // straight after a U-turn). Whatever the clearing wipes there, the cache presses back, so a
+        // mark can never be cut where ground is reused: a U-turn comes back to last lap's ruts whole.
+        const long long du = cu - m.originU, dv = cv - m.originV;
+        if (du < m.size / 2 - slack || du > m.size / 2 + slack)
+            shiftU = du > m.size / 2 + slack ? du - (m.size / 2 + slack) : du - (m.size / 2 - slack);
+        if (dv < m.size / 2 - slack || dv > m.size / 2 + slack)
+            shiftV = dv > m.size / 2 + slack ? dv - (m.size / 2 + slack) : dv - (m.size / 2 - slack);
+    }
+    if (fit != g_markFit) {
+        g_markFit = fit;
+        Log("postfx: tire marks: %s", fit ? "every rut ridden so far fits in the map: it holds still around them (nothing to press back)"
+                                          : "the ruts ridden reach wider than the map: it follows the camera");
+    }
+    if (shiftU != 0) {
+        const long long from = shiftU > 0 ? m.originU + m.size : m.originU + shiftU;
+        const long long count = shiftU > 0 ? shiftU : -shiftU;
         ClearBand(0, g_res.marks, m, from, count);
         RepressCache(0, from, count);
-        m.originU += shift;
+        m.originU += shiftU;
     }
-    if (dv < m.size / 2 - slack || dv > m.size / 2 + slack) {
-        const long long shift = dv > m.size / 2 + slack ? dv - (m.size / 2 + slack) : dv - (m.size / 2 - slack);
-        const long long from = shift > 0 ? m.originV + m.size : m.originV + shift;
-        const long long count = shift > 0 ? shift : -shift;
+    if (shiftV != 0) {
+        const long long from = shiftV > 0 ? m.originV + m.size : m.originV + shiftV;
+        const long long count = shiftV > 0 ? shiftV : -shiftV;
         ClearBand(1, g_res.marks, m, from, count);
         RepressCache(1, from, count);
-        m.originV += shift;
+        m.originV += shiftV;
     }
+    ProcessRepress();
     // The grooves: from each wheel's last contact with the ground to this one, pressed only where
     // the tire is down on it - and both answers must agree: the terrain's depth where the game drew
     // that wheel (exact, but it exists only there), and this wheel's own world-space answer from its
@@ -4048,10 +4333,14 @@ bool UpdateMarks(double dt)
             k.arc = 0.0;  // the run broke at here: the next one turns in from its start
         };
         const double seenCell = kTerrainCellMetres * g_unitsPerMetre;
-        const auto ClearOfSeen = [&](Vec3 p) {
+        // At the ground the game drew there: known, and the tire within kOthersAtGround of it. (Asked
+        // only "not clear of it", ground never seen counted as down: other riders' jumps - their air
+        // missed by their contact's fall, smoothed over the network - were cached, and pressed back as
+        // fans of straight lines over every jump once the window moved.)
+        const auto AtSeenGround = [&](Vec3 p) {
             double seen = 0;
             return TerrainHeightAt(Dot(p, u) / seenCell, Dot(p, v) / seenCell, seen) &&
-                   Dot(p, up) - seen > kAirClearMetres * g_unitsPerMetre;
+                   std::fabs(Dot(p, up) - seen) < kOthersAtGround * g_unitsPerMetre;
         };
         static std::vector<lobby::Segment> others;
         lobby::TakeSegments(others);
@@ -4108,7 +4397,11 @@ bool UpdateMarks(double dt)
                 Vec(stamp, "u_eyeB", TransformPoint(g_frame.rendered, b));
                 Groove(g_res.marks, m, au, av, bu, bv, halfWidth / m.texel, strength, stroke.arc, kMarkNoFade);
                 // Into the cache, in strokes: only while both answers say on the ground.
-                if (s.grounded && !ClearOfSeen(a) && !ClearOfSeen(b)) {
+                if (s.grounded && AtSeenGround(a) && AtSeenGround(b)) {
+                    // (A stroke goes on only from where it left off: a wheel that jumped - another one
+                    // taken for it - starts a stroke of its own rather than joining the two.)
+                    if (stroke.have && std::hypot(au - stroke.lu, av - stroke.lv) * m.texel > 0.3 * g_unitsPerMetre)
+                        Flush(stroke);
                     if (!stroke.have) {
                         stroke.su = au;
                         stroke.sv = av;
@@ -4169,6 +4462,11 @@ bool UpdateMarks(double dt)
     g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
     g_gl.Disable(GL_BLEND);
     g_gl.Disable(GL_SCISSOR_TEST);
+    if (g_markDumpWanted) {
+        g_markDumpWanted = false;
+        DumpMarks(cu, cv);
+    }
+    g_markMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     return true;
 }
 
@@ -4871,7 +5169,7 @@ void Render(int w, int h)
         Bind(p, "u_shadowMap", 5, g_res.shadowMap);
         g_gl.Uniform1f(p["u_shadowMapOn"], shadowMapOn ? 1.0f : 0.0f);
         if (shadowMapOn) {
-            float matrices[kCascades][16], bias[kCascades];
+            float matrices[kCascades][16], bias[kCascades], texelWorld[kCascades];
             for (int c = 0; c < kCascades; ++c) {
                 double projection[16], viewToShadow[16];
                 for (int i = 0; i < 16; ++i)
@@ -4880,9 +5178,13 @@ void Render(int w, int h)
                 ToFloat(viewToShadow, matrices[c], 16);
                 // About 4 cm along the light, plus a little more for a wider cascade's bigger texels.
                 bias[c] = static_cast<float>((0.04 + g_shadow.cascadeHalf[c] * 0.002) / (2.0 * g_shadow.depth));
+                // One texel of this cascade (a quarter tile of the map), for the shader's push off the surface.
+                texelWorld[c] = static_cast<float>(4.0 * g_shadow.cascadeHalf[c] / std::max(g_res.shadowSize, 1));
             }
             g_gl.UniformMatrix4fv(p["u_viewToShadow[0]"], kCascades, GL_FALSE, &matrices[0][0]);
             g_gl.Uniform1fv(p["u_shadowBias[0]"], kCascades, bias);
+            g_gl.Uniform1fv(p["u_shadowTexelWorld[0]"], kCascades, texelWorld);
+            g_gl.Uniform1f(p["u_shadowSoft"], static_cast<float>(cfg.shadowSoftness));
             g_gl.Uniform1f(p["u_shadowTexel"], 1.0f / g_res.shadowSize);
         }
         Vec(p, "u_lightView", lightView);
@@ -4963,6 +5265,8 @@ void Render(int w, int h)
             Vec(p, "u_markVW", mv);
             g_gl.Uniform1f(p["u_markTexel"], static_cast<float>(g_mark.texel));
             g_gl.Uniform1f(p["u_markSize"], static_cast<float>(g_mark.size));
+            // (Holding still around every rut ridden there are none near its edge to fade: a few m.)
+            g_gl.Uniform1f(p["u_markBlend"], static_cast<float>(g_markFit ? 3.0 : kMarkBlend));
             // How deep the map's groove values measure down, in m: the relief the floor is
             // sampled at (the shader keeps it under eight texels either way).
             g_gl.Uniform1f(p["u_markDepth"], static_cast<float>(cfg.markDepth * 0.3));
@@ -5211,12 +5515,26 @@ bool WindowSize(int& w, int& h)
 bool  g_riderPartCast = false;     // this frame: your helmet's own model was cast
 bool  g_riderPieceCast = false;    // this frame: a body piece of your rider's own was cast
 int   g_riderPiecesDrawn = 0;      // this frame: your rider's body pieces the game drew (NoteRiderPiecesDrawn)
+int   g_standInsCast = 0;          // this frame, for the trace (F11): the shapes cast (bit i: LogStandIn's which)
+int   g_lateSceneDraws = 0;        // this frame, for the trace: 3D draws after the effects were applied
+int   g_riderDrawsDropped = 0;     // this frame, for the trace: rider pieces not collected (the list full)
+int   g_nearCasts[6] = {};         // this frame, for the trace: the draws around your rider (NoteNearCast)
+int   g_replays[2][4] = {};        // this frame, for the trace: repeats into the shadow map (NoteReplay)
+int   g_realBodyDrawn = 0;         // this frame: pieces of your rider drawn along with one the game drew (NoteRealBodyDrawn)
+int   g_realBodyTraced = 0;        // (the last frame's, for the trace)
+unsigned g_sceneEndProgram = 0;    // what this frame's scene end was taken from
+char  g_sceneEndWhy[96] = "";
 bool  g_loggedWholeRider = false, g_wholeRiderWas = false;
 bool  g_wheelDrawnByGame[2] = { false, false };  // this frame: the game drew that wheel's call near you
 bool  g_haveHeadRest = false;
+constexpr double kAtHeadMetres = 0.35;  // the game's camera this close to where your rider's eyes are: first person
+constexpr double kLeftHeadMetres = 0.48; // ...and this far off before it's taken to have left them
+bool  g_cameraAtHead = false;       // last frame's: the game's camera at your rider's eyes (CameraAtYourHead)
 Vec3  g_headRest;                  // the game's eye in your torso bone's own frame (first person)
 int   g_headRestSamples = 0;
-bool  g_loggedStandIn[6] = {};     // head, torso (on its bone), rear wheel, swingarm, torso (on its joints), front wheel
+double g_headRestUnit = 0;         // the game unit g_headRest was laid out in
+bool  g_loggedStandIn[7] = {};     // head, torso (on its bone), rear wheel, swingarm, torso (on its joints), front wheel,
+                                   // the bike's body
 
 float g_shapeLight[kCascades][16];  // this frame's eye space -> each cascade's clip space (DrawStandIns)
 
@@ -5308,6 +5626,7 @@ void ShapeModel(Vec3 x, Vec3 y, Vec3 z, Vec3 at, double out[16])
 
 void LogStandIn(int which, const char* text)
 {
+    g_standInsCast |= 1 << which;  // (called as each is cast)
     if (!g_loggedStandIn[which]) {
         g_loggedStandIn[which] = true;
         Log("postfx: shadow map: %s", text);
@@ -5321,6 +5640,19 @@ void DrawStandIns()
         return;
     const double u = g_unitsPerMetre;
     bool head = false, torso = false;
+    // The game drawing your whole rider (third person, or the camera close behind or beside you) draws
+    // your whole bike too: no shape stands in for anything then. In a lobby the wheel tracker can let
+    // go of your wheel for another bike's: your tire, swingarm and body shapes were then cast on top
+    // of your real bike's shadow, and it came out a mess.
+    const bool whole = g_riderPiecesDrawn >= 5;
+    if (whole != g_wholeRiderWas && !g_loggedWholeRider) {
+        g_loggedWholeRider = whole;
+        Log("postfx: shadow map: the game draws your whole rider here (%d pieces): no shape stands in for any of it",
+            g_riderPiecesDrawn);
+    }
+    g_wholeRiderWas = whole;
+    bool atHead = false;  // the game's camera where your rider's eyes are: first person
+    g_cameraAtHead = false;
     if (g_rider.haveTorso && !g_thirdPerson) {
         double invTorso[16];
         if (AffineInverse(g_rider.torsoWorld, invTorso)) {
@@ -5329,14 +5661,39 @@ void DrawStandIns()
             // back. (A camera behind the rider, in a replay or another view, once dragged your
             // head's shadow back behind you.) Until then: 65 cm straight above it (your rider's).
             const Vec3 rest = TransformPoint(invTorso, CameraPosition(g_frame.raw));
-            if (!g_haveHeadRest) {
+            // (Laid out again if the unit changes: it's in game units. Measured before the unit settled,
+            // the eyes stood in the wrong place for the rest of the session.)
+            if (!g_haveHeadRest || std::fabs(g_headRestUnit - u) > 0.1 * u) {
                 g_headRest = Vec3{ 0.0, 0.65 * u, 0.0 };
                 g_haveHeadRest = true;
+                g_headRestUnit = u;
+                g_headRestSamples = 0;
             }
             if (std::fabs(rest.x) < 0.10 * u && rest.y > 0.50 * u && rest.y < 0.85 * u && std::fabs(rest.z) < 0.25 * u &&
                 replay::Current() == replay::Mode::Off && g_headRestSamples < 300) {
                 g_headRest = g_headRest + (rest - g_headRest) * 0.02;
                 ++g_headRestSamples;  // (then kept as it is: nothing can drag it away over a session)
+            }
+            // Only with the game's camera right at your rider's eyes does the game leave your helmet and
+            // torso out. Anywhere else (the camera close behind or beside you) it draws them, whatever
+            // its pieces count: the count alone (whole, below) took some riders' gear, drawn in fewer
+            // pieces, for first person, and the shapes sat inside the real helmet and hoodie, shading
+            // them in jagged, pixelated patches.
+            // (Only once the game's unit is measured, from your bike's wheelbase: the eyes are placed in
+            // it. Until then, as before: by the pieces count alone.)
+            const double off = Length(rest - g_headRest) / u;
+            // (Held once there until the camera is well clear: turning your head in first person moves
+            // the eyes some 35 cm about the torso bone, and the shapes went with it; the camera close
+            // behind you sits half a metre off.)
+            static bool wasAtHead = true;
+            atHead = off < (wasAtHead ? kLeftHeadMetres : kAtHeadMetres) || !g_unitsMeasured;
+            wasAtHead = atHead;
+            g_cameraAtHead = atHead;
+            static bool loggedOff = false;
+            if (!atHead && !whole && !loggedOff) {
+                loggedOff = true;
+                Log("postfx: shadow map: the game's camera is %.2f m from your rider's eyes: your helmet and torso are "
+                    "drawn by the game, no shapes stand in for them", off);
             }
         }
         // (Whenever the game leaves your torso and helmet out: a part kept on your torso could be
@@ -5344,15 +5701,14 @@ void DrawStandIns()
         // rider - the camera close behind or beside you, not far enough off to count as third person:
         // the shapes then sat inside the real helmet and body, and where they poked through, they
         // shaded them in jagged patches.)
-        const bool whole = g_riderPiecesDrawn >= 5;
-        if (whole != g_wholeRiderWas && !g_loggedWholeRider) {
-            g_loggedWholeRider = whole;
-            Log("postfx: shadow map: the game draws your whole rider here (%d pieces): no helmet or torso shape stands in",
-                g_riderPiecesDrawn);
-        }
-        g_wholeRiderWas = whole;
-        head = g_haveHeadRest && !whole;
-        torso = g_haveHeadRest && !whole;
+        // And once your real helmet and body pieces are known (the game drew them once: third person,
+        // a replay) they're cast instead (proc_hooks CastRiderPieces, UpdateRiddenParts): the shapes
+        // step aside, so your shadow is your real rider's, not the two on top of each other.
+        // (The torso's shape steps aside only for your real body drawn along with your rider this frame
+        // - repeated later instead, as kept, it came out invisible in the game, and your shadow had no
+        // torso at all.)
+        head = g_haveHeadRest && atHead && !whole && !g_riderPartCast;
+        torso = g_haveHeadRest && atHead && !whole && g_realBodyDrawn == 0;
     }
     // Your wheels the game isn't drawing (placed from your bike, see OwnWheelCast): a tire for one it
     // has never drawn this session; the swingarm whenever the rear one isn't drawn (the game leaves
@@ -5364,7 +5720,7 @@ void DrawStandIns()
         // wheel's kept draw call can be its brake disc or sprocket, followed for the wheel: the
         // shadow then went small). Placed where it sits on your bike.
         // (Never beside the real one: the game drawing its call near you, see NoteWheelDrawnByGame.)
-        placed[i] = w.standIn && !g_wheelDrawnByGame[i] && w.onBikeWeight > 0 && g_bikeNow.found && WheelPlausibleOnBike(i, w.onBike) &&
+        placed[i] = !whole && w.standIn && !g_wheelDrawnByGame[i] && w.onBikeWeight > 0 && g_bikeNow.found && WheelPlausibleOnBike(i, w.onBike) &&
                     Length(TransformPoint(g_bikeNow.model, w.onBike) - g_rider.position) < 2.0 * u;
         wheel[i] = placed[i];
     }
@@ -5496,11 +5852,103 @@ void DrawStandIns()
         Bar(axleAt - forward * (0.25 * u) + up * (0.42 * u), axleAt + forward * (0.45 * u) + up * (0.50 * u), 0.04, 0.11);
         LogStandIn(3, "your rear wheel isn't drawn by the game here: a swingarm shape stands in for the back of your bike "
                       "(with the shock and the rear fender)");
+        // The bike's body, which the game leaves out with the back of the bike in first person: without
+        // it your shadow was a rider over two tire rings and a hole where the bike is (the front end -
+        // forks, bars, fender - the game does draw, and it casts). Between your two axles as learnt on
+        // your bike, its length scaled to your wheelbase: the seat, the tank and its shrouds, the side
+        // panels under the seat, the engine and the radiators (metres along from the rear axle, up from it).
+        const Wheel& f = g_wheels[1];
+        if (f.onBikeWeight > 0 && WheelPlausibleOnBike(1, f.onBike)) {
+            const Vec3 frontAt = TransformPoint(g_bikeNow.model, f.onBike - across * Dot(f.onBike, across));
+            Vec3 ahead = frontAt - axleAt;
+            const double wheelbase = Length(ahead);
+            if (wheelbase > 0.8 * u && wheelbase < 2.2 * u) {
+                ahead = ahead / wheelbase;
+                const Vec3 rise = Normalize(up - ahead * Dot(up, ahead));
+                const double stretch = wheelbase / (1.48 * u);  // (a motocross bike's 1.48 m)
+                const auto At = [&](double along, double high) { return axleAt + ahead * (along * stretch * u) + rise * (high * u); };
+                const auto BodyPiece = [&](Vec3 a, Vec3 c, double tall, double wide) {  // half sizes, metres
+                    const Vec3 along = (c - a) * 0.5;
+                    ShapeModel(along, Normalize(Cross(side, along)) * (tall * u), side * (wide * u), (a + c) * 0.5, model);
+                    DrawShape(0, model, 0.0f);
+                };
+                BodyPiece(At(0.05, 0.62), At(0.85, 0.63), 0.06, 0.12);   // the seat
+                BodyPiece(At(0.78, 0.60), At(1.12, 0.70), 0.13, 0.21);   // the tank and its shrouds
+                BodyPiece(At(0.10, 0.40), At(0.80, 0.46), 0.14, 0.13);   // the side panels, under the seat
+                BodyPiece(At(0.52, 0.12), At(1.05, 0.24), 0.19, 0.15);   // the engine
+                BodyPiece(At(0.95, 0.30), At(1.15, 0.58), 0.12, 0.19);   // the radiators
+                LogStandIn(6, "your bike's body isn't drawn by the game here: a body shape stands in for it "
+                              "(the seat, the tank and shrouds, the side panels, the engine)");
+            }
+        }
     }
     EndShadowDraw();
 }
 
+// ---- Timings for the trace (F11) --------------------------------------------------------------
+// How long the mod's own work takes each frame: on the CPU, and on the GPU (timer queries, read a few
+// frames later so nothing waits for them). 0: the held-back shadow casters drawn at once, 1: the rest
+// of the effects (stand-ins, the composite and the passes after it).
+constexpr int kTimerSlots = 2, kTimerRing = 4;
+constexpr GLenum kTimeElapsed = 0x88BF, kQueryResult = 0x8866, kQueryResultAvailable = 0x8867;
+GLuint g_timerQ[kTimerRing][kTimerSlots] = {};
+bool   g_timerPending[kTimerRing][kTimerSlots] = {};
+bool   g_timersMade = false;
+unsigned g_timerFrame = 0;
+double g_gpuMs[kTimerSlots] = {}, g_cpuMs[kTimerSlots] = {};
+std::chrono::steady_clock::time_point g_timerStart[kTimerSlots];
+double g_castNowMs = 0, g_castNowMsTraced = 0, g_lobbyMs = 0;
+
+bool TimersOk()
+{
+    return g_gl.GenQueries && g_gl.BeginQuery && g_gl.EndQuery && g_gl.GetQueryObjectiv && g_gl.GetQueryObjectui64v;
+}
+
+void TimerBegin(int slot)
+{
+    g_timerStart[slot] = std::chrono::steady_clock::now();
+    if (!TimersOk())
+        return;
+    if (!g_timersMade) {
+        g_gl.GenQueries(kTimerRing * kTimerSlots, &g_timerQ[0][0]);
+        g_timersMade = true;
+    }
+    const int r = static_cast<int>(g_timerFrame % kTimerRing);
+    const GLuint q = g_timerQ[r][slot];
+    if (g_timerPending[r][slot]) {  // this slot's result from kTimerRing frames ago, if it's in
+        GLint available = 0;
+        g_gl.GetQueryObjectiv(q, kQueryResultAvailable, &available);
+        if (available) {
+            unsigned long long ns = 0;
+            g_gl.GetQueryObjectui64v(q, kQueryResult, &ns);
+            g_gpuMs[slot] = static_cast<double>(ns) / 1e6;
+        }
+        g_timerPending[r][slot] = false;
+    }
+    g_gl.BeginQuery(kTimeElapsed, q);
+}
+
+void TimerEnd(int slot)
+{
+    g_cpuMs[slot] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_timerStart[slot]).count();
+    if (!TimersOk() || !g_timersMade)
+        return;
+    g_gl.EndQuery(kTimeElapsed);
+    g_timerPending[g_timerFrame % kTimerRing][slot] = true;
+}
+
+bool g_effectsTimerOpen = false;
+void ApplyInner();
 void Apply()
+{
+    ApplyInner();
+    if (g_effectsTimerOpen) {
+        g_effectsTimerOpen = false;
+        TimerEnd(1);
+    }
+}
+
+void ApplyInner()
 {
     if (!LoadGL())
         return;
@@ -5508,6 +5956,7 @@ void Apply()
     g_riderPartCast = false;
     g_riderPieceCast = false;
     g_riderPiecesDrawn = 0;
+    g_standInsCast = 0;
     g_wheelDrawnByGame[0] = g_wheelDrawnByGame[1] = false;
     g_wheelMask.cleared = g_wheelMask.drawn = false;
     if (!WindowSize(w, h)) {
@@ -5515,7 +5964,11 @@ void Apply()
         return;
     }
     UnderstandScene();
+    TimerBegin(0);
     FlushShadowCasters();  // the held-back shadow casters, all at once, before the shadows are used
+    TimerEnd(0);
+    TimerBegin(1);
+    g_effectsTimerOpen = true;
     SavedState saved;
     Save(saved);
     DrawStandIns();       // (its program and vertex array are put back with the rest)
@@ -6087,8 +6540,35 @@ const char* WheelTraceText()
         g_bikeTrace.lit = false;
     }
     // The dab indicator (dab.cpp): the dab key held, sitting, your speed (m/s).
-    snprintf(text + n, sizeof text - n, ",%d,%d,%.2f", dab::KeyDown() ? 1 : 0, dab::Sitting() ? 1 : 0,
-             g_rider.seen ? Length(g_rider.velocity) / g_unitsPerMetre : -1.0);
+    n += snprintf(text + n, sizeof text - n, ",%d,%d,%.2f", dab::KeyDown() ? 1 : 0, dab::Sitting() ? 1 : 0,
+                  g_rider.seen ? Length(g_rider.velocity) / g_unitsPerMetre : -1.0);
+    // Your shadow: your rider's pieces the game drew, your real helmet / body pieces cast in place of
+    // what it left out, and the shapes standing in (as letters: h helmet, t torso on its bone, T torso
+    // on its joints, r rear tire, f front tire, s swingarm, b the bike's body; - none).
+    char shapes[8] = "", *at = shapes;
+    static const char kLetters[] = "htrsTfb";
+    for (int i = 0; i < 7; ++i)
+        if (g_standInsCast & (1 << i))
+            *at++ = kLetters[i];
+    *at = '\0';
+    snprintf(text + n, sizeof text - n, ",%d,%d,%d,%s,%d,%d,%d/%d/%d/%d/%d/%d", g_riderPiecesDrawn, g_riderPieceCast ? 1 : 0,
+             g_riderPartCast ? 1 : 0, shapes[0] ? shapes : "-", g_lateSceneDraws, g_riderDrawsDropped, g_nearCasts[0], g_nearCasts[1],
+             g_nearCasts[2], g_nearCasts[3], g_nearCasts[4], g_nearCasts[5]);
+    n = static_cast<int>(strlen(text));
+    snprintf(text + n, sizeof text - n, ",%d/%d/%d/%d,%d/%d/%d/%d,%d", g_replays[1][0], g_replays[1][1], g_replays[1][2],
+             g_replays[1][3], g_replays[0][0], g_replays[0][1], g_replays[0][2], g_replays[0][3], g_realBodyTraced);
+    n = static_cast<int>(strlen(text));
+    snprintf(text + n, sizeof text - n, ",%d,%d,%d,%.2f,%d", g_markRepressed, static_cast<int>(g_repress.size()),
+             static_cast<int>(g_markCacheSize[2]), g_markMs, g_markFit ? 1 : 0);
+    n = static_cast<int>(strlen(text));
+    snprintf(text + n, sizeof text - n, ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", g_gpuMs[0], g_gpuMs[1], g_cpuMs[0], g_cpuMs[1],
+             g_castNowMsTraced, g_lobbyMs);
+    for (auto& kind : g_replays)
+        for (int& c : kind)
+            c = 0;
+    g_lateSceneDraws = g_riderDrawsDropped = 0;  // (read once a frame, at its end)
+    for (int& c : g_nearCasts)
+        c = 0;
     return text;
 }
 
@@ -6128,6 +6608,9 @@ bool GetOwnAnchors(OwnAnchors& out)
     out.riderPosition[0] = g_rider.position.x;
     out.riderPosition[1] = g_rider.position.y;
     out.riderPosition[2] = g_rider.position.z;
+    out.hips[0] = g_rider.hips.x;
+    out.hips[1] = g_rider.hips.y;
+    out.hips[2] = g_rider.hips.z;
     std::copy(g_frame.raw, g_frame.raw + 16, out.raw);
     std::copy(g_frame.rendered, g_frame.rendered + 16, out.rendered);
     out.unitsPerMetre = g_unitsPerMetre;
@@ -6182,6 +6665,75 @@ bool HidesGameFlare()
     return cfg.shaders && cfg.hideGameFlare && cfg.timeOfDay >= 0 && (g_frame.haveView || g_lastFrame3D);
 }
 
+bool SceneApplied() { return g_frame.haveView && g_frame.applied; }
+
+void NoteDrawAfterScene(unsigned program)
+{
+    ++g_lateSceneDraws;
+    static int logged = 0;
+    if (logged < 5 && g_lateSceneDraws == 1) {
+        ++logged;
+        Log("postfx: a 3D object (program %u) drawn after the effects were applied this frame - no shadow for it: the "
+            "scene was taken as ended at program %u (%s)", program, g_sceneEndProgram, g_sceneEndWhy);
+    }
+}
+
+void NoteRiderDrawDropped() { ++g_riderDrawsDropped; }
+
+bool OwnRiderEye(float out[3])
+{
+    if (!g_frame.haveView || !g_rider.seen)
+        return false;
+    const Vec3 e = TransformPoint(g_frame.rendered, g_rider.position);
+    out[0] = static_cast<float>(e.x);
+    out[1] = static_cast<float>(e.y);
+    out[2] = static_cast<float>(e.z);
+    return true;
+}
+
+bool NearAnyRiderEye(const float eye[3], double metres)
+{
+    double inv[16];
+    if (!g_frame.haveView || g_lastRiderHips.empty() || !AffineInverse(g_frame.rendered, inv))
+        return false;
+    const Vec3 at = TransformPoint(inv, Vec3{ eye[0], eye[1], eye[2] });
+    const double reach = metres * g_unitsPerMetre;
+    for (const Vec3& h : g_lastRiderHips)
+        if (Length(at - h) < reach)
+            return true;
+    return false;
+}
+
+bool CameraAtYourHead() { return g_cameraAtHead; }
+void NoteCastNowMs(double ms) { g_castNowMs += ms; }
+void NoteLobbyMs(double ms) { g_lobbyMs = ms; }
+void RequestMarksDump() { g_markDumpWanted = true; }
+
+bool OwnHipsEye(float out[3])
+{
+    if (!g_frame.haveView || !g_rider.seen)
+        return false;
+    const Vec3 e = TransformPoint(g_frame.rendered, g_rider.hips);
+    out[0] = static_cast<float>(e.x);
+    out[1] = static_cast<float>(e.y);
+    out[2] = static_cast<float>(e.z);
+    return true;
+}
+
+void NoteRealBodyDrawn(int pieces) { g_realBodyDrawn += pieces; }
+
+void NoteReplay(bool skinned, int outcome)
+{
+    if (outcome >= 0 && outcome < 4)
+        ++g_replays[skinned ? 1 : 0][outcome];
+}
+
+void NoteNearCast(int outcome)
+{
+    if (outcome >= 0 && outcome < 6)
+        ++g_nearCasts[outcome];
+}
+
 bool WantsSceneEnd()
 {
     const Config& cfg = GetConfig();
@@ -6197,6 +6749,8 @@ void SceneEnd(unsigned program, const char* why)
     if (drawFb != 0)
         return;  // drawing into a texture of the game's, not over the scene
     g_frame.applied = true;
+    g_sceneEndProgram = program;
+    strncpy_s(g_sceneEndWhy, why ? why : "", _TRUNCATE);
     if (!g_loggedBeforeHud) {
         g_loggedBeforeHud = true;
         Log("postfx: applied before the HUD (first HUD draw: program %u, %s)", program, why);
@@ -6216,6 +6770,9 @@ void FrameEnd(bool apply)
         g_frame.applied = true;
         Apply();
     }
+    ++g_timerFrame;
+    g_castNowMsTraced = g_castNowMs;
+    g_castNowMs = 0;
     // The dab indicator's rider, when the effects didn't look for it this frame (shaders off).
     if ((cfg.dabIndicator || cfg.brakeSqueal > 0.0) && g_frame.haveView && !g_riderThisFrame && LoadGL()) {
         const double now = Seconds();
@@ -6229,6 +6786,20 @@ void FrameEnd(bool apply)
         g_haveLastRaw = true;
     }
     g_lastFrame3D = g_frame.haveView;
+    g_realBodyTraced = g_realBodyDrawn;
+    g_realBodyDrawn = 0;
+    // (Every rider's hips this frame, for the next: NearAnyRiderEye.)
+    g_lastRiderHips.clear();
+    double invRawHips[16];
+    if (g_frame.haveView && AffineInverse(g_frame.raw, invRawHips)) {
+        for (const RiderPoint& r : g_riderPoints) {
+            double vm[16], world[16];
+            for (int i = 0; i < 16; ++i)
+                vm[i] = r.viewModel[i];
+            MatMul(invRawHips, vm, world);
+            g_lastRiderHips.push_back(TransformPoint(world, Vec3{ r.hips[0], r.hips[1], r.hips[2] }));
+        }
+    }
     g_frame = Frame{};
     g_skeletons.clear();
     g_riderPoints.clear();

@@ -1726,14 +1726,20 @@ int main(int argc, char** argv)
               "a wheel found on its own doesn't have its draw call kept (it could be the sprocket or a brake disc)");
         Check(log.find("your rear wheel isn't drawn by the game here: a tire and hub stand in for it") != std::string::npos,
               "the rear wheel, never drawn, has a tire and hub standing in for it in the shadow map");
-        Check(log.find("shadow map: a part of your rider (on the torso: the helmet)") != std::string::npos,
-              "the helmet casts its shadow once the game stops drawing it");
+        // (Kept parts on your torso aren't cast any more: in a lobby other bikes' wheels were learnt as
+        // your helmet. Your head's shape stands in for it in first person - see headshadow.)
+        Check(log.find("shadow map: a part of your rider (on the torso: the helmet)") == std::string::npos,
+              "no part kept on your torso is cast (the head's shape stands in for the helmet)");
         Check(log.find("shadow map: a part of your bike") == std::string::npos,
               "something riding alongside at your speed isn't cast as part of your bike");
         Check(log.find("a swingarm shape stands in for the back of your bike") != std::string::npos,
               "a swingarm shape stands in for the back of your bike");
-        Check(log.find("a piece of your rider the game doesn't draw here casts its shadow anyway") != std::string::npos,
-              "the rider's torso piece casts its shadow once the game stops drawing it");
+        // (The camera here is 4.5 m from the rider, not at its eyes: the game only leaves your body out
+        // in first person. Counted by pieces alone, some riders' gear - drawn in two pieces in every
+        // view - read as left out with the camera close behind, and copies of the body were cast into
+        // the real one: jagged patches on the hoodie.)
+        Check(log.find("a piece of your rider the game doesn't draw here casts its shadow anyway") == std::string::npos,
+              "with the camera away from the rider's eyes, no kept body piece is cast in place of the real one");
         Check(log.find("uses bones the game doesn't send here") == std::string::npos, "its bones are all found");
         bool unitOk = true;
         for (size_t from = 0; (from = log.find("units to the metre", from)) != std::string::npos; from += 18) {

@@ -33,6 +33,13 @@ constexpr double kWheelSameAxis = 0.95;   // ...about the same axis of their own
 constexpr double kWheelSamples  = 120.0;  // ...over at least this many turns (weighted, see kStatsSeconds)
 constexpr double kReach         = 330.0;  // game units (~100 m) from the camera: wheels further off are left out
 constexpr size_t kMaxSegments   = 4096;   // held for the marks, at most (oldest dropped)
+constexpr double kMinTireUnits  = 0.2 * 3.2808;  // a tire's radius at least (20 cm): smaller is a valve, a bolt, a hub
+// Only a wheel's tire leaves a rut. Whatever turns with a wheel is taken for one (its rim, its brake
+// disc, its sprocket, a valve stem, a decal on its hub: up to seven meshes on a wheel of a lobby's
+// bikes), and each of them pressed a rut of its own: the disc's and the rim's beside the tire's, and
+// the off-axle ones' (their "contact" circling with them round the hub) in dashes - a jump's face
+// ridden by a lobby came out in streaks. A copy whose centre lies within a larger wheel copy's tire
+// is part of that wheel, and is left to it.
 constexpr int    kLogLinesMax   = 24;
 // In the air, from how the contact moves (not from the ground): its height over the last
 // kAirWindow fitted with a parabola; falling faster than kAirFall of the game's gravity for
@@ -57,6 +64,10 @@ struct Copy {
     bool   air = false;
     int    toward = 0;                    // frames on end pointing the other way (the hysteresis)
     unsigned id = 0;                      // which wheel: carried on from the copy it was matched to
+    double centre[3] = {}, radius = 0;    // its axle's centre and its radius, in the world (with a contact)
+    bool   havePrev = false;              // matched to a copy with a contact last frame:
+    double prev[3] = {};                  //   its contact then,
+    bool   prevAir = false;               //   and whether it was in the air
 };
 unsigned g_nextId = 1;
 
@@ -129,7 +140,9 @@ uint64_t KeyOf(unsigned program, unsigned vao, unsigned elementBuffer, const Dra
 bool Enabled()
 {
     const Config& cfg = GetConfig();
-    return (cfg.marksEveryBike && (cfg.tireMarks > 0.0 || cfg.tireDirt > 0.0)) ||
+    // (Tire dirt watches them whatever else is on: the mud goes only on meshes seen turning like a
+    // wheel - see PaintTireDirt.)
+    return cfg.tireMarks > 0.0 || cfg.tireDirt > 0.0 ||
            (cfg.headlightEveryBike && cfg.headlight > 0.0 && cfg.timeOfDay >= 0.0);
 }
 
@@ -224,6 +237,18 @@ bool ContactOf(const Mesh& mesh, const double m[16], const double up[3], double 
     return true;
 }
 
+// The copy's axle centre and radius in the world (for telling a tire from the parts inside it).
+void PlaceOf(const Mesh& mesh, Copy& c)
+{
+    double a2 = 0;
+    for (int r = 0; r < 3; ++r) {
+        c.centre[r] = c.m[r] * mesh.centre[0] + c.m[4 + r] * mesh.centre[1] + c.m[8 + r] * mesh.centre[2] + c.m[12 + r];
+        const double a = c.m[r] * mesh.axle[0] + c.m[4 + r] * mesh.axle[1] + c.m[8 + r] * mesh.axle[2];
+        a2 += a * a;
+    }
+    c.radius = mesh.radius * std::sqrt(a2);
+}
+
 }  // namespace
 
 bool NoteRigidDraw(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw, const float raw[16])
@@ -249,6 +274,29 @@ bool IsWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawC
         return false;
     const auto found = g_meshes.find(KeyOf(program, vao, elementBuffer, draw));
     return found != g_meshes.end() && found->second.wheel;
+}
+
+bool KnownNotWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw)
+{
+    if (!Enabled())
+        return false;
+    const auto found = g_meshes.find(KeyOf(program, vao, elementBuffer, draw));
+    return found != g_meshes.end() && !found->second.wheel && found->second.matched >= 2.0 * kWheelSamples &&
+           found->second.turning < 0.2 * found->second.matched;
+}
+
+bool SeenTurning(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw)
+{
+    if (!Enabled())
+        return false;
+    const auto found = g_meshes.find(KeyOf(program, vao, elementBuffer, draw));
+    if (found == g_meshes.end())
+        return false;
+    const Mesh& m = found->second;
+    if (m.wheel)
+        return true;
+    const double n = std::sqrt(m.axis[0] * m.axis[0] + m.axis[1] * m.axis[1] + m.axis[2] * m.axis[2]);
+    return m.matched >= 4.0 && m.turning >= 0.4 * m.matched && n >= 0.8 * m.turning;
 }
 
 bool KnowsWheels()
@@ -333,8 +381,11 @@ void FrameEnd(const double* rawView, double now)
             Copy c;
             Mul(toWorld, mv, c.m);
             const double dx = c.m[12] - toWorld[12], dy = c.m[13] - toWorld[13], dz = c.m[14] - toWorld[14];
-            if (m.shape == 2 && dx * dx + dy * dy + dz * dz < kReach * kReach)
+            if (m.shape == 2 && dx * dx + dy * dy + dz * dz < kReach * kReach) {
                 c.haveContact = ContactOf(m, c.m, up, c.contact);
+                if (c.haveContact)
+                    PlaceOf(m, c);
+            }
             m.now.push_back(c);
         }
         m.raws.clear();
@@ -377,19 +428,11 @@ void FrameEnd(const double* rawView, double now)
             }
             if (!best)
                 continue;
-            // Its path over the ground, for the marks.
+            // Its path over the ground, for the marks (once every mesh's copies are in: below).
             if (c.haveContact && best->haveContact) {
-                if (g_segments.size() >= kMaxSegments)
-                    g_segments.erase(g_segments.begin(), g_segments.begin() + kMaxSegments / 4);
-                Segment s;
-                for (int k = 0; k < 3; ++k) {
-                    s.a[k] = best->contact[k];
-                    s.b[k] = c.contact[k];
-                }
-                s.radius = m.radius;
-                s.grounded = !best->air && !c.air;
-                s.id = c.id;
-                g_segments.push_back(s);
+                c.havePrev = true;
+                std::copy(best->contact, best->contact + 3, c.prev);
+                c.prevAir = best->air;
             }
             if (m.wheel)
                 continue;  // (its statistics have done their job)
@@ -406,6 +449,42 @@ void FrameEnd(const double* rawView, double now)
             if (m.turning >= kWheelTurning * m.matched && n >= kWheelSameAxis * m.turning)
                 m.wheel = true;  // (its shape is asked for at its next draw)
         }
+    }
+    // The paths over the ground, for the marks: only the tires' (see kMinTireUnits).
+    std::vector<const Copy*> wheels;
+    for (const auto& kv : g_meshes)
+        if (kv.second.wheel && kv.second.shape == 2)
+            for (const Copy& c : kv.second.now)
+                if (c.haveContact)
+                    wheels.push_back(&c);
+    for (const Copy* c : wheels) {
+        if (!c->havePrev || c->radius < kMinTireUnits)
+            continue;
+        bool inside = false;
+        for (const Copy* o : wheels) {
+            if (o == c || o->radius < c->radius || (o->radius == c->radius && o < c))
+                continue;  // (the larger one, or the first of two the same: one of them is kept)
+            double d2 = 0;
+            for (int k = 0; k < 3; ++k)
+                d2 += (o->centre[k] - c->centre[k]) * (o->centre[k] - c->centre[k]);
+            if (d2 < o->radius * o->radius) {
+                inside = true;
+                break;
+            }
+        }
+        if (inside)
+            continue;
+        if (g_segments.size() >= kMaxSegments)
+            g_segments.erase(g_segments.begin(), g_segments.begin() + kMaxSegments / 4);
+        Segment s;
+        for (int k = 0; k < 3; ++k) {
+            s.a[k] = c->prev[k];
+            s.b[k] = c->contact[k];
+        }
+        s.radius = c->radius;
+        s.grounded = !c->prevAir && !c->air;
+        s.id = c->id;
+        g_segments.push_back(s);
     }
 }
 

@@ -29,6 +29,15 @@ bool IsWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawC
 // Whether it's running and has found wheels already (so a mesh it doesn't know as one isn't one).
 bool KnowsWheels();
 
+// Whether this draw's mesh has been watched long enough to know it isn't a wheel (its copies seen
+// frame after frame, not turning like one). A mesh only just seen, or not yet classified, isn't.
+bool KnownNotWheel(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw);
+
+// Whether a mesh is a wheel or, watched only a moment so far, turns like one: in most of the frames
+// it was seen, about the same axis of its own (a bike's body or a helmet never does). For the tire
+// dirt: what may have mud on it.
+bool SeenTurning(unsigned program, unsigned vao, unsigned elementBuffer, const DrawCall& draw);
+
 // The frame is done: rawView is the game's view for it (null if none was found).
 void FrameEnd(const double* rawView, double now);
 

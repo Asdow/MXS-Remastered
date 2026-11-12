@@ -91,6 +91,7 @@ struct OwnAnchors {
     double bikeAcross[3] = { 1, 0, 0 };  // across your bike, in its own space (the wheels' axles)
     double torsoWorld[16] = {};          // your rider's torso bone (it carries the head)
     double riderPosition[3] = {};        // the middle of your rider and bike
+    double hips[3] = {};                 // your rider's hips bone (every piece of your rider is drawn with it)
     double raw[16] = {};                 // the game's view this frame, and the one drawn with
     double rendered[16] = {};
     double unitsPerMetre = 3.2808;
@@ -157,6 +158,50 @@ void MarksNewTrack();
 
 // Cheap: whether draw calls should be checked for the start of the HUD.
 bool WantsSceneEnd();
+
+// For the trace (F11): the effects were already applied this frame (the HUD taken as started), and a
+// 3D object is drawn now - too late for the shadow map and the effects. And a rider's piece near the
+// camera not collected (the list was full).
+bool SceneApplied();
+void NoteDrawAfterScene(unsigned program);
+void NoteRiderDrawDropped();
+// For the trace: your rider's middle in the eye space the frame is drawn from (false: no rider), and
+// what became of a draw of the game's right around it (your bike, your rider): 0 seen, 1 cast into
+// the shadow map straight away, 2 left out as too big / overhead, 3 out of the map's reach, 4
+// see-through, 5 held back (into the shadow map later, with the others).
+bool OwnRiderEye(float out[3]);
+void NoteNearCast(int outcome);
+
+// Whether a point (in the eye space the frame is drawn from) is within reach of any rider: one of last
+// frame's (a bike can be drawn before its rider). For the shadow map: what's with the riders - their
+// bikes, their helmets - is cast as the game draws it, never held back.
+bool NearAnyRiderEye(const float eye[3], double metres);
+
+// For the trace: a held-back or kept draw repeated into the shadow map (skinned: with bones, a rider's
+// piece; else rigid): 0 drawn as it was kept, 1 skipped (its vertex array was given other indices
+// since), 2 drawn though its vertex array was re-pointed since it was kept (it then draws whatever
+// that points at), 3 skipped (its bones weren't found).
+void NoteReplay(bool skinned, int outcome);
+
+// Your rider's hips in the eye space the frame is drawn from (false: no rider). And: pieces of your
+// rider the game left out (your body, in first person) drawn into the shadow map right along with a
+// piece it did draw (your arms, your legs), with the game's own state for your rider - the torso's
+// shape then steps aside this frame.
+bool OwnHipsEye(float out[3]);
+
+// Whether the game's camera sat at your rider's eyes last frame (first person: the game leaves your
+// helmet and body out). Only then is anything of your rider cast in their place.
+bool CameraAtYourHead();
+
+// For the trace (F11): CPU time spent casting draws into the shadow map as the game draws them
+// (added up over the frame), and in watching every bike's wheels (lobby_wheels FrameEnd).
+void NoteCastNowMs(double ms);
+void NoteLobbyMs(double ms);
+
+// For bug reports (F11): the tire marks map around you, saved as MXS_REMASTERED_marks.bmp next to
+// the trace at the next frame.
+void RequestMarksDump();
+void NoteRealBodyDrawn(int pieces);
 
 // The HUD is about to be drawn (why: for the log). Applies the effects now.
 void SceneEnd(unsigned program, const char* why);

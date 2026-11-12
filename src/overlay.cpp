@@ -948,6 +948,9 @@ const RowDef kRows[] = {
     Choice3(1, nullptr,          "Shadow resolution",    &Config::shadowResolution, "2048", "4096", "8192")
         .Help("Detailed shadows: how sharp they are, near and far. Higher is sharper, at the cost of "
               "graphics memory and speed (8192 is for high-end graphics cards)."),
+    Slider(1, nullptr,           "Shadow softness",      &Config::shadowSoftness,   0.0,   1.0,   0.01,   100.0,  0, "%", "Crisp")
+        .Help("Detailed shadows: how soft their edges are. Lower is crisper; higher smooths the steps a "
+              "low sun can leave along shadows on berms and slopes. No cost either way."),
     Slider(1, nullptr,           "Contact shadows",      &Config::shadowLength,     1.0,   20.0,  0.5,    1.0,    1, " m")
         .Help("Screen-space shadows: how far they reach from what casts them. They add shadows from "
               "the ground's own shape (ruts, jumps)."),
