@@ -150,6 +150,7 @@ struct Helmet {
 };
 
 Detection    g_detect;
+Detection    g_lookDetect;  // the same, for LooksLikeReplay() (the first person mod off)
 ReplayCamera g_camera;
 Chase        g_chase;
 Helmet       g_helmet;
@@ -490,6 +491,27 @@ void ObserveBones(const float* positions, int count)
     g_riders[g_riderCount++] = sum / count;
 }
 
+// One frame of the replay camera's signature (kReplayPitchDeg) into d: why a replay that was
+// on is over (the caller turns d.active off), or null. d.active is the caller's to turn on.
+const char* Detect(Detection& d, Vec3 right, Vec3 back, Vec3 pos, double contentTime)
+{
+    const Vec3 worldUp = WorldUp();
+    const double dt = d.haveLast ? Clamp(contentTime - d.lastTime, 0.0, 0.1) : 0.0;
+    const double tolerance = std::sin(kAngleTolerance * kDegToRad);
+    const bool level = std::fabs(Dot(right, worldUp)) < tolerance;
+    const bool replayAngle = level && std::fabs(Dot(back, worldUp) - std::sin(kReplayPitchDeg * kDegToRad)) < tolerance;
+    const bool jumped = d.haveLast && Length(pos - d.lastPos) > kJumpDistance;
+    const char* over = !d.active ? nullptr
+                     : !level ? "the horizon tilted"
+                     : jumped && !replayAngle ? "the camera jumped"
+                     : nullptr;
+    d.signatureTime = replayAngle && !over ? d.signatureTime + dt : 0.0;
+    d.haveLast = true;
+    d.lastPos  = pos;
+    d.lastTime = contentTime;
+    return over;
+}
+
 Mode Update(const double view[16], double contentTime, double correction[16], double rotationOnly[16])
 {
     Detection& d = g_detect;
@@ -499,20 +521,8 @@ Mode Update(const double view[16], double contentTime, double correction[16], do
         d.haveLast = false;
         return g_mode;
     }
-    const Vec3 worldUp = WorldUp();
-    const double dt = d.haveLast ? Clamp(contentTime - d.lastTime, 0.0, 0.1) : 0.0;
-    const double tolerance = std::sin(kAngleTolerance * kDegToRad);
-    const bool level = std::fabs(Dot(right, worldUp)) < tolerance;
-    const bool replayAngle = level && std::fabs(Dot(back, worldUp) - std::sin(kReplayPitchDeg * kDegToRad)) < tolerance;
-    const bool jumped = d.haveLast && Length(pos - d.lastPos) > kJumpDistance;
-    if (d.active && !level)
-        Stop("the horizon tilted");
-    else if (d.active && jumped && !replayAngle)
-        Stop("the camera jumped");
-    d.signatureTime = replayAngle ? d.signatureTime + dt : 0.0;
-    d.haveLast = true;
-    d.lastPos  = pos;
-    d.lastTime = contentTime;
+    if (const char* over = Detect(d, right, back, pos, contentTime))
+        Stop(over);
     g_camera = { QuatFromBasis(right, up, back), pos, right, up, back };
 
     const int camera = GetConfig().replayCamera;
@@ -630,6 +640,23 @@ void EndFrame(double contentTime, bool captured)
 }
 
 Mode Current() { return g_mode; }
+
+bool LooksLikeReplay(const double view[16], double contentTime)
+{
+    Detection& d = g_lookDetect;
+    Vec3 right, up, back, pos;
+    if (!Decompose(view, right, up, back, pos)) {
+        d = Detection{};
+        return false;
+    }
+    if (d.haveLast && contentTime - d.lastTime > 0.25)
+        d = Detection{};  // (no camera for a while: as EndFrame's "no camera" stops a replay)
+    if (Detect(d, right, back, pos, contentTime))
+        d.active = false;
+    if (!d.active && d.signatureTime >= kEnterSeconds)
+        d.active = true;
+    return d.active;
+}
 
 double AngleToCameraDeg(const double view[16])
 {

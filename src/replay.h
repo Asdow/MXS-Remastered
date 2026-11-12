@@ -52,6 +52,11 @@ void EndFrame(double contentTime, bool captured);
 // As of the last Update().
 Mode Current();
 
+// With the first person mod off (Update() isn't called then): whether view, the frame's raw
+// camera, is the game's replay camera, told the same way Update() tells it. Logs nothing and
+// changes nothing Update() or Current() use. One call a frame.
+bool LooksLikeReplay(const double view[16], double contentTime);
+
 // For the sky, drawn before Update(): degrees between view's rotation and the replay camera's
 // (-1 if view isn't a rotation), and the rotation-only correction this frame will get.
 double AngleToCameraDeg(const double view[16]);

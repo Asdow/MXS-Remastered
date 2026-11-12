@@ -1069,6 +1069,58 @@ void RotationCorrectionOf(const Frame& f, double out[16])
     }
 }
 
+// ---- Look only: the look keys with the first person mod off --------------------------------
+// Just the head's turn, on the game's own camera: about WorldUp, as the full camera turns it,
+// the eye where the game put it. Nothing else of the mod runs (no smoothing, levelling, neck or
+// bike tracking), and looking ahead the game's view is left exactly as it is.
+struct LookOnly {
+    bool   valid    = false;
+    Quat   prevRawRot;      // the game camera's rotation last frame (for the sky's preview)
+    double headTurn = 0;    // rad, + = right, eased at Config::lookTurnSpeed
+};
+LookOnly g_lookOnly;
+double   g_lookTurn = 0;  // the look keys' turn in the last frame's view (rad, + = right): LookTurn()
+
+// Steps s by dt toward where the rider is asked to look. False if view isn't a camera.
+bool StepLookOnly(LookOnly& s, const double view[16], double dt, Vec3& right, Vec3& up, Vec3& back)
+{
+    double scale;
+    if (!DecomposeView(view, right, up, back, scale))
+        return false;
+    if (!s.valid) {  // (from straight ahead: it eases into a look already held, never jumps)
+        s = LookOnly{};
+        s.valid = true;
+    }
+    s.prevRawRot = QuatFromBasis(right, up, back);
+    const Config& cfg = GetConfig();
+    const double side = cfg.lookSideDeg * kDegToRad;
+    const double aim = g_look == Look::Left  ? -side
+                     : g_look == Look::Right ? side
+                     : g_look == Look::Back  ? (s.headTurn < 0 ? -kPi : kPi)
+                     : 0.0;
+    s.headTurn += (aim - s.headTurn) * LowPassAlpha(cfg.lookTurnSpeed, dt);
+    if (aim == 0 && std::fabs(s.headTurn) < 1e-4)  // (back ahead: the game's view, untouched)
+        s.headTurn = 0;
+    return true;
+}
+
+// The eye-space correction that turns the game camera (axes right, up, back) by s's head turn;
+// false (out untouched) while it looks straight ahead.
+bool LookOnlyCorrectionOf(const LookOnly& s, Vec3 right, Vec3 up, Vec3 back, double out[16])
+{
+    if (s.headTurn == 0)
+        return false;
+    const Config& cfg = GetConfig();
+    const Vec3 worldUp{ cfg.worldUp[0], cfg.worldUp[1], cfg.worldUp[2] };
+    Frame f;
+    f.rot = Normalize(AxisAngle(worldUp, -s.headTurn) * QuatFromBasis(right, up, back));
+    f.rawRight = right;
+    f.rawUp = up;
+    f.rawBack = back;
+    RotationCorrectionOf(f, out);  // (a rotation about the eye: no translation)
+    return true;
+}
+
 bool FinishFrame(const double view[16], double correction[16])
 {
     const Config& cfg = GetConfig();
@@ -1261,7 +1313,11 @@ bool FinishFrame(const double view[16], double correction[16])
 
 }  // namespace
 
-void Reset() { g_model.state.valid = false; }
+void Reset()
+{
+    g_model.state.valid = false;
+    g_lookOnly.valid = false;
+}
 
 const Telemetry& LastTelemetry() { return g_telemetry; }
 
@@ -1340,10 +1396,12 @@ bool Update(const double view[16], double correction[16])
     const double dt = StepDt(gap);
     if (gap)
         g_model.state.valid = false;  // paused, alt-tabbed or loading: resync rather than integrate
+    g_lookOnly.valid = false;  // (the mod is on: the look-only head starts ahead next time)
     Frame f;
     if (!Orient(g_model, view, dt, true, f))
         return false;
     g_frame = f;
+    g_lookTurn = g_model.state.headTurn;
     g_lastCommitTime = g_contentTime;
     g_lastCommitWallTime = NowSeconds();
     if (!FinishFrame(view, correction))
@@ -1351,6 +1409,93 @@ bool Update(const double view[16], double correction[16])
     g_frame.telemetry.rawIntervalMs = g_rawIntervalMs;
     g_telemetry = g_frame.telemetry;
     return true;
+}
+
+bool LookOnlyUpdate(const double view[16], double correction[16])
+{
+    bool gap;
+    const double dt = StepDt(gap);
+    if (gap)
+        g_lookOnly.valid = false;  // paused, alt-tabbed or loading: back to straight ahead
+    Vec3 right, up, back;
+    if (!StepLookOnly(g_lookOnly, view, dt, right, up, back))
+        return false;
+    g_lastCommitTime = g_contentTime;
+    g_lastCommitWallTime = NowSeconds();
+    // The full camera starts from the raw camera again when the mod comes back on.
+    g_model.state.valid = false;
+    g_frame.valid = false;
+    g_lookTurn = g_lookOnly.headTurn;
+    return LookOnlyCorrectionOf(g_lookOnly, right, up, back, correction);
+}
+
+double LookTurn() { return g_lookTurn; }
+
+void OrbitLook(const double view[16], const double rider[3], double correction[16])
+{
+    const double turn = g_lookTurn;
+    if (turn == 0)
+        return;
+    const Config& cfg = GetConfig();
+    // In the raw camera's eye space (V's rows are its axes; a uniform scale cancels out).
+    const auto Rot = [](const double m[16], const double v[3], double out[3]) {  // m's 3x3 times v
+        for (int r = 0; r < 3; ++r)
+            out[r] = m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2];
+    };
+    double up[3];
+    Rot(view, cfg.worldUp, up);
+    const double upLength = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    if (upLength < 1e-9)
+        return;
+    for (double& c : up)
+        c /= upLength;
+    // The drawn eye: the point C sends to the origin, -R_C^T t_C.
+    double eye[3];
+    for (int r = 0; r < 3; ++r)
+        eye[r] = -(correction[r * 4] * correction[12] + correction[r * 4 + 1] * correction[13] +
+                   correction[r * 4 + 2] * correction[14]);
+    // Round the rider: the same turn as the view's (AxisAngle(WorldUp, -turn)), by Rodrigues.
+    const double a = -turn, cosA = std::cos(a), sinA = std::sin(a);
+    const double v[3] = { eye[0] - rider[0], eye[1] - rider[1], eye[2] - rider[2] };
+    const double along = up[0] * v[0] + up[1] * v[1] + up[2] * v[2];
+    const double cross[3] = { up[1] * v[2] - up[2] * v[1], up[2] * v[0] - up[0] * v[2], up[0] * v[1] - up[1] * v[0] };
+    double moved[3];
+    for (int r = 0; r < 3; ++r)
+        moved[r] = rider[r] + v[r] * cosA + cross[r] * sinA + up[r] * along * (1.0 - cosA);
+    // C's translation puts the eye there: t = -R_C * eye.
+    double t[3];
+    Rot(correction, moved, t);
+    correction[12] = -t[0];
+    correction[13] = -t[1];
+    correction[14] = -t[2];
+}
+
+bool LookOnlyPreview(const double view[16], double out[16])
+{
+    bool gap;
+    const double dt = StepDt(gap);
+    LookOnly copy = g_lookOnly;
+    if (gap)
+        copy.valid = false;
+    Vec3 right, up, back;
+    if (!StepLookOnly(copy, view, dt, right, up, back))
+        return false;
+    if (!LookOnlyCorrectionOf(copy, right, up, back, out)) {
+        for (int i = 0; i < 16; ++i)
+            out[i] = (i % 5 == 0) ? 1.0 : 0.0;
+    }
+    return true;
+}
+
+double LookOnlyAngleToLastDeg(const double view[16])
+{
+    Vec3 right, up, back;
+    double scale;
+    if (!DecomposeView(view, right, up, back, scale))
+        return -1;
+    if (!g_lookOnly.valid)
+        return 0;
+    return AngleBetween(g_lookOnly.prevRawRot, QuatFromBasis(right, up, back)) * kRadToDeg;
 }
 
 }  // namespace camera

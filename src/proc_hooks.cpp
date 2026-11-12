@@ -547,6 +547,12 @@ bool HasTranslation(const GLfloat* m)
     return std::fabs(m[12]) + std::fabs(m[13]) + std::fabs(m[14]) > 1e-3f;
 }
 
+// The first person mod off with Controller look on: the look keys still turn the game's own
+// camera (camera::LookOnlyUpdate), and nothing else of the mod touches it.
+bool LookOnly(const Config& cfg) { return !cfg.enabled && cfg.controllerLook; }
+// Whether the frame's view may be corrected at all (the mod, or the look keys alone).
+bool Correcting(const Config& cfg) { return cfg.enabled || LookOnly(cfg); }
+
 // A rotation-only view drawn before the camera is known this frame: if it is the closest yet to
 // the last camera rotation (the sky), preview this frame's orientation from it. Anything further
 // off - clouds, a sun billboard, a reflection pass - takes whatever correction is current.
@@ -554,8 +560,10 @@ void ConsiderSkyRotation(const double view[16])
 {
     if (g_camera.capturedThisFrame || !g_camera.haveCorrection)
         return;
-    const bool replay = replay::Corrects(replay::Current());
-    const double angle = replay ? replay::AngleToCameraDeg(view) : camera::AngleToLastCameraDeg(view);
+    const bool lookOnly = LookOnly(GetConfig());
+    const bool replay = !lookOnly && replay::Corrects(replay::Current());
+    const double angle = replay ? replay::AngleToCameraDeg(view)
+                       : lookOnly ? camera::LookOnlyAngleToLastDeg(view) : camera::AngleToLastCameraDeg(view);
     if (g_camera.havePreview && std::fabs(angle - g_camera.skyAngle) < 0.01)
         return;  // the same rotation again (u_envmat, then the sky): already previewed
     if (angle < 0 || angle > kMaxSkyAngleDeg || (g_camera.havePreview && angle >= g_camera.skyAngle)) {
@@ -563,7 +571,10 @@ void ConsiderSkyRotation(const double view[16])
         DumpCall("^ rotation only, %.1f deg from the camera: not taken as the sky", angle);
         return;
     }
-    if (replay ? replay::PreviewRotation(view, g_camera.rotationOnly) : camera::PreviewRotation(view, g_camera.rotationOnly)) {
+    const bool previewed = replay ? replay::PreviewRotation(view, g_camera.rotationOnly)
+                         : lookOnly ? camera::LookOnlyPreview(view, g_camera.rotationOnly)
+                         : camera::PreviewRotation(view, g_camera.rotationOnly);
+    if (previewed) {
         g_camera.havePreview = true;
         g_camera.skyAngle = angle;
         ++g_camera.previews;
@@ -607,13 +618,23 @@ double LookAwayDeg(const double view[16])
     return std::acos(std::fmax(-1.0, std::fmin(1.0, cosine))) * 180.0 / 3.14159265358979;
 }
 
+// Third person: the look keys swing the camera round your rider (camera::OrbitLook), so you stay
+// in view: looking back, the camera is out in front of you, facing you.
+void OrbitOwnRider(const double view[16], double correction[16])
+{
+    double rider[3];
+    if (camera::LookTurn() != 0 && postfx::OwnRiderForLook(rider))
+        camera::OrbitLook(view, rider, correction);
+}
+
 // Returns the matrix to actually upload: value itself, or scratch holding C * value.
 const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, GLboolean transpose,
                                 const GLfloat* value, GLfloat* scratch)
 {
     const Config& cfg = GetConfig();
-    if (!cfg.enabled || !value || count != 1 || transpose)
+    if (!Correcting(cfg) || !value || count != 1 || transpose)
         return value;
+    const bool lookOnly = LookOnly(cfg);
 
     AcquireSRWLockShared(&g_lock);
     const bool isModelview = g_modelviewUniforms.count(UniformKey(program, location)) != 0;
@@ -631,9 +652,23 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
         for (int i = 0; i < 16; ++i)
             view[i] = value[i];
         g_camera.capturedThisFrame = true;
-        const replay::Mode before = replay::Current();
-        const replay::Mode mode = replay::Update(view, camera::ContentTime(), g_camera.correction, g_camera.rotationOnly);
-        if (mode != replay::Mode::Off) {
+        if (lookOnly) {
+            // The mod off: the look keys alone turn the game's camera (never a replay's).
+            g_camera.haveCorrection = !replay::LooksLikeReplay(view, camera::ContentTime()) &&
+                                      camera::LookOnlyUpdate(view, g_camera.correction);
+            if (g_camera.haveCorrection) {
+                std::copy(g_camera.correction, g_camera.correction + 16, g_camera.rotationOnly);
+                OrbitOwnRider(view, g_camera.correction);  // (third person; the rotation-only copy stays put)
+                NoteCorrectedCamera(view);
+                g_ground.awayDeg = LookAwayDeg(view);
+                g_terrain.lookingAway = g_ground.awayDeg > kLookAwayFillDeg;
+                DumpCall("^ CAMERA  look only (first person mod off): %.0f deg from the game camera", g_ground.awayDeg);
+            } else {
+                DumpCall("^ CAMERA  look only (first person mod off): looking ahead, untouched");
+            }
+        } else if (const replay::Mode before = replay::Current(),
+                   mode = replay::Update(view, camera::ContentTime(), g_camera.correction, g_camera.rotationOnly);
+                   mode != replay::Mode::Off) {
             // A replay: the helmet cam and the bike tracker sit it out.
             if (before == replay::Mode::Off)
                 bike::Reset();
@@ -648,6 +683,7 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
             g_camera.haveCorrection = camera::Update(view, g_camera.correction) &&
                                       camera::RotationCorrection(g_camera.rotationOnly);
             if (g_camera.haveCorrection) {
+                OrbitOwnRider(view, g_camera.correction);  // (third person)
                 NoteCorrectedCamera(view);
                 g_ground.awayDeg = LookAwayDeg(view);
                 g_terrain.lookingAway = g_ground.awayDeg > kLookAwayFillDeg;
@@ -673,7 +709,7 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
         for (int i = 0; i < 16; ++i)
             view[i] = value[i];
         ConsiderSkyRotation(view);
-    } else if (g_camera.capturedThisFrame && replay::Current() == replay::Mode::Off) {
+    } else if (g_camera.capturedThisFrame && !lookOnly && replay::Current() == replay::Mode::Off) {
         bike::Observe(program, value);  // raw View * Model: one of the candidates for the bike
     }
     if (!g_camera.haveCorrection)
@@ -1437,7 +1473,7 @@ const GLfloat* CorrectLight(GLint location, GLsizei count, const GLfloat* value,
     GLfloat timed[kMaxLights * 4];
     if (postfx::OverrideLight(value, count, components, timed))
         value = timed;
-    if (!GetConfig().enabled || !g_camera.haveCorrection) {
+    if (!Correcting(GetConfig()) || !g_camera.haveCorrection) {
         if (value != timed)
             return value;
         std::copy(timed, timed + count * components, scratch);
@@ -1462,7 +1498,7 @@ const GLfloat* CorrectLight(GLint location, GLsizei count, const GLfloat* value,
 // frame's camera rotation. Ours: (C R)^T = R^T C^T = u_envmat * C^T.
 const GLfloat* CorrectEnvMatrix(GLint location, GLsizei count, GLboolean transpose, const GLfloat* value, GLfloat* scratch)
 {
-    if (!GetConfig().enabled || !value || count != 1 || transpose)
+    if (!Correcting(GetConfig()) || !value || count != 1 || transpose)
         return value;
     AcquireSRWLockShared(&g_lock);
     const bool isEnv = g_envUniforms.count(UniformKey(g_program, location)) != 0;
@@ -1727,7 +1763,7 @@ void FinishTerrainPass()
     if (g_variants.empty()) {
         g_ground.note = "no-variants";
         DumpCall("^ TERRAIN  can't be filled in (indices from client memory, or too many draw calls per patch)");
-    } else if (!GetConfig().enabled || !g_camera.haveCorrection) {
+    } else if (!Correcting(GetConfig()) || !g_camera.haveCorrection) {
         g_ground.note = "off";
     } else if (!g_terrain.haveEye) {
         g_ground.note = "no-eye";
@@ -3974,15 +4010,18 @@ bool EndShaderFrame()
     g_terrain.haveEye = false;
     g_terrain.lookingAway = false;
     const bool captured = g_camera.capturedThisFrame;
-    if (captured && replay::Current() == replay::Mode::Off)
+    // The mod's own camera ran this frame (with the mod off the look keys may still have turned
+    // the game's: captured, but no bike tracker, replay camera or camera trace).
+    const bool modCamera = captured && GetConfig().enabled;
+    if (modCamera && replay::Current() == replay::Mode::Off)
         bike::EndFrame(camera::GameTime(), camera::FrameInterval());
     if (IsDumping())
         Log("  shader path: camera %s, %d '%s' uploads corrected, %d sky preview(s), %d other rotation-only draw(s)",
             captured ? "found" : "NOT found", g_camera.correctedThisFrame, GetConfig().modelviewUniform,
             g_camera.previews, g_camera.otherRotations);
-    TraceFrame(captured);
+    TraceFrame(modCamera);
     g_ground = GroundStats{};
-    replay::EndFrame(camera::ContentTime(), captured);
+    replay::EndFrame(camera::ContentTime(), modCamera);
     camera::FrameTick();
     // The game has no look keys: the controller (the binds on the KEYBINDS tab, the d-pad unless
     // changed) turns the head for the next frame. Polled while the menu is open too, for binding.
@@ -4000,6 +4039,13 @@ bool EndShaderFrame()
         }
     }
     camera::SetLook(look);
+    // The mod off, a look just asked for: the next frame's sky, drawn before its camera is
+    // known, is to turn with it from its first frame, so a correction (none yet) is on.
+    if (LookOnly(lookCfg) && look != camera::Look::Ahead && captured && !g_camera.haveCorrection) {
+        for (int i = 0; i < 16; ++i)
+            g_camera.correction[i] = g_camera.rotationOnly[i] = (i % 5 == 0) ? 1.0 : 0.0;
+        g_camera.haveCorrection = true;
+    }
     // The brake squeal (brake.h): the brakes just read, your speed as postfx follows your rider.
     {
         double speed = 0;

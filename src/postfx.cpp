@@ -1455,6 +1455,7 @@ struct OwnRider {
     double torsoWorld[16] = {};    // carries the head (and the helmet the game draws on it)
     bool   haveJoints = false;     // this frame: where its arms and legs join the body (world), left
     Vec3   shoulder[2], hip[2];    // and right, from the limb bones (see FindJoints)
+    Vec3   inEye;                  // position in the game camera's eye space (the raw view's)
 };
 OwnRider g_rider;
 void PartWorld(const SkeletonRecord& rec, const double world[16], int b, double out[16]);
@@ -1674,6 +1675,13 @@ void FindOwnRider(double dt)
     r.last = position;
     r.haveLast = true;
     r.position = position;
+    r.inEye = TransformPoint(g_frame.raw, position);
+    // First person: the camera is at your rider's head (its nearest bone ~0.7 m away); third
+    // person: metres behind. Hysteresis, so it never flips back and forth.
+    if (r.nearestBone > 2.0)
+        g_thirdPerson = true;
+    else if (r.nearestBone < 1.4)
+        g_thirdPerson = false;
     // Which way the bike points, level: the way your rider's torso faces (known standing still,
     // and it turns with the bike in slides), or else the way it's travelling. Never up or down:
     // a drop onto the start gate or a landing would aim the light at the ground.
@@ -1986,14 +1994,7 @@ void UpdateBike(double dt)
     double invRaw[16];
     if (!g_frame.haveView || !AffineInverse(g_frame.raw, invRaw))
         return;
-    // First person: the camera is at your rider's head (its nearest bone ~0.7 m away); third
-    // person: metres behind. Hysteresis, so it never flips back and forth.
-    if (g_rider.seen) {
-        if (g_rider.nearestBone > 2.0)
-            g_thirdPerson = true;
-        else if (g_rider.nearestBone < 1.4)
-            g_thirdPerson = false;
-    }
+    // (g_thirdPerson: set as your rider is found, FindOwnRider.)
     const bike::Pose& pose = bike::Current();
     if (cfg.enabled && !g_thirdPerson && pose.tracked) {
         MatMul(invRaw, pose.cameraSpace, g_bikeNow.model);
@@ -6588,6 +6589,17 @@ void NoteRiderPartCast(bool piece)
     (piece ? g_riderPieceCast : g_riderPartCast) = true;
 }
 
+bool OwnRiderForLook(double inEye[3])
+{
+    // (Seen in the last frame drawn: after a pause or a menu in between it isn't trusted.)
+    if (!g_thirdPerson || !g_rider.seen || Seconds() - g_riderTime > 0.25)
+        return false;
+    inEye[0] = g_rider.inEye.x;
+    inEye[1] = g_rider.inEye.y;
+    inEye[2] = g_rider.inEye.z;
+    return true;
+}
+
 bool GetOwnAnchors(OwnAnchors& out)
 {
     out = OwnAnchors{};
@@ -6774,7 +6786,8 @@ void FrameEnd(bool apply)
     g_castNowMsTraced = g_castNowMs;
     g_castNowMs = 0;
     // The dab indicator's rider, when the effects didn't look for it this frame (shaders off).
-    if ((cfg.dabIndicator || cfg.brakeSqueal > 0.0) && g_frame.haveView && !g_riderThisFrame && LoadGL()) {
+    if ((cfg.dabIndicator || cfg.brakeSqueal > 0.0 || cfg.controllerLook) && g_frame.haveView && !g_riderThisFrame &&
+        LoadGL()) {
         const double now = Seconds();
         const double dt = g_riderTime > 0 ? Clamp(now - g_riderTime, 1.0 / 1000.0, 0.25) : 1.0 / 60.0;
         FindOwnRider(dt);

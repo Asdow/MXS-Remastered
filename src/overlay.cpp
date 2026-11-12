@@ -1113,7 +1113,8 @@ const RowDef kRows[] = {
     // ======== FIRST PERSON ========
     Toggle(0, "CAMERA",          "First person mod",     &Config::enabled)
         .Help("The first-person camera mod (its key is on the KEYBINDS tab). Off gives you the game's own "
-              "cameras and replays untouched, and only the shaders stay on.")
+              "cameras and replays untouched, and only the shaders stay on (and Controller look, if it's "
+              "on: it still turns the game's camera).")
         .Col(0),
     Choice(0, nullptr,           "Camera",               &Config::customCamera, "GAME", "CUSTOM")
         .Help("GAME adjusts the game's own first-person camera (and its 1st Person Angle). CUSTOM builds "
@@ -1158,7 +1159,8 @@ const RowDef kRows[] = {
     Toggle(0, "LOOKING AROUND",  "Controller look",      &Config::controllerLook)
         .Help("Look around with a controller: the d-pad's left / right to look sideways and down to "
               "look behind, unless you bind other buttons, paddles or stick directions on the KEYBINDS "
-              "tab. Release to look ahead again."),
+              "tab. Release to look ahead again. It works with the First person mod off too: then it "
+              "only turns the game's own camera (not in replays)."),
     Slider(0, nullptr,           "Side look angle",      &Config::lookSideDeg,      30.0,   90.0, 1.0, 1.0,   0, "\xB0")
         .Help("How far the head turns when looking left / right with the controller."),
     Slider(0, nullptr,           "Turn speed",           &Config::lookTurnSpeed,    2.0,   40.0, 1.0, 1.0,   0, "")
@@ -2177,7 +2179,10 @@ bool RowInactive(const RowDef& def, const Config& cfg)
 {
     if (def.locked || (def.customOnly && !cfg.customCamera))
         return true;
-    if ((def.tab == kTabFirstPerson || def.tab == kTabReplay) && !cfg.enabled && def.flag != &Config::enabled)
+    // (Controller look and its angle and speed work with the mod off too.)
+    const bool lookRow = def.flag == &Config::controllerLook || def.number == &Config::lookSideDeg ||
+                         def.number == &Config::lookTurnSpeed;
+    if ((def.tab == kTabFirstPerson || def.tab == kTabReplay) && !cfg.enabled && def.flag != &Config::enabled && !lookRow)
         return true;  // the first person mod is off (it does the replay cameras too)
     if (def.tab == kTabReplay && def.number) {  // placement for a replay camera that isn't the one chosen
         const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||

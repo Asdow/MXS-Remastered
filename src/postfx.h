@@ -99,6 +99,12 @@ struct OwnAnchors {
 };
 bool GetOwnAnchors(OwnAnchors& out);
 
+// For the look keys in third person (they swing the camera round your rider): true while the
+// game's camera is in third person and your rider was seen last frame, with the middle of your
+// rider and bike in that frame's raw camera eye space (the chase camera follows you, so it holds
+// for this frame's camera too).
+bool OwnRiderForLook(double inEye[3]);
+
 // The game drew wheel i's own draw call (kept while it was yours) near your rider this frame: no
 // stand-in tire goes in the shadow map beside it (0 rear, 1 front).
 void NoteWheelDrawnByGame(int i);

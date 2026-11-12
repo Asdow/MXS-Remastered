@@ -101,6 +101,27 @@ double AngleToLastCameraDeg(const double view[16]);
 // Rotation-only correction of the last Update().
 bool RotationCorrection(double out[16]);
 
+// With the first person mod off, in place of Update(): only the look keys (SetLook) turn the
+// game's own camera, about WorldUp, the eye left where the game put it. correction receives the
+// eye-space rotation (it has no translation: it is the rotation-only correction too). False -
+// the frame left untouched - while the head looks straight ahead, or if view isn't a camera.
+bool LookOnlyUpdate(const double view[16], double correction[16]);
+// The same for the sky, drawn before the camera, without advancing anything; and the angle to
+// the last frame's game camera, as PreviewRotation() / AngleToLastCameraDeg() for Update().
+bool LookOnlyPreview(const double view[16], double out[16]);
+double LookOnlyAngleToLastDeg(const double view[16]);
+
+// How far the look keys turn the view this frame (rad, + = right), as of the last Update() or
+// LookOnlyUpdate(): their share of the turn about WorldUp (look to apex not included).
+double LookTurn();
+
+// Third person: moves the eye of correction (C, eye space: C * view is what's drawn, already turned
+// by LookTurn() about WorldUp) round the vertical through rider (a point in view's eye space) by
+// the same turn, so the camera swings round your rider instead of turning where it stands: looking
+// back it's out in front of you, facing you, and you stay where you were on screen. The rotation
+// (and so the sky's) is unchanged.
+void OrbitLook(const double view[16], const double rider[3], double correction[16]);
+
 const Telemetry& LastTelemetry();
 
 }  // namespace camera
