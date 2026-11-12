@@ -902,9 +902,22 @@ void main()
             // facing it: the normal read from the depth is noisy on small curved things (a rider's gear),
             // and pixel by pixel it flipped in and out of the map's shadow - pixelated patches.
             float towards = dot(nView, u_lightView);
-            float facing = ground > 0.5 ? step(1e-6, towards) : smoothstep(0.0, 0.2, towards);
-            if (u_shadowMapOn > 0.5 && facing > 0.0)
-                lit = min(lit, mix(1.0, MapShadow(p, nView, ground), facing));
+            if (u_shadowMapOn > 0.5) {
+                if (ground > 0.5) {
+                    // The ground: its own light is baked in by the game, not turned to this sun, so
+                    // ground turned away from the sun is put in shade here, eased in as it turns edge-on.
+                    // (Cut at edge-on, as this was, a berm face edge-on to a low sun behind a wall had
+                    // its noisy normal flip pixel by pixel between the wall's shadow and full sun: a
+                    // speckled patch where the shadow should have been solid.)
+                    float sunSide = smoothstep(-0.02, 0.12, towards);
+                    float shade = sunSide > 0.0 ? MapShadow(p, nView, ground) : 0.0;
+                    lit = min(lit, sunSide * shade);
+                } else {
+                    float facing = smoothstep(0.0, 0.2, towards);
+                    if (facing > 0.0)
+                        lit = min(lit, mix(1.0, MapShadow(p, nView, ground), facing));
+                }
+            }
             ao = mix(1.0, ao, u_ao);
             albedo = c * ao;
             // (Overcast in the snow: the sun's shadows fade, the light comes from the whole sky.)

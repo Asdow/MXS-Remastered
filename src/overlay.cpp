@@ -1,19 +1,23 @@
 // overlay.cpp
 //   In-game settings panel ("MXS Remastered"). Config::menuKey (E by default) opens and closes it.
-//   Tabs: FIRST PERSON, GRAPHICS, REPLAY (up to three columns of rows each) and KEYBINDS.
+//   Black and red: the tabs down the left (with a search box over them that finds a setting on
+//   any tab), the logo and the presets along the top, the current tab's settings in one scrolling
+//   list in a box, and the buttons along the bottom.
 //
 //   Rendering: the panel is drawn into the game's back buffer right before each swap, as one
 //   batch of textured triangles through a tiny shader of our own (GLSL 1.50, 1.30 or 1.20,
-//   whichever the context accepts). The texture is an atlas built once with GDI: Segoe UI
-//   glyphs, an anti-aliased disc (slider knobs, the toggle, rounded corners) and a solid white
-//   block (plain rectangles). Every piece of GL state touched is saved and restored, and all GL
-//   calls go straight to the driver, never through our own hooks.
+//   whichever the context accepts). The texture is an atlas built once with GDI: Segoe UI and
+//   Arial glyphs, an anti-aliased disc (slider knobs, rounded corners), a solid white block
+//   (plain rectangles) and the logo (logo_png.h, decoded with WIC). The settings list is clipped
+//   to its box with the scissor test. Every piece of GL state touched is saved and restored, and
+//   all GL calls go straight to the driver, never through our own hooks.
 //
 //   Input: keys and the mouse are polled each frame. While the panel is open the game window is
 //   subclassed so clicks and key presses stop reaching the game (releases still pass, so nothing
 //   gets stuck), and the system cursor is replaced by a drawn one.
 
 #include <windows.h>
+#include <wincodec.h>
 #include <GL/gl.h>
 #include <atomic>
 #include <cmath>
@@ -30,12 +34,16 @@
 #include "gamepad.h"
 #include "hooks.h"
 #include "log.h"
+#include "logo_png.h"
 #include "mathlib.h"
 #include "overlay.h"
 #include "postfx.h"
 #include "replay.h"
 #include "sound_packs.h"
 #include "texfilter.h"
+
+#pragma comment(lib, "windowscodecs.lib")  // (the logo's PNG: WIC)
+#pragma comment(lib, "ole32.lib")
 
 namespace mxcam {
 namespace {
@@ -76,6 +84,7 @@ struct GLApi {
     decltype(&::glEnable)             Enable;
     decltype(&::glDisable)            Disable;
     decltype(&::glViewport)           Viewport;
+    decltype(&::glScissor)            Scissor;
     decltype(&::glColorMask)          ColorMask;
     decltype(&::glGenTextures)        GenTextures;
     decltype(&::glDeleteTextures)     DeleteTextures;
@@ -135,6 +144,7 @@ bool LoadGL()
     ok = LoadFunction(g_gl.Enable, "glEnable") && ok;
     ok = LoadFunction(g_gl.Disable, "glDisable") && ok;
     ok = LoadFunction(g_gl.Viewport, "glViewport") && ok;
+    ok = LoadFunction(g_gl.Scissor, "glScissor") && ok;
     ok = LoadFunction(g_gl.ColorMask, "glColorMask") && ok;
     ok = LoadFunction(g_gl.GenTextures, "glGenTextures") && ok;
     ok = LoadFunction(g_gl.DeleteTextures, "glDeleteTextures") && ok;
@@ -180,7 +190,7 @@ bool LoadGL()
 // ===========================================================================
 struct SavedState {
     GLint     program = 0, vao = 0, arrayBuffer = 0, activeTexture = 0, texture = 0, sampler = 0, drawFramebuffer = 0;
-    GLint     viewport[4] = {};
+    GLint     viewport[4] = {}, scissorBox[4] = {};
     GLint     blendSrcRgb = 0, blendDstRgb = 0, blendSrcAlpha = 0, blendDstAlpha = 0, blendEqRgb = 0, blendEqAlpha = 0;
     GLboolean colorMask[4] = {};
     bool      blend = false, depthTest = false, cullFace = false, scissorTest = false, stencilTest = false, srgb = false;
@@ -199,6 +209,7 @@ void SaveState(SavedState& s)
     if (g_gl.BindFramebuffer)
         g_gl.GetIntegerv(kDrawFramebufferBinding, &s.drawFramebuffer);
     g_gl.GetIntegerv(GL_VIEWPORT, s.viewport);
+    g_gl.GetIntegerv(GL_SCISSOR_BOX, s.scissorBox);
     g_gl.GetIntegerv(kBlendSrcRgb, &s.blendSrcRgb);
     g_gl.GetIntegerv(kBlendDstRgb, &s.blendDstRgb);
     g_gl.GetIntegerv(kBlendSrcAlpha, &s.blendSrcAlpha);
@@ -234,6 +245,7 @@ void RestoreState(const SavedState& s)
     if (g_gl.BindFramebuffer)
         g_gl.BindFramebuffer(kDrawFramebuffer, s.drawFramebuffer);
     g_gl.Viewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
+    g_gl.Scissor(s.scissorBox[0], s.scissorBox[1], s.scissorBox[2], s.scissorBox[3]);
     g_gl.BlendFuncSeparate(s.blendSrcRgb, s.blendDstRgb, s.blendSrcAlpha, s.blendDstAlpha);
     g_gl.BlendEquationSeparate(s.blendEqRgb, s.blendEqAlpha);
     g_gl.ColorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
@@ -247,13 +259,123 @@ void RestoreState(const SavedState& s)
 }
 
 // ===========================================================================
-// Atlas: solid block + anti-aliased disc + glyphs
+// Atlas: solid block + anti-aliased disc + glyphs + the logo
 // ===========================================================================
 constexpr int kAtlasSize = 2048;
-constexpr int kDiscX = 16, kDiscY = 4, kDiscSize = 64;
-constexpr int kGlyphTop = kDiscY + kDiscSize + 8;
+constexpr int kDiscX = 64, kDiscY = 64, kDiscSize = 64;  // (well apart from the rest: its smaller copies stay clean)
+constexpr int kGlyphTop = kDiscY + kDiscSize + 64;
 
-enum FontId { kFontTitle, kFontBody, kFontValue, kFontSmall, kFontCount };
+// kFontTab: the tabs down the left. kFontButton: the buttons. kFontSection: a section's heading.
+// kFontLabel: a setting's name. kFontValue: its value (and the search box). kFontBody: the help.
+enum FontId { kFontTitle, kFontBody, kFontValue, kFontSmall, kFontTab, kFontButton, kFontSection, kFontLabel, kFontCount };
+
+// The logo in the atlas, at the size it's drawn (kLogoHeight at the atlas's scale).
+struct AtlasImage {
+    bool  valid = false;
+    float w = 0, h = 0, u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+};
+AtlasImage g_logo;
+constexpr float kLogoHeight = 52.0f;
+
+// The logo's PNG (logo_png.h), decoded once: RGBA, straight alpha.
+struct DecodedImage {
+    bool tried = false;
+    int  w = 0, h = 0;
+    std::vector<uint8_t> rgba;
+};
+DecodedImage g_logoImage;
+
+template <class T>
+void ReleaseCom(T*& p)
+{
+    if (p) {
+        p->Release();
+        p = nullptr;
+    }
+}
+
+bool DecodeLogo()
+{
+    DecodedImage& img = g_logoImage;
+    if (img.tried)
+        return !img.rgba.empty();
+    img.tried = true;
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);  // (RPC_E_CHANGED_MODE: COM is already up)
+    IWICImagingFactory* factory = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr))
+        hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr))
+        hr = stream->InitializeFromMemory(const_cast<BYTE*>(kLogoPng), static_cast<DWORD>(sizeof kLogoPng));
+    if (SUCCEEDED(hr))
+        hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+    if (SUCCEEDED(hr))
+        hr = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(hr))
+        hr = factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(hr))
+        hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+    UINT w = 0, h = 0;
+    if (SUCCEEDED(hr))
+        hr = converter->GetSize(&w, &h);
+    if (SUCCEEDED(hr) && w > 0 && h > 0 && w <= 4096 && h <= 4096) {
+        img.rgba.resize(static_cast<size_t>(w) * h * 4);
+        hr = converter->CopyPixels(nullptr, w * 4, static_cast<UINT>(img.rgba.size()), img.rgba.data());
+        if (FAILED(hr))
+            img.rgba.clear();
+        img.w = static_cast<int>(w);
+        img.h = static_cast<int>(h);
+    }
+    ReleaseCom(converter);
+    ReleaseCom(frame);
+    ReleaseCom(decoder);
+    ReleaseCom(stream);
+    ReleaseCom(factory);
+    if (init == S_OK || init == S_FALSE)
+        CoUninitialize();
+    if (img.rgba.empty())
+        Log("overlay: could not decode the logo (0x%08lX): the title is drawn as text", static_cast<unsigned long>(hr));
+    return !img.rgba.empty();
+}
+
+// The logo shrunk to w x h (area-averaged, through premultiplied alpha so its edges stay clean),
+// written into the atlas's RGBA at (x, y).
+void PlaceLogo(std::vector<uint8_t>& atlas, int x, int y, int w, int h)
+{
+    const DecodedImage& img = g_logoImage;
+    const double sx = static_cast<double>(img.w) / w, sy = static_cast<double>(img.h) / h;
+    for (int ty = 0; ty < h; ++ty) {
+        const double y0 = ty * sy, y1 = (ty + 1) * sy;
+        for (int tx = 0; tx < w; ++tx) {
+            const double x0 = tx * sx, x1 = (tx + 1) * sx;
+            double sum[4] = {}, area = 0;
+            for (int py = static_cast<int>(y0); py < static_cast<int>(std::ceil(y1)) && py < img.h; ++py) {
+                const double wy = std::fmin(y1, py + 1.0) - std::fmax(y0, static_cast<double>(py));
+                for (int px = static_cast<int>(x0); px < static_cast<int>(std::ceil(x1)) && px < img.w; ++px) {
+                    const double wx = std::fmin(x1, px + 1.0) - std::fmax(x0, static_cast<double>(px));
+                    const double weight = wx * wy;
+                    const uint8_t* p = &img.rgba[(static_cast<size_t>(py) * img.w + px) * 4];
+                    const double a = p[3] / 255.0;
+                    sum[0] += p[0] * a * weight;
+                    sum[1] += p[1] * a * weight;
+                    sum[2] += p[2] * a * weight;
+                    sum[3] += a * weight;
+                    area += weight;
+                }
+            }
+            uint8_t* out = &atlas[(static_cast<size_t>(y + ty) * kAtlasSize + x + tx) * 4];
+            const double alpha = area > 0 ? sum[3] / area : 0.0;
+            for (int c = 0; c < 3; ++c)
+                out[c] = static_cast<uint8_t>(sum[3] > 1e-6 ? Clamp(sum[c] / sum[3], 0.0, 255.0) + 0.5 : 0.0);
+            out[3] = static_cast<uint8_t>(Clamp(alpha, 0.0, 1.0) * 255.0 + 0.5);
+        }
+    }
+}
 
 struct Glyph {
     float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
@@ -288,48 +410,67 @@ bool BuildAtlas(GLuint texture, float scale)
         }
     }
 
-    // Glyphs, rendered white-on-black by GDI with grayscale anti-aliasing.
-    BITMAPINFO info = {};
-    info.bmiHeader.biSize        = sizeof info.bmiHeader;
-    info.bmiHeader.biWidth       = kAtlasSize;
-    info.bmiHeader.biHeight      = -kAtlasSize;  // top-down
-    info.bmiHeader.biPlanes      = 1;
-    info.bmiHeader.biBitCount    = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
+    // Glyphs: each drawn white-on-black by GDI at kSuper times its size, then shrunk into the atlas
+    // (averaged), so they're smooth at any size. (Drawn at their own size, GDI turns smoothing off
+    // for Arial at the small sizes the menu uses - the font asks it to - and the text came out jagged.)
+    constexpr int kSuper = 4;
     HDC dc = CreateCompatibleDC(nullptr);
-    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dc || !bitmap || !bits) {
-        if (bitmap) DeleteObject(bitmap);
-        if (dc) DeleteDC(dc);
+    if (!dc)
         return false;
-    }
-    HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
-    memset(bits, 0, kAtlasSize * kAtlasSize * 4);
     SetTextColor(dc, RGB(255, 255, 255));
     SetBkMode(dc, TRANSPARENT);
 
-    struct FontSpec { int pixels; int weight; };
+    struct FontSpec { int pixels; int weight; const wchar_t* face; };
     const FontSpec specs[kFontCount] = {
-        { 26, FW_BOLD },      // kFontTitle
-        { 16, FW_NORMAL },    // kFontBody
-        { 16, FW_SEMIBOLD },  // kFontValue
-        { 13, FW_SEMIBOLD },  // kFontSmall (smaller gets crunchy once GDI hinting kicks in)
+        { 26, FW_BOLD,     L"Segoe UI" },  // kFontTitle
+        { 16, FW_NORMAL,   L"Segoe UI" },  // kFontBody
+        { 16, FW_BOLD,     L"Arial" },     // kFontValue
+        { 13, FW_SEMIBOLD, L"Segoe UI" },  // kFontSmall
+        { 28, FW_BOLD,     L"Arial" },     // kFontTab
+        { 22, FW_BOLD,     L"Arial" },     // kFontButton
+        { 17, FW_BOLD,     L"Arial" },     // kFontSection
+        { 18, FW_NORMAL,   L"Arial" },     // kFontLabel
     };
     const int pad = 2;
     int penX = 0, penY = kGlyphTop, rowHeight = 0;
     bool fits = true;
 
     for (int f = 0; f < kFontCount && fits; ++f) {
-        HFONT font = CreateFontW(-static_cast<int>(std::lround(specs[f].pixels * scale)), 0, 0, 0, specs[f].weight,
+        HFONT font = CreateFontW(-static_cast<int>(std::lround(specs[f].pixels * scale * kSuper)), 0, 0, 0, specs[f].weight,
                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                 ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+                                 ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, specs[f].face);
         HGDIOBJ previousFont = SelectObject(dc, font);
         TEXTMETRICW metrics = {};
         GetTextMetricsW(dc, &metrics);
         Font& out = g_fonts[f];
         out = Font{};
-        out.lineHeight = static_cast<float>(metrics.tmHeight);
+        // Drawn this far down the scratch bitmap that the baseline falls on a texel's edge: the letters'
+        // feet stay sharp (not smeared over two texels).
+        const int lift = (kSuper - metrics.tmAscent % kSuper) % kSuper;
+        const int cellHeight = (metrics.tmHeight + lift + kSuper - 1) / kSuper;
+        out.lineHeight = static_cast<float>(cellHeight);
+
+        // A scratch bitmap a glyph big (at kSuper times), top-down.
+        const int scratchW = 2 * metrics.tmMaxCharWidth + 4 * pad * kSuper, scratchH = cellHeight * kSuper;
+        BITMAPINFO info = {};
+        info.bmiHeader.biSize        = sizeof info.bmiHeader;
+        info.bmiHeader.biWidth       = scratchW;
+        info.bmiHeader.biHeight      = -scratchH;
+        info.bmiHeader.biPlanes      = 1;
+        info.bmiHeader.biBitCount    = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bitmap || !bits) {
+            if (bitmap)
+                DeleteObject(bitmap);
+            SelectObject(dc, previousFont);
+            DeleteObject(font);
+            fits = false;
+            break;
+        }
+        HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
+        const uint8_t* pixels = static_cast<const uint8_t*>(bits);
 
         // Printable ASCII plus the degree sign and middle dot.
         for (int code = 32; code <= 0xB7 && fits; ++code) {
@@ -344,8 +485,8 @@ bool BuildAtlas(GLuint texture, float scale)
                 abc.abcB = static_cast<UINT>(size.cx);
                 abc.abcC = 0;
             }
-            const int cellWidth = static_cast<int>(abc.abcB > 0 ? abc.abcB : 1) + 2 * pad;
-            const int cellHeight = metrics.tmHeight;
+            const int ink = static_cast<int>(abc.abcB > 0 ? abc.abcB : 1);
+            const int cellWidth = (ink + kSuper - 1) / kSuper + 2 * pad;
             if (penX + cellWidth > kAtlasSize) {
                 penX = 0;
                 penY += rowHeight + pad;
@@ -355,7 +496,20 @@ bool BuildAtlas(GLuint texture, float scale)
                 fits = false;
                 break;
             }
-            TextOutW(dc, penX + pad - abc.abcA, penY, &ch, 1);
+            memset(bits, 0, static_cast<size_t>(scratchW) * scratchH * 4);
+            TextOutW(dc, pad * kSuper - abc.abcA, lift, &ch, 1);  // its ink from pad texels in
+            GdiFlush();
+            const int readW = cellWidth * kSuper < scratchW ? cellWidth * kSuper : scratchW;
+            for (int ty = 0; ty < cellHeight; ++ty) {
+                for (int tx = 0; tx < cellWidth; ++tx) {
+                    int sum = 0;
+                    for (int sy = ty * kSuper; sy < (ty + 1) * kSuper; ++sy)
+                        for (int sx = tx * kSuper; sx < (tx + 1) * kSuper && sx < readW; ++sx)
+                            sum += pixels[(static_cast<size_t>(sy) * scratchW + sx) * 4 + 2];  // (grey: any channel)
+                    coverage[static_cast<size_t>(penY + ty) * kAtlasSize + penX + tx] =
+                        static_cast<uint8_t>((sum + kSuper * kSuper / 2) / (kSuper * kSuper));
+                }
+            }
 
             Glyph& g  = out.glyphs[code];
             g.u0      = static_cast<float>(penX) / kAtlasSize;
@@ -364,8 +518,8 @@ bool BuildAtlas(GLuint texture, float scale)
             g.v1      = static_cast<float>(penY + cellHeight) / kAtlasSize;
             g.width   = static_cast<float>(cellWidth);
             g.height  = static_cast<float>(cellHeight);
-            g.bearing = static_cast<float>(abc.abcA - pad);
-            g.advance = static_cast<float>(abc.abcA + static_cast<int>(abc.abcB) + abc.abcC);
+            g.bearing = static_cast<float>(abc.abcA) / kSuper - pad;
+            g.advance = static_cast<float>(abc.abcA + static_cast<int>(abc.abcB) + abc.abcC) / kSuper;
             g.valid   = true;
 
             penX += cellWidth + pad;
@@ -374,17 +528,13 @@ bool BuildAtlas(GLuint texture, float scale)
         penX = 0;
         penY += rowHeight + pad;
         rowHeight = 0;
+        SelectObject(dc, previousBitmap);
+        DeleteObject(bitmap);
         SelectObject(dc, previousFont);
         DeleteObject(font);
     }
-    GdiFlush();
-
-    const uint8_t* pixels = static_cast<const uint8_t*>(bits);
-    for (int i = kGlyphTop * kAtlasSize; i < kAtlasSize * kAtlasSize; ++i)
-        coverage[i] = pixels[i * 4 + 2];  // grayscale anti-aliasing: any channel will do (BGRA)
-    SelectObject(dc, previousBitmap);
-    DeleteObject(bitmap);
     DeleteDC(dc);
+    const int logoTop = penY + 2;  // (under the glyphs)
     if (!fits)
         return false;
 
@@ -392,6 +542,22 @@ bool BuildAtlas(GLuint texture, float scale)
     std::vector<uint8_t> rgba(kAtlasSize * kAtlasSize * 4, 255);
     for (int i = 0; i < kAtlasSize * kAtlasSize; ++i)
         rgba[i * 4 + 3] = coverage[i];
+    // The logo, in colour (the only texels that aren't white).
+    g_logo = AtlasImage{};
+    if (DecodeLogo()) {
+        const int h = static_cast<int>(std::lround(kLogoHeight * scale));
+        const int w = static_cast<int>(std::lround(static_cast<double>(h) * g_logoImage.w / g_logoImage.h));
+        if (h > 4 && w + 2 <= kAtlasSize && logoTop + h + 2 <= kAtlasSize) {
+            PlaceLogo(rgba, 1, logoTop, w, h);
+            g_logo.valid = true;
+            g_logo.w = static_cast<float>(w);
+            g_logo.h = static_cast<float>(h);
+            g_logo.u0 = 1.0f / kAtlasSize;
+            g_logo.v0 = static_cast<float>(logoTop) / kAtlasSize;
+            g_logo.u1 = static_cast<float>(1 + w) / kAtlasSize;
+            g_logo.v1 = static_cast<float>(logoTop + h) / kAtlasSize;
+        }
+    }
 
     GLint alignment = 4, rowLength = 0, unpackBuffer = 0;
     g_gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -401,17 +567,41 @@ bool BuildAtlas(GLuint texture, float scale)
     g_gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     g_gl.BindBuffer(kPixelUnpackBuffer, 0);
 
+    // With its smaller copies (mipmaps): the disc drawn small (a slider's knob, a checkbox's corners, a
+    // line's round ends) is cut from a copy its own size, its edge smooth. (Shrunk from the full-size
+    // disc instead, the edge came out jagged.) Text and the logo are drawn at their own size: the
+    // full-size atlas.
     g_gl.BindTexture(GL_TEXTURE_2D, texture);
-    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kClampToEdge);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kClampToEdge);
     g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kAtlasSize, kAtlasSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    {
+        std::vector<uint8_t> level = rgba, smaller;
+        int size = kAtlasSize;
+        for (int mip = 1; size > 1; ++mip) {
+            const int half = size / 2;
+            smaller.assign(static_cast<size_t>(half) * half * 4, 0);
+            for (int y = 0; y < half; ++y)
+                for (int x = 0; x < half; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        const size_t i0 = (static_cast<size_t>(2 * y) * size + 2 * x) * 4 + c, row = static_cast<size_t>(size) * 4;
+                        smaller[(static_cast<size_t>(y) * half + x) * 4 + c] =
+                            static_cast<uint8_t>((level[i0] + level[i0 + 4] + level[i0 + row] + level[i0 + row + 4] + 2) / 4);
+                    }
+            g_gl.TexImage2D(GL_TEXTURE_2D, mip, GL_RGBA8, half, half, 0, GL_RGBA, GL_UNSIGNED_BYTE, smaller.data());
+            level.swap(smaller);
+            size = half;
+        }
+    }
 
     g_gl.BindBuffer(kPixelUnpackBuffer, unpackBuffer);
     g_gl.PixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
     g_gl.PixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     g_atlasScale = scale;
+    Log("overlay: font atlas built at scale %.2f (%d of %d rows used%s)", scale, g_logo.valid ? logoTop + static_cast<int>(g_logo.h) : logoTop,
+        kAtlasSize, g_logo.valid ? ", logo included" : ", no logo");
     return true;
 }
 
@@ -435,7 +625,7 @@ const char* const kFragmentBody =
     "IN vec2 v_uv;\n"
     "IN vec4 v_color;\n"
     "uniform sampler2D u_atlas;\n"
-    "void main() { FRAG_COLOR = vec4(v_color.rgb, v_color.a * TEX(u_atlas, v_uv).a); }\n";
+    "void main() { FRAG_COLOR = v_color * TEX(u_atlas, v_uv); }\n";  // (the atlas is white but for the logo)
 
 // The same shader in the three GLSL dialects a game context might accept (core 3.2+, 3.0/3.1,
 // and 2.x compatibility); the first one that compiles wins.
@@ -567,24 +757,113 @@ uint32_t Rgba(int r, int g, int b, float a)
 }
 uint32_t White(float a) { return Rgba(255, 255, 255, a); }
 uint32_t Gray(int level, float a = 1.0f) { return Rgba(level, level, level, a); }
-// Colour theme: dark navy-charcoal panels with a blue glow toward the bottom, a royal blue border,
-// royal blue for whatever is on or selected, white text.
-const uint32_t kPanelColor = Rgba(13, 17, 26, 0.96f);
-const uint32_t kPanelSolid = Rgba(13, 17, 26, 1.0f);
-const uint32_t kBlue       = Rgba(26, 100, 214, 1.0f);   // on, selected, primary
-const uint32_t kBlueHot    = Rgba(54, 130, 238, 1.0f);
-const uint32_t kBorder     = Rgba(30, 94, 206, 0.95f);   // panel outline
-const uint32_t kLine       = Rgba(36, 78, 148, 0.6f);    // separators, idle outlines
-const uint32_t kTrack      = Rgba(32, 86, 176, 1.0f);    // slider track
-const uint32_t kLabel      = Rgba(222, 228, 238, 1.0f);
-const uint32_t kDim        = Rgba(112, 124, 146, 1.0f);
-const uint32_t kSection    = Rgba(140, 164, 204, 1.0f);
+// Colour theme: black and red. Near-black panels with a red glow rising from the bottom left and a
+// red outline, red for whatever is on or selected, white text.
+const uint32_t kPanelColor = Rgba(14, 14, 16, 0.97f);
+const uint32_t kPanelSolid = Rgba(14, 14, 16, 1.0f);
+const uint32_t kBoxColor   = Rgba(8, 8, 10, 0.95f);       // the settings' box
+const uint32_t kBoxSolid   = Rgba(8, 8, 10, 1.0f);
+const uint32_t kAccent     = Rgba(206, 18, 26, 1.0f);    // on, selected, primary
+const uint32_t kAccentHot  = Rgba(236, 44, 50, 1.0f);
+const uint32_t kAccentDeep = Rgba(96, 6, 12, 1.0f);      // the far end of a red gradient
+const uint32_t kBorder     = Rgba(200, 16, 24, 0.95f);   // panel outline
+const uint32_t kLine       = Rgba(255, 255, 255, 0.10f); // separators
+const uint32_t kOutline    = Rgba(118, 118, 124, 1.0f);  // idle outlines: value boxes, checkboxes
+const uint32_t kTrack      = Rgba(168, 16, 24, 1.0f);    // slider track
+const uint32_t kLabel      = Rgba(232, 232, 234, 1.0f);
+const uint32_t kDim        = Rgba(116, 116, 122, 1.0f);
+const uint32_t kSection    = Rgba(236, 38, 44, 1.0f);    // section headings
+const uint32_t kInfo       = Rgba(150, 150, 156, 1.0f);  // the readout under the settings
 
 void Quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint32_t color)
 {
     const Vertex a{ x0, y0, u0, v0, color }, b{ x1, y0, u1, v0, color };
     const Vertex c{ x1, y1, u1, v1, color }, d{ x0, y1, u0, v1, color };
     g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+}
+
+// A quad with a colour at each corner (top left, top right, bottom right, bottom left), all from the
+// atlas's solid block.
+void ShadedQuad(float x0, float y0, float x1, float y1, uint32_t c00, uint32_t c10, uint32_t c11, uint32_t c01)
+{
+    const float u = 4.0f / kAtlasSize;
+    const Vertex a{ x0, y0, u, u, c00 }, b{ x1, y0, u, u, c10 };
+    const Vertex c{ x1, y1, u, u, c11 }, d{ x0, y1, u, u, c01 };
+    g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+}
+
+void GradientH(float x, float y, float w, float h, uint32_t left, uint32_t right)
+{
+    if (w > 0 && h > 0)
+        ShadedQuad(std::round(x), std::round(y), std::round(x + w), std::round(y + h), left, right, right, left);
+}
+
+void GradientV(float x, float y, float w, float h, uint32_t top, uint32_t bottom)
+{
+    if (w > 0 && h > 0)
+        ShadedQuad(std::round(x), std::round(y), std::round(x + w), std::round(y + h), top, top, bottom, bottom);
+}
+
+// A soft glow of (r, g, b): maxAlpha at (cx, cy), fading out over the radii.
+struct GlowSpec {
+    float cx, cy, rx, ry;
+    int   r, g, b;
+    float maxAlpha;
+    uint32_t At(float px, float py) const
+    {
+        const float dx = (px - cx) / rx, dy = (py - cy) / ry;
+        const float t = Clamp(1.0f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);
+        return Rgba(r, g, b, maxAlpha * t * t * (3.0f - 2.0f * t));
+    }
+};
+
+// The glow over a rectangle.
+void Glow(float x, float y, float w, float h, const GlowSpec& glow)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    const int nx = static_cast<int>(Clamp(w / 40.0f, 2.0f, 48.0f)), ny = static_cast<int>(Clamp(h / 40.0f, 1.0f, 32.0f));
+    const auto At = [&](float px, float py) { return glow.At(px, py); };
+    for (int j = 0; j < ny; ++j) {
+        const float y0 = y + h * j / ny, y1 = y + h * (j + 1) / ny;
+        for (int i = 0; i < nx; ++i) {
+            const float x0 = x + w * i / nx, x1 = x + w * (i + 1) / nx;
+            ShadedQuad(x0, y0, x1, y1, At(x0, y0), At(x1, y0), At(x1, y1), At(x0, y1));
+        }
+    }
+}
+
+// Parts of the batch drawn only inside a rectangle (the scrolled settings list): [begin, end).
+struct ClipRange {
+    size_t begin, end;
+    float  x, y, w, h;
+};
+std::vector<ClipRange> g_clips;
+
+void Segment(float x0, float y0, float x1, float y1, float w, uint32_t color);  // (with the dab indicator, below)
+
+// A chevron (an arrow head) centred at (x, y): dir 0 left, 1 right, 2 up, 3 down.
+void Chevron(float x, float y, float size, int dir, float width, uint32_t color)
+{
+    const float a = size;  // (the arrow is size wide, twice that tall)
+    switch (dir) {
+    case 0:
+        Segment(x + a * 0.5f, y - size, x - a * 0.5f, y, width, color);
+        Segment(x - a * 0.5f, y, x + a * 0.5f, y + size, width, color);
+        break;
+    case 1:
+        Segment(x - a * 0.5f, y - size, x + a * 0.5f, y, width, color);
+        Segment(x + a * 0.5f, y, x - a * 0.5f, y + size, width, color);
+        break;
+    case 2:
+        Segment(x - size, y + a * 0.5f, x, y - a * 0.5f, width, color);
+        Segment(x, y - a * 0.5f, x + size, y + a * 0.5f, width, color);
+        break;
+    default:
+        Segment(x - size, y - a * 0.5f, x, y + a * 0.5f, width, color);
+        Segment(x, y + a * 0.5f, x + size, y - a * 0.5f, width, color);
+        break;
+    }
 }
 
 void Rect(float x, float y, float w, float h, uint32_t color)
@@ -618,6 +897,25 @@ void RoundedRect(float x, float y, float w, float h, float r, uint32_t color)
     Rect(x + r, y, w - 2 * r, h, color);
     Rect(x, y + r, r, h - 2 * r, color);
     Rect(x + w - r, y + r, r, h - 2 * r, color);
+}
+
+// The glow over a rounded rectangle's inside (its rounded corners cut from the disc, as RoundedRect's).
+void GlowRounded(float x, float y, float w, float h, float r, const GlowSpec& glow)
+{
+    r = std::floor(std::fmin(r, std::fmin(w, h) * 0.5f));
+    Glow(x + r, y, w - 2 * r, h, glow);
+    Glow(x, y + r, r, h - 2 * r, glow);
+    Glow(x + w - r, y + r, r, h - 2 * r, glow);
+    const auto Corner = [&](float x0, float y0, float u0, float v0, float u1, float v1) {
+        const float x1 = x0 + r, y1 = y0 + r;
+        const Vertex a{ x0, y0, u0, v0, glow.At(x0, y0) }, b{ x1, y0, u1, v0, glow.At(x1, y0) };
+        const Vertex c{ x1, y1, u1, v1, glow.At(x1, y1) }, d{ x0, y1, u0, v1, glow.At(x0, y1) };
+        g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+    };
+    Corner(x, y, kDiscU0, kDiscV0, kDiscUM, kDiscVM);
+    Corner(x + w - r, y, kDiscUM, kDiscV0, kDiscU1, kDiscVM);
+    Corner(x, y + h - r, kDiscU0, kDiscVM, kDiscUM, kDiscV1);
+    Corner(x + w - r, y + h - r, kDiscUM, kDiscVM, kDiscU1, kDiscV1);
 }
 
 float LineHeight(FontId font) { return g_fonts[font].lineHeight; }
@@ -1164,6 +1462,23 @@ struct PanelState {
     int    renaming     = -1;
     std::string nameDraft;
     double renameStarted = 0;
+    // The search box: what's typed (query: the same, trimmed), whether keys type into it, and when
+    // typing started (the caret blinks from then).
+    std::string search, query;
+    bool   searchFocus  = false;
+    double searchStarted = 0;
+    // The settings list's scroll (pixels at the current scale), eased toward scrollTarget; the
+    // scrollbar's thumb while it's dragged; and what the list showed (a new tab or search: back to the top).
+    float  scroll       = 0;
+    float  scrollTarget = 0;
+    bool   scrollDrag   = false;
+    float  scrollGrab   = 0;
+    double scrollTime   = 0;
+    int    listTab      = -1;
+    std::string listQuery;
+    // The red bar behind the current tab, sliding to a tab when it's chosen (in tabs, from the top).
+    float  tabBar       = -1;
+    double tabBarTime   = 0;
 };
 PanelState g_panel;
 
@@ -1310,6 +1625,7 @@ struct Input {
     int   step = 0;  // -1 left, +1 right
     bool  activate = false, coarse = false;
     bool  rename = false;  // F2: rename the preset in use (with the presets focused)
+    float wheel = 0;       // mouse wheel notches since the last frame (+ away from you: up the list)
 
     bool Inside(float x, float y, float w, float h) const
     {
@@ -1351,6 +1667,7 @@ double Seconds()
 }
 
 std::atomic<bool> g_menuOpen{ false };  // read by the window procedure (the window's thread)
+std::atomic<int>  g_wheelDelta{ 0 };    // the mouse wheel while the menu is open (WHEEL_DELTA a notch)
 HWND    g_hookedWindow   = nullptr;
 WNDPROC g_previousProc   = nullptr;
 bool    g_windowUnicode  = true;
@@ -1374,6 +1691,8 @@ LRESULT CALLBACK PanelWindowProc(HWND window, UINT message, WPARAM wParam, LPARA
         }
     }
     if (g_menuOpen.load(std::memory_order_relaxed)) {
+        if (message == WM_MOUSEWHEEL)
+            g_wheelDelta += GET_WHEEL_DELTA_WPARAM(wParam);
         switch (message) {
         case WM_SETCURSOR:
             if (LOWORD(lParam) == HTCLIENT) {
@@ -1436,11 +1755,14 @@ void OpenPanel(HWND window)
 }
 
 void FinishRename(bool keep, double now);
+void ClearSearch();
 
 void ClosePanel()
 {
     if (g_panel.renaming >= 0)
         FinishRename(true, Seconds());
+    ClearSearch();
+    g_panel.scrollDrag = false;
     g_panel.open = false;
     g_panel.dragging = -1;
     g_panel.listening = -1;
@@ -1460,8 +1782,10 @@ Input ReadInput(HWND window, bool focus, int width, int height, double now)
     const bool f2    = PollKey(g_keys.f2, VK_F2, false, now);
     const bool wasDown = g_keys.mouse.down;
     PollKey(g_keys.mouse, VK_LBUTTON, false, now);
-    if (!focus)
+    if (!focus) {
+        g_wheelDelta = 0;
         return in;
+    }
 
     POINT cursor;
     if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor)) {
@@ -1476,6 +1800,7 @@ Input ReadInput(HWND window, bool focus, int width, int height, double now)
     in.step     = (right ? 1 : 0) - (left ? 1 : 0);
     in.activate = enter || space;
     in.rename   = f2;
+    in.wheel    = static_cast<float>(g_wheelDelta.exchange(0)) / WHEEL_DELTA;
     in.coarse   = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     return in;
 }
@@ -1513,10 +1838,12 @@ int PollNewKey()
     return pressed;
 }
 
-// ---- Renaming a preset ------------------------------------------------------------------------
+// ---- Typing: a preset's name, the search -------------------------------------------------------
 // Typed straight from the keyboard (the game's window may never be sent key messages), each key
-// made its character by the keyboard layout, with Shift, Caps Lock and AltGr. Enter keeps the name,
-// Esc (OverlayFrame) leaves it as it was, and clicking anywhere else keeps it.
+// made its character by the keyboard layout, with Shift, Caps Lock and AltGr. Renaming: Enter keeps
+// the name, Esc (OverlayFrame) leaves it as it was, and clicking anywhere else keeps it. Search:
+// Enter stops typing (the results stay), Esc clears it.
+constexpr int kSearchMax = 32;
 struct Typing {
     bool   down[256] = {};
     double repeatAt[256] = {};
@@ -1528,14 +1855,20 @@ bool TypingKey(int vk)
     return vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU && vk != VK_CAPITAL && !(vk >= VK_LSHIFT && vk <= VK_RMENU);
 }
 
+void PrimeTyping()
+{
+    for (int vk = VK_BACK; vk < 0xFF; ++vk)  // keys already held (the F2 that got here) aren't typed
+        g_typing.down[vk] = TypingKey(vk) && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
 void StartRename(int preset, double now)
 {
+    g_panel.searchFocus = false;
     g_panel.renaming = preset;
     g_panel.nameDraft = PresetName(preset);
     g_panel.renameStarted = now;
     g_panel.listening = -1;
-    for (int vk = VK_BACK; vk < 0xFF; ++vk)  // keys already held (the F2 that got here) aren't typed
-        g_typing.down[vk] = TypingKey(vk) && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    PrimeTyping();
     Log("panel: renaming preset %d", preset + 1);
 }
 
@@ -1552,8 +1885,35 @@ void FinishRename(bool keep, double now)
     SetStatus(text, now);
 }
 
-void TypeName(double now)
+void UpdateQuery()
 {
+    const std::string& s = g_panel.search;
+    const size_t a = s.find_first_not_of(' ');
+    g_panel.query = a == std::string::npos ? std::string() : s.substr(a, s.find_last_not_of(' ') - a + 1);
+}
+
+void StartSearch(double now)
+{
+    if (g_panel.renaming >= 0)
+        FinishRename(true, now);
+    g_panel.searchFocus = true;
+    g_panel.searchStarted = now;
+    g_panel.listening = -1;
+    PrimeTyping();
+}
+
+void ClearSearch()
+{
+    g_panel.search.clear();
+    g_panel.searchFocus = false;
+    UpdateQuery();
+}
+
+// The keys typed since the last call, into text (printable ASCII, at most maxLength characters):
+// true if Enter was pressed.
+bool TypeInto(std::string& text, int maxLength, double now)
+{
+    bool entered = false;
     BYTE state[256] = {};
     const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0, alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
@@ -1577,11 +1937,11 @@ void TypeName(double now)
             g_typing.repeatAt[vk] = now + 0.05;
         }
         g_typing.down[vk] = down;
-        if (!fire || g_panel.renaming < 0 || vk == VK_ESCAPE)
+        if (!fire || entered || vk == VK_ESCAPE)
             continue;
-        std::string& draft = g_panel.nameDraft;
+        std::string& draft = text;
         if (vk == VK_RETURN) {
-            FinishRename(true, now);
+            entered = true;
             continue;
         }
         if (vk == VK_BACK) {
@@ -1600,9 +1960,46 @@ void TypeName(double now)
         wchar_t out[4];
         const int n = ToUnicode(static_cast<UINT>(vk), MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC), state, out, 4,
                                 0x4 /* leave the keyboard's dead-key state alone */);
-        if (n == 1 && out[0] >= 32 && out[0] <= 126 && static_cast<int>(draft.size()) < kPresetNameMax)
+        if (n == 1 && out[0] >= 32 && out[0] <= 126 && static_cast<int>(draft.size()) < maxLength)
             draft += static_cast<char>(out[0]);
     }
+    return entered;
+}
+
+// Is row i in the list now: the current tab's rows, or with a search typed, every row on any tab
+// whose name, section or tab has it (any case).
+bool Contains(const char* text, const std::string& query)
+{
+    if (!text || query.empty())
+        return false;
+    const size_t n = strlen(text), m = query.size();
+    for (size_t i = 0; i + m <= n; ++i) {
+        size_t k = 0;
+        while (k < m && tolower(static_cast<unsigned char>(text[i + k])) == tolower(static_cast<unsigned char>(query[k])))
+            ++k;
+        if (k == m)
+            return true;
+    }
+    return false;
+}
+
+// A row's section: its own, or the last one above it on its tab.
+const char* RowSection(int i)
+{
+    for (int r = i; r >= 0 && kRows[r].tab == kRows[i].tab; --r)
+        if (kRows[r].section)
+            return kRows[r].section;
+    return "";
+}
+
+bool RowShown(int i)
+{
+    if (i < 0 || i >= kRowCount)
+        return false;
+    const RowDef& def = kRows[i];
+    if (g_panel.query.empty())
+        return def.tab == g_panel.tab;
+    return Contains(def.label, g_panel.query) || Contains(RowSection(i), g_panel.query) || Contains(kTabs[def.tab], g_panel.query);
 }
 
 void StartListening(int row)
@@ -1690,7 +2087,7 @@ void ListenForPad(double now)
 // A key row is waiting: Esc cancels, any other key is taken (unless it clashes).
 void ListenForKey(double now)
 {
-    if (kRows[g_panel.listening].tab != g_panel.tab) {  // switched tabs with the mouse
+    if (!RowShown(g_panel.listening)) {  // switched tabs (or searched) with the mouse
         g_panel.listening = -1;
         return;
     }
@@ -1823,40 +2220,10 @@ bool RowInactive(const RowDef& def, const Config& cfg)
     return false;
 }
 
-// A tab's columns: how many, and the tallest (the panel is sized for the tallest of all the tabs,
-// so it doesn't jump around).
-constexpr int kMaxColumns = 3;
-struct TabLayout {
-    int   columns = 1;
-    float height  = 0;
-};
-TabLayout LayoutTab(int tab, float sectionH, float rowH)
-{
-    TabLayout layout;
-    float columnH[kMaxColumns] = {};
-    int column = 0;
-    for (const RowDef& def : kRows) {
-        if (def.tab != tab)
-            continue;
-        if (def.column >= 0)
-            column = Clamp(def.column, 0, kMaxColumns - 1);
-        layout.columns = column + 1 > layout.columns ? column + 1 : layout.columns;
-        columnH[column] += (def.section ? sectionH : 0) + rowH;
-    }
-    for (float h : columnH)
-        layout.height = std::fmax(layout.height, h);
-    return layout;
-}
+// The panel's size at scale 1 (pixels at 1080p); the window's scale fits it, with a margin.
+constexpr float kPanelW = 1400.0f, kPanelH = 800.0f;
 
-// The whole panel's height at scale 1 (BuildPanel's sizes: the tallest tab's rows and everything
-// around them), with a margin above and below: what the scale has to fit in the window.
-float PanelHeightAtScale1()
-{
-    float contentH = 0;
-    for (int tab = 0; tab < kTabCount; ++tab)
-        contentH = std::fmax(contentH, LayoutTab(tab, 38.0f, 50.0f).height);
-    return 26.0f + 56.0f + 46.0f + contentH + 24.0f + 36.0f + 42.0f + 14.0f + 18.0f + 20.0f + 2.0f * 16.0f;
-}
+float PanelHeightAtScale1() { return kPanelH + 2.0f * 16.0f; }
 
 // The Windows clipboard, for preset codes (shared as text: Discord and the like).
 bool CopyToClipboard(const std::string& text)
@@ -1906,11 +2273,13 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     Config& cfg = EditConfig();
     const float s = g_atlasScale;
     const auto S = [s](float v) { return std::round(v * s); };
+    const float thin = std::fmax(1.0f, S(1)), stroke = std::fmax(1.5f, S(2));
+    const bool searching = !g_panel.query.empty();
 
-    int rowsInTab = 0;
-    for (const RowDef& def : kRows)
-        rowsInTab += def.tab == g_panel.tab ? 1 : 0;
-    const int presetItem = kFirstRowItem + rowsInTab;
+    int rowsShown = 0;
+    for (int i = 0; i < kRowCount; ++i)
+        rowsShown += RowShown(i) ? 1 : 0;
+    const int presetItem = kFirstRowItem + rowsShown;
     const int saveItem = presetItem + 1, defaultsItem = saveItem + 1, closeItem = saveItem + 2;
     const int copyCodeItem = closeItem + 1, pasteCodeItem = closeItem + 2;
     const int itemCount = pasteCodeItem + 1;
@@ -1918,6 +2287,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         g_panel.selected = itemCount - 1;
     if (in.nav)
         g_panel.selected = (g_panel.selected + in.nav + itemCount) % itemCount;
+    const bool reveal = in.nav != 0;  // moved with the keys: the row it's on scrolls into view
 
     // Help follows whichever was used last: the mouse (what's under it) or the keys (the selection).
     if (in.inside && (in.mx != g_panel.mouseX || in.my != g_panel.mouseY || in.pressed))
@@ -1926,8 +2296,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         g_panel.helpForMouse = false;
     g_panel.mouseX = in.mx;
     g_panel.mouseY = in.my;
-    // Where the help box goes: beside the panel, level with the row (or under it in the row's own
-    // column, when the screen is too narrow for the box beside the panel).
+    // Where the help box goes: beside the panel, level with the row (or under it, when the screen
+    // is too narrow for the box beside the panel).
     struct HelpSpot { const char* text = nullptr; float top = 0, bottom = 0, left = 0, width = 0; };
     HelpSpot hoveredHelp, selectedHelp;
     const auto OfferHelp = [&](const char* text, float top, float bottom, float left, float width, bool hot, bool selected) {
@@ -1937,60 +2307,101 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             selectedHelp = { text, top, bottom, left, width };
     };
 
-    // Up to three columns of rows side by side.
-    const float pad = S(26), columnW = S(372), columnGap = S(36);
-    const float innerW = kMaxColumns * columnW + (kMaxColumns - 1) * columnGap, panelW = innerW + 2 * pad;
-    const float headerH = S(56), tabsH = S(46), sectionH = S(38), rowH = S(50), buttonH = S(42);
-    float contentH = 0;
-    for (int tab = 0; tab < kTabCount; ++tab)
-        contentH = std::fmax(contentH, LayoutTab(tab, sectionH, rowH).height);
-    const float panelH = pad + headerH + tabsH + contentH + S(24) + S(36) + buttonH + S(14) + S(18) + S(20);
+    // ---- Layout: the tabs down the left (search over them), the logo and the presets along the
+    // top, the settings in a box, the buttons along the bottom ----
+    const float panelW = S(kPanelW), panelH = S(kPanelH);
     const float px = S(32);
     const float py = std::fmax(S(16), std::round((screenHeight - panelH) * 0.5f));
+    const float pad = S(34);
+    const float sideX = px + pad, sideW = S(262);
+    const float topY = py + pad, topH = S(48);
+    const float boxX = sideX + sideW + S(44), boxR = px + panelW - pad - S(36), boxW = boxR - boxX;
+    const float boxY = topY + topH + S(24);
+    const float buttonH = S(48), buttonsY = py + panelH - pad - buttonH;
+    const float boxB = buttonsY - S(46), boxH = boxB - boxY;
 
-    // Keyboard-focus marker: a short blue bar just left of the focused item.
-    const auto Marker = [&](float left, float top, float height) { Rect(left, top, S(3), height, kBlueHot); };
-
-    // A panel: navy-charcoal, a blue glow rising from the bottom, a royal blue outline.
+    // Keyboard-focus marker: a short red bar just left of the focused item.
+    const auto Marker = [&](float left, float top, float height) { Rect(left, top, S(3), height, kAccentHot); };
     const auto PanelFill = [&](float bx, float by, float bw, float bh, float r) {
         RoundedRect(bx - S(2), by - S(2), bw + S(4), bh + S(4), r + S(2), kBorder);
         RoundedRect(bx, by, bw, bh, r, kPanelColor);
-        const int bands = 24;
-        const float top = by + bh * 0.35f, bottom = by + bh - r, step = (bottom - top) / bands;
-        for (int b = 0; b < bands; ++b) {
-            const float t = (b + 1.0f) / bands;
-            Rect(bx, std::round(top + b * step), bw, std::ceil(step) + 1, Rgba(24, 52, 120, 0.03f + 0.07f * t));
-        }
     };
-    PanelFill(px, py, panelW, panelH, S(12));
 
-    // ---- Header: title and the on/off switch ----
-    const float x = px + pad;
-    float y = py + pad;
-    Text(kFontTitle, x, y + S(2), "MXS Remastered", White(1.0f), S(1));
+    // ---- The panel: near black, a red glow rising from its bottom left, a red outline ----
+    PanelFill(px, py, panelW, panelH, S(8));
+    GlowRounded(px, py, panelW, panelH, S(8),
+                { px - panelW * 0.02f, py + panelH * 1.08f, panelW * 0.62f, panelH * 0.85f, 150, 10, 18, 0.30f });
 
-    // A pill switch; returns its outer width.
-    const auto Switch = [&](float rightEdge, float centerY, float h, bool on, bool hot) {
-        const float w = std::round(h * 1.8f), r = h * 0.5f, sx = rightEdge - w, sy = std::round(centerY - r);
-        if (on) {
-            RoundedRect(sx, sy, w, h, r, hot ? kBlueHot : kBlue);
-            Disc(sx + w - r, sy + r, r - S(4), White(1.0f));
+    // ---- Search (top left): type to find a setting on any tab ----
+    {
+        const float sh = S(36), sy = topY + std::round((topH - sh) * 0.5f);
+        const bool hot = in.Inside(sideX, sy, sideW, sh);
+        const float xcx = sideX + sideW - S(17), xcy = sy + std::round(sh * 0.5f);
+        const bool canClear = !g_panel.search.empty();
+        const bool xHot = canClear && in.Inside(xcx - S(13), sy, S(26), sh);
+        if (in.pressed) {
+            if (xHot)
+                ClearSearch();
+            else if (hot && !g_panel.searchFocus)
+                StartSearch(now);
+            else if (!hot && g_panel.searchFocus)
+                g_panel.searchFocus = false;  // a click anywhere else: done typing, the results stay
+        }
+        const uint32_t fill = Rgba(30, 30, 33, 1.0f);
+        RoundedRect(sideX - thin, sy - thin, sideW + 2 * thin, sh + 2 * thin, S(5) + thin,
+                    g_panel.searchFocus ? kAccent : (hot ? kOutline : Rgba(66, 66, 72, 1.0f)));
+        RoundedRect(sideX, sy, sideW, sh, S(5), fill);
+        // A magnifying glass.
+        const float mcx = sideX + S(18), mcy = sy + std::round(sh * 0.5f) - S(1);
+        Disc(mcx, mcy, S(7), White(0.92f));
+        Disc(mcx, mcy, S(7) - stroke, fill);
+        Segment(mcx + S(5), mcy + S(5), mcx + S(9), mcy + S(9), stroke, White(0.92f));
+        const float tx = sideX + S(34), ty = sy + std::round((sh - LineHeight(kFontValue)) * 0.5f);
+        float textRight = sideX + sideW - S(12);
+        if (!g_panel.search.empty()) {  // an x that clears it
+            const float k = S(5);
+            const uint32_t xColor = xHot ? White(1.0f) : kDim;
+            Segment(xcx - k, xcy - k, xcx + k, xcy + k, stroke, xColor);
+            Segment(xcx - k, xcy + k, xcx + k, xcy - k, stroke, xColor);
+            textRight = xcx - S(14);
+        }
+        if (g_panel.search.empty() && !g_panel.searchFocus) {
+            Text(kFontValue, tx, ty, "Search", Rgba(196, 196, 200, 1.0f), 0);
         } else {
-            RoundedRect(sx, sy, w, h, r, hot ? kBlue : kLine);
-            RoundedRect(sx + 1, sy + 1, w - 2, h - 2, r - 1, kPanelSolid);
-            Disc(sx + r, sy + r, r - S(5), Gray(hot ? 200 : 130));
+            std::string shown = g_panel.search;  // (its end, if it's longer than the box)
+            while (!shown.empty() && tx + TextWidth(kFontValue, shown.c_str(), 0) > textRight)
+                shown.erase(0, 1);
+            Text(kFontValue, tx, ty, shown.c_str(), White(1.0f), 0);
+            if (g_panel.searchFocus && std::fmod(now - g_panel.searchStarted, 1.0) < 0.6)
+                Rect(tx + TextWidth(kFontValue, shown.c_str(), 0) + S(2), ty, std::fmax(1.0f, S(2)), LineHeight(kFontValue),
+                     White(1.0f));
         }
-        return w;
-    };
+        OfferHelp("Type to find a setting on any tab: by its name, its section or its tab. Enter keeps the results "
+                  "and lets the arrow keys move through them; Esc or the x clears it.",
+                  sy, sy + sh, sideX, sideW, hot, false);
+    }
 
-    // ---- Presets (in the header, right of the title): PRESET  1 | 2 | 3 | 4 | 5, each its name ----
+    // ---- The logo (top right, over the settings) ----
+    float logoLeft = boxR;
+    if (g_logo.valid) {
+        const float lx = boxR - g_logo.w, ly = topY + std::round((topH - g_logo.h) * 0.5f);
+        Quad(lx, ly, lx + g_logo.w, ly + g_logo.h, g_logo.u0, g_logo.v0, g_logo.u1, g_logo.v1, White(1.0f));
+        logoLeft = lx;
+    } else {
+        const char* title = "MXS Remastered";
+        const float tw = TextWidth(kFontTitle, title, S(1));
+        Text(kFontTitle, boxR - tw, topY + std::round((topH - LineHeight(kFontTitle)) * 0.5f), title, White(1.0f), S(1));
+        logoLeft = boxR - tw;
+    }
+
+    // ---- Presets (top, left of the logo): PRESET  1 | 2 | 3 | 4 | 5, each its name ----
     {
         const char* label = "PRESET";
         const float labelW = TextWidth(kFontSmall, label, S(2));
-        const float titleW = TextWidth(kFontTitle, "MXS Remastered", S(1));
-        const float segH = S(32), segY = std::round(y + S(2) + (LineHeight(kFontTitle) - segH) * 0.5f);
+        const float segH = S(34), segY = topY + std::round((topH - segH) * 0.5f);
         const float minW = S(46), padW = S(28), editW = S(150);
-        const float room = std::fmax(kPresetCount * minW, innerW - titleW - S(40) - labelW - S(14));
+        const float lx = boxX, sx0 = lx + labelW + S(14);
+        const float room = std::fmax(kPresetCount * minW, logoLeft - S(28) - sx0);
         // Each segment fits its name; when they don't all fit, the one being renamed keeps its room
         // and the rest share what's left (their names cut short).
         std::string names[kPresetCount];
@@ -2012,22 +2423,21 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 total += w[p];
             }
         }
-        const float sx0 = std::round(x + innerW - total), lx = sx0 - S(14) - labelW;
         const bool focused = g_panel.selected == presetItem;
-        const bool areaHot = in.Inside(lx, segY, x + innerW - lx, segH);
+        const bool areaHot = in.Inside(lx, segY, sx0 + total - lx, segH);
         OfferHelp("Five presets, each with its own copy of every setting (not the keybinds). Click one to switch "
                   "to it: your changes stay with the preset you made them in. Click the one in use again (or press "
                   "F2) to rename it: type the name, Enter keeps it, Esc leaves it as it was. A pasted code never "
                   "changes a name. SAVE writes them all to MXS_REMASTERED.ini, and the game starts with the one in use.",
-                  segY, segY + segH, lx, x + innerW - lx, areaHot, focused);
+                  segY, segY + segH, lx, sx0 + total - lx, areaHot, focused);
         if (focused)
             Marker(lx - S(12), segY, segH);
         Text(kFontSmall, lx, segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f), label, focused ? kLabel : kDim, S(2));
         const int current = ActivePreset();
         int wanted = current;
         bool renameNow = false;
-        RoundedRect(sx0 - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, kBorder);
-        RoundedRect(sx0, segY, total, segH, segH * 0.5f, kPanelSolid);
+        RoundedRect(sx0 - thin, segY - thin, total + 2 * thin, segH + 2 * thin, S(5) + thin, Rgba(66, 66, 72, 1.0f));
+        RoundedRect(sx0, segY, total, segH, S(5), Rgba(24, 24, 27, 1.0f));
         float sx = sx0;
         for (int p = 0; p < kPresetCount; ++p) {
             const bool hot = in.Inside(sx, segY, w[p], segH);
@@ -2040,10 +2450,12 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                     wanted = p;
             }
             if (editing) {
-                RoundedRect(sx, segY, w[p], segH, segH * 0.5f, kBlueHot);
-                RoundedRect(sx + S(2), segY + S(2), w[p] - S(4), segH - S(4), segH * 0.5f - S(2), Rgba(20, 36, 66, 1.0f));
+                RoundedRect(sx, segY, w[p], segH, S(5), kAccentHot);
+                RoundedRect(sx + stroke, segY + stroke, w[p] - 2 * stroke, segH - 2 * stroke, S(4), kBoxSolid);
             } else if (p == current) {
-                RoundedRect(sx, segY, w[p], segH, segH * 0.5f, hot ? kBlueHot : kBlue);
+                RoundedRect(sx, segY, w[p], segH, S(5), hot ? kAccentHot : kAccent);
+            } else if (hot) {
+                RoundedRect(sx, segY, w[p], segH, S(5), White(0.06f));
             }
             // The name, cut short with ".." if its segment is too narrow (while typing, its end shows).
             std::string shown = names[p];
@@ -2093,85 +2505,130 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         }
     }
 
-    y += headerH;
-
-    // ---- Tabs ----
+    // ---- Tabs (down the left) ----
     {
-        if (g_panel.selected == kTabBarItem && in.step)
+        if (g_panel.selected == kTabBarItem && in.step) {
             g_panel.tab = (g_panel.tab + in.step + kTabCount) % kTabCount;
-        // Each tab is its label plus an equal share of the spare width, so long labels still fit
-        // (with tighter letter spacing if they would only just fit).
-        float labelW[kTabCount], spare = innerW, tracking = S(2);
-        for (int pass = 0; pass < 2; ++pass) {
-            spare = innerW;
-            for (int tab = 0; tab < kTabCount; ++tab) {
-                labelW[tab] = TextWidth(kFontSmall, kTabs[tab], tracking);
-                spare -= labelW[tab];
-            }
-            if (spare >= kTabCount * S(8))
-                break;
-            tracking = S(1) > 0 ? S(1) : 1;
+            ClearSearch();
         }
-        float tx = x;
-        const bool equal = spare >= kTabCount * S(40);  // room for equal tabs
+        const float itemH = S(56), barH = S(50), top = boxY + S(6);
+        {
+            const double dt = g_panel.tabBarTime > 0 ? Clamp(now - g_panel.tabBarTime, 0.0, 0.1) : 0.0;
+            g_panel.tabBarTime = now;
+            const float wanted = static_cast<float>(g_panel.tab);
+            if (g_panel.tabBar < 0)
+                g_panel.tabBar = wanted;
+            g_panel.tabBar += (wanted - g_panel.tabBar) * static_cast<float>(1.0 - std::exp(-dt / 0.06));
+            if (std::fabs(wanted - g_panel.tabBar) < 0.002f)
+                g_panel.tabBar = wanted;
+            if (g_panel.search.empty())
+                GradientH(sideX, std::round(top + g_panel.tabBar * itemH), sideW, barH, kAccent, kAccentDeep);
+        }
         for (int tab = 0; tab < kTabCount; ++tab) {
-            const float tabW = equal ? std::floor(innerW / kTabCount) : labelW[tab] + spare / kTabCount;
-            const bool hot = in.Inside(tx, y, tabW, tabsH - S(8));
+            const float iy = top + tab * itemH;
+            const bool hot = in.Inside(sideX, iy, sideW, barH);
             if (hot && in.pressed) {
                 g_panel.tab = tab;
                 g_panel.selected = kTabBarItem;
+                ClearSearch();
             }
-            const bool current = tab == g_panel.tab;
-            const float lx = std::round(tx + (tabW - labelW[tab]) * 0.5f);
-            Text(kFontSmall, lx, y + S(8), kTabs[tab], current ? White(1.0f) : (hot ? kLabel : kDim), tracking);
-            Rect(tx + S(6), y + S(30), tabW - S(12), current ? S(2) : 1, current ? White(1.0f) : kLine);
-            tx += tabW;
+            const bool current = !g_panel.search.size() && tab == g_panel.tab;
+            if (hot && !current)
+                GradientH(sideX, iy, sideW, barH, White(0.08f), White(0.0f));
+            Text(kFontTab, sideX + S(24), iy + std::round((barH - LineHeight(kFontTab)) * 0.5f), kTabs[tab],
+                 current || hot ? White(1.0f) : Rgba(204, 204, 208, 1.0f), 0);
         }
         if (g_panel.selected == kTabBarItem)
-            Marker(px + S(10), y + S(4), S(26));
-        y += tabsH;
+            Marker(sideX - S(12), std::round(top + g_panel.tabBar * itemH), barH);
+        // Under the tabs, at the bottom: the keys, and the credit.
+        const float lh = LineHeight(kFontSmall);
+        const float creditY = buttonsY - S(22) - lh;
+        char hint[64];
+        snprintf(hint, sizeof hint, "%s TO CLOSE", KeyName(cfg.menuKey));
+        Text(kFontSmall, sideX + S(4), creditY - S(16) - 2 * lh - S(4), hint, kDim, S(1));
+        Text(kFontSmall, sideX + S(4), creditY - S(16) - lh, "ARROW KEYS ADJUST", kDim, S(1));
+        Text(kFontSmall, sideX + S(4), creditY, "By: Voaks", kDim, S(1));
     }
-    const float rowsTop = y;
 
-    // ---- Rows of the current tab, column by column ----
-    const TabLayout layout = LayoutTab(g_panel.tab, sectionH, rowH);
-    float colW = std::floor((innerW - (layout.columns - 1) * columnGap) / layout.columns);
-    if (layout.columns == 1)
-        colW = std::fmin(colW, S(600));  // one short list: not stretched across the whole panel
-    for (int c = 1; c < layout.columns; ++c) {  // a faint line between the columns
-        const float lineX = std::round(x + c * (colW + columnGap) - columnGap * 0.5f);
-        Rect(lineX, rowsTop + S(10), 1, contentH - S(10), kLine);
-    }
-    int item = kFirstRowItem, column = -1;
-    bool firstInColumn = true;
-    float cx = x;
-    for (int i = 0; i < kRowCount; ++i) {
-        const RowDef& def = kRows[i];
-        if (def.tab != g_panel.tab)
-            continue;
-        const int thisItem = item++;
-        const int wantColumn = def.column >= 0 ? Clamp(def.column, 0, kMaxColumns - 1) : (column < 0 ? 0 : column);
-        if (wantColumn != column) {
-            column = wantColumn;
-            cx = std::round(x + column * (colW + columnGap));
-            y = rowsTop;
-            firstInColumn = true;
+    // ---- The settings: one list in the box, scrolled ----
+    RoundedRect(boxX - S(2), boxY - S(2), boxW + S(4), boxH + S(4), S(6), kBorder);
+    RoundedRect(boxX, boxY, boxW, boxH, S(4), kBoxColor);
+    const float sectionH = S(60), rowH = S(46), inX = S(34), topPad = S(4), bottomPad = S(22);
+    const float cx = boxX + inX, cw = boxW - 2 * inX, right = cx + cw;
+    // How tall the list is: a heading wherever the section (or, searching, the tab) changes.
+    float listH = topPad + bottomPad;
+    {
+        int lastTab = -1;
+        const char* lastSection = nullptr;
+        for (int i = 0; i < kRowCount; ++i) {
+            if (!RowShown(i))
+                continue;
+            const char* section = RowSection(i);
+            if (kRows[i].tab != lastTab || section != lastSection)
+                listH += sectionH;
+            lastTab = kRows[i].tab;
+            lastSection = section;
+            listH += rowH;
         }
-        const float cw = colW;
-        if (def.section) {
-            if (!firstInColumn)  // the tab underline already separates the first section
-                Rect(cx, y + S(8), cw, 1, kLine);
-            Text(kFontSmall, cx, y + S(19), def.section, kSection, S(2));
+    }
+    const float maxScroll = std::fmax(0.0f, listH - boxH);
+    {
+        if (g_panel.listTab != g_panel.tab || g_panel.listQuery != g_panel.query) {  // a new list: from its top
+            g_panel.listTab = g_panel.tab;
+            g_panel.listQuery = g_panel.query;
+            g_panel.scroll = g_panel.scrollTarget = 0;
+        }
+        if (in.wheel != 0 && in.Inside(boxX, boxY, boxR + S(36) - boxX, boxH))
+            g_panel.scrollTarget -= in.wheel * rowH * 3;
+        g_panel.scrollTarget = Clamp(g_panel.scrollTarget, 0.0f, maxScroll);
+        const double dt = g_panel.scrollTime > 0 ? Clamp(now - g_panel.scrollTime, 0.0, 0.1) : 0.0;
+        g_panel.scrollTime = now;
+        g_panel.scroll += (g_panel.scrollTarget - g_panel.scroll) * static_cast<float>(1.0 - std::exp(-dt / 0.05));
+        if (std::fabs(g_panel.scrollTarget - g_panel.scroll) < 0.5f || g_panel.scrollDrag)
+            g_panel.scroll = g_panel.scrollTarget;
+        g_panel.scroll = Clamp(g_panel.scroll, 0.0f, maxScroll);
+    }
+
+    const size_t clipBegin = g_batch.size();
+    const bool mouseInBox = in.Inside(boxX, boxY, boxW, boxH);
+    float y = boxY + topPad - g_panel.scroll;
+    int item = kFirstRowItem, lastTab = -1;
+    const char* lastSection = nullptr;
+    for (int i = 0; i < kRowCount; ++i) {
+        if (!RowShown(i))
+            continue;
+        const RowDef& def = kRows[i];
+        const int thisItem = item++;
+        const char* section = RowSection(i);
+        float headingTop = -1;
+        if (def.tab != lastTab || section != lastSection) {
+            headingTop = y;
+            char heading[96];
+            if (searching)
+                snprintf(heading, sizeof heading, "%s  \xB7  %s", kTabs[def.tab], section);
+            else
+                snprintf(heading, sizeof heading, "%s", section);
+            Text(kFontSection, cx, y + S(24), heading, kSection, 0);
+            Rect(cx, y + S(50), cw, thin, kLine);
             y += sectionH;
         }
-        firstInColumn = false;
+        lastTab = def.tab;
+        lastSection = section;
 
+        const bool focused = g_panel.selected == thisItem;
+        if (focused && reveal) {  // the keys moved here: into view
+            const float top = (headingTop >= 0 ? headingTop : y) - S(4), bottom = y + rowH + S(4);
+            if (top < boxY)
+                g_panel.scrollTarget -= boxY - top;
+            else if (bottom > boxB)
+                g_panel.scrollTarget += bottom - boxB;
+        }
+        const bool visible = y + rowH > boxY && y < boxB;
         const bool inactive = RowInactive(def, cfg);
         const uint32_t labelColor = inactive ? kDim : kLabel;
         const uint32_t valueColor = inactive ? kDim : White(1.0f);
-        const float hx = cx - S(12), hw = cw + S(24);  // the row's hover area reaches into the gaps
-        const bool hot = in.Inside(hx, y, hw, rowH);
-        const bool focused = g_panel.selected == thisItem;
+        const float hx = boxX + S(6), hw = boxW - S(12);  // the row's hover area: the box's width
+        const bool hot = visible && mouseInBox && in.Inside(hx, y, hw, rowH);
         if (hot && in.pressed)
             g_panel.selected = thisItem;
         const bool active = g_panel.dragging == i;
@@ -2179,21 +2636,27 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         const bool kept = i == g_panel.adjustRow && g_panel.opacity < 0.999f;
         const size_t keptBegin = g_batch.size();
         if (kept)
-            RoundedRect(hx - S(6), y - S(4), hw + S(12), rowH + S(8), S(10),
-                        Rgba(13, 17, 26, 0.9f * (1.0f - g_panel.opacity)));
+            RoundedRect(hx, y - S(2), hw, rowH + S(4), S(6), Rgba(8, 8, 10, 0.92f * (1.0f - g_panel.opacity)));
         if (hot || active)
-            RoundedRect(hx, y, hw, rowH, S(6), Rgba(40, 90, 176, 0.14f));
+            Rect(hx, y, hw, rowH, White(0.04f));
         if (focused)
-            Marker(cx - S(17), y + S(9), rowH - S(18));
-        OfferHelp(def.help, y, y + rowH, hx, hw, hot, focused);
-        const float labelY = y + std::round((rowH - LineHeight(kFontBody)) * 0.5f);
+            Marker(boxX + S(14), y + S(10), rowH - S(20));
+        OfferHelp(def.help, std::fmax(y, boxY), std::fmin(y + rowH, boxB), hx, hw, hot, focused);
+        const float midY = std::round(y + rowH * 0.5f);
+        Text(kFontLabel, cx, y + std::round((rowH - LineHeight(kFontLabel)) * 0.5f), def.label, labelColor, 0);
 
         if (def.kind == RowKind::Slider) {
+            // A white bar on a thin red track, the value at the right.
             double& value = cfg.*SliderField(def, cfg);
-            if (hot && in.pressed && !def.locked)
+            char text[32];
+            FormatValue(def, value, text, sizeof text);
+            const float valueW = std::fmax(S(96), TextWidth(kFontValue, text, 0) + S(24));
+            const float trackW = S(290), tx0 = right - valueW - trackW;
+            const bool trackHot = hot && in.mx >= tx0 - S(16) && in.mx <= tx0 + trackW + S(16);
+            if (trackHot && in.pressed && !def.locked)
                 g_panel.dragging = i;
             if (active && in.down) {
-                SetSlider(def, value, def.min + Clamp((in.mx - cx) / cw, 0.0f, 1.0f) * (def.max - def.min));
+                SetSlider(def, value, def.min + Clamp((in.mx - tx0) / trackW, 0.0f, 1.0f) * (def.max - def.min));
                 g_panel.adjustRow = i;
             }
             if (focused && in.step && !def.locked) {
@@ -2201,27 +2664,26 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 g_panel.adjustRow = i;
                 g_panel.adjustedAt = now;
             }
-
-            char text[32];
             FormatValue(def, value, text, sizeof text);
-            Text(kFontBody, cx, y + S(5), def.label, labelColor, 0);
-            Text(kFontValue, cx + cw - TextWidth(kFontValue, text, 0), y + S(5), text, valueColor, 0);
-
-            const float trackY = y + S(36);
+            Text(kFontValue, right - TextWidth(kFontValue, text, 0), y + std::round((rowH - LineHeight(kFontValue)) * 0.5f), text,
+                 valueColor, 0);
             const float t = static_cast<float>((value - def.min) / (def.max - def.min));
-            const float knobX = std::round(cx + t * cw);
-            Rect(cx, trackY, cw, S(2), inactive ? kLine : kTrack);
-            if (def.min < 0 && !def.clock) {  // signed values fill from the centre
-                const float zeroX = std::round(cx + static_cast<float>(-def.min / (def.max - def.min)) * cw);
-                Rect(std::fmin(zeroX, knobX), trackY, std::fabs(knobX - zeroX), S(2), inactive ? kDim : White(0.95f));
-                Rect(zeroX, trackY - S(3), 1, S(8), kSection);
-            } else {
-                Rect(cx, trackY, knobX - cx, S(2), inactive ? kDim : White(0.95f));
+            const float knobX = std::round(tx0 + t * trackW);
+            const float lineH = std::fmax(1.0f, S(2)), barH = std::fmax(3.0f, S(5));
+            Rect(tx0, midY - std::round(lineH * 0.5f), trackW, lineH, inactive ? Rgba(74, 74, 80, 1.0f) : kTrack);
+            float from = tx0;
+            if (def.min < 0 && !def.clock) {  // signed values fill from the zero
+                from = std::round(tx0 + static_cast<float>(-def.min / (def.max - def.min)) * trackW);
+                Rect(from, midY - S(6), thin, S(12), kDim);
             }
-            if (active || hot)
-                Disc(knobX, trackY + S(1), S(11), Rgba(26, 100, 214, 0.35f));
-            Disc(knobX, trackY + S(1), active ? S(8) : (hot ? S(7) : S(6)), inactive ? kDim : White(1.0f));
+            const float fillX = std::fmin(from, knobX), fillW = std::fabs(knobX - from);
+            if (fillW >= 1.0f)
+                RoundedRect(fillX, midY - std::round(barH * 0.5f), fillW, barH, barH * 0.5f, inactive ? kDim : White(0.96f));
+            if (active || trackHot)
+                Disc(knobX, midY, S(11), Rgba(206, 18, 26, 0.4f));
+            Disc(knobX, midY, active ? S(7) : (trackHot ? S(6) : S(5)), inactive ? kDim : White(1.0f));
         } else if (def.kind == RowKind::Toggle) {
+            // A checkbox: red with a white tick when on.
             bool& flag = cfg.*def.flag;
             if ((hot && in.pressed) || (focused && (in.step || in.activate))) {
                 SetFlag(flag, !flag);
@@ -2232,122 +2694,198 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                     g_panel.askChoice = cfg.dabSticky == 2 ? 1 : 0;
                 }
             }
-            Text(kFontBody, cx, labelY, def.label, labelColor, 0);
-            const float sw = Switch(cx + cw, y + rowH * 0.5f, S(22), flag, hot);
-            const char* onOff = flag ? "ON" : "OFF";
-            Text(kFontSmall, cx + cw - sw - S(10) - TextWidth(kFontSmall, onOff, S(2)),
-                 y + std::round((rowH - LineHeight(kFontSmall)) * 0.5f), onOff, flag ? valueColor : kDim, S(2));
-        } else if (def.kind == RowKind::Key || def.kind == RowKind::Pad) {  // the key's (control's) name in a box; click it, then press one
+            const float bs = S(20), bx = right - bs, by = std::round(midY - bs * 0.5f);
+            if (flag) {
+                RoundedRect(bx, by, bs, bs, S(3), inactive ? kDim : (hot ? kAccentHot : kAccent));
+                const float tw = std::fmax(1.5f, S(2.5f));
+                Segment(bx + bs * 0.25f, by + bs * 0.52f, bx + bs * 0.43f, by + bs * 0.70f, tw, White(1.0f));
+                Segment(bx + bs * 0.43f, by + bs * 0.70f, bx + bs * 0.76f, by + bs * 0.31f, tw, White(1.0f));
+            } else {
+                RoundedRect(bx, by, bs, bs, S(3), hot ? Rgba(196, 196, 202, 1.0f) : kOutline);
+                RoundedRect(bx + stroke, by + stroke, bs - 2 * stroke, bs - 2 * stroke, std::fmax(0.0f, S(3) - stroke), kBoxSolid);
+            }
+        } else if (def.kind == RowKind::Key || def.kind == RowKind::Pad) {
+            // The key's (control's) name in a box; click it, then press one.
             const bool listening = g_panel.listening == i;
             if (listening && in.pressed)  // a second click, here or anywhere else, cancels
                 g_panel.listening = -1;
             else if ((hot && in.pressed) || (focused && in.activate))
                 StartListening(i);
             const bool waiting = g_panel.listening == i;
-
             const char* text = def.kind == RowKind::Pad
                 ? (waiting ? "PRESS OR PUSH" : gamepad::ControlName(cfg.*def.pad))
                 : (waiting ? "PRESS A KEY" : KeyName(cfg.*def.key));
-            const float boxH = S(28), boxPad = S(14), boxY = std::round(y + (rowH - boxH) * 0.5f);
-            const float textW = TextWidth(kFontSmall, text, S(2));
-            const float boxW = std::fmax(textW + 2 * boxPad, S(130)), bx = cx + cw - boxW;
+            const float vh = S(32), textW = TextWidth(kFontValue, text, 0);
+            const float vw = std::fmax(textW + S(36), S(170)), vx = right - vw, vy = std::round(midY - vh * 0.5f);
             if (waiting) {
-                RoundedRect(bx, boxY, boxW, boxH, boxH * 0.5f, kBlue);
+                RoundedRect(vx, vy, vw, vh, S(3), kAccent);
             } else {
-                RoundedRect(bx - 1, boxY - 1, boxW + 2, boxH + 2, boxH * 0.5f + 1, hot ? kBlueHot : kBorder);
-                RoundedRect(bx, boxY, boxW, boxH, boxH * 0.5f, kPanelSolid);
+                RoundedRect(vx, vy, vw, vh, S(3), hot ? Rgba(196, 196, 202, 1.0f) : kOutline);
+                RoundedRect(vx + thin, vy + thin, vw - 2 * thin, vh - 2 * thin, S(2), Rgba(18, 18, 20, 1.0f));
             }
-            Text(kFontSmall, std::round(bx + (boxW - textW) * 0.5f), boxY + std::round((boxH - LineHeight(kFontSmall)) * 0.5f), text,
-                 waiting ? White(1.0f) : valueColor, S(2));
-            Text(kFontBody, cx, labelY, def.label, labelColor, 0);
-        } else {  // Choice: two to four segments, e.g. GAME | CUSTOM
+            Text(kFontValue, std::round(vx + (vw - textW) * 0.5f), vy + std::round((vh - LineHeight(kFontValue)) * 0.5f), text,
+                 waiting ? White(1.0f) : valueColor, 0);
+        } else {
+            // A choice of two to four: < VALUE > with a bar under it, a segment per option.
             const char* options[4] = { def.offText, def.onText, def.thirdText, def.fourthText };
             const int count = def.option ? (def.fourthText ? 4 : 3) : 2;
-            const int current = def.option ? cfg.*def.option : (cfg.*def.flag ? 1 : 0);
+            const auto Current = [&]() { return def.option ? cfg.*def.option : (cfg.*def.flag ? 1 : 0); };
             const auto Pick = [&](int o) {
                 if (def.option)
                     SetOption(cfg.*def.option, o);
                 else
                     SetFlag(cfg.*def.flag, o == 1);
             };
-            const float segH = S(28), segPad = S(14), segY = std::round(y + (rowH - segH) * 0.5f);
-            float segW[4], total = 0;
-            for (int o = 0; o < count; ++o) {
-                segW[o] = TextWidth(kFontSmall, options[o], S(2)) + 2 * segPad;
-                total += segW[o];
-            }
-            float sx = cx + cw - total;
-            RoundedRect(sx - 1, segY - 1, total + 2, segH + 2, segH * 0.5f + 1, kBorder);
-            RoundedRect(sx, segY, total, segH, segH * 0.5f, kPanelSolid);
-            for (int o = 0; o < count; ++o) {
-                const bool selected = current == o;
-                const bool segHot = in.Inside(sx, segY, segW[o], segH);
-                if (segHot && in.pressed)
-                    Pick(o);
-                if (selected)
-                    RoundedRect(sx, segY, segW[o], segH, segH * 0.5f, segHot ? kBlueHot : kBlue);
-                Text(kFontSmall, sx + segPad, segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f), options[o],
-                     selected ? White(1.0f) : (segHot ? kLabel : kDim), S(2));
-                sx += segW[o];
+            float widest = 0;
+            for (int o = 0; o < count; ++o)
+                widest = std::fmax(widest, TextWidth(kFontValue, options[o], 0));
+            const float vw = std::fmax(S(160), widest + S(40)), vh = S(30), arrowW = S(26);
+            const float vx = right - arrowW - vw, vy = std::round(midY - vh * 0.5f) - S(3);
+            const bool leftHot = hot && in.mx >= vx - arrowW && in.mx < vx;
+            const bool rightHot = hot && in.mx >= vx + vw && in.mx < vx + vw + arrowW;
+            const bool valueHot = hot && in.mx >= vx && in.mx < vx + vw;
+            int current = Current();
+            if (in.pressed) {
+                if (leftHot && current > 0)
+                    Pick(current - 1);
+                else if (rightHot && current < count - 1)
+                    Pick(current + 1);
+                else if (valueHot)
+                    Pick((current + 1) % count);
             }
             if (focused && in.step)
                 Pick(Clamp(current + (in.step > 0 ? 1 : -1), 0, count - 1));
             if (focused && in.activate)
                 Pick((current + 1) % count);
-            Text(kFontBody, cx, labelY, def.label, labelColor, 0);
+            current = Current();
+            const uint32_t arrowOn = inactive ? kDim : White(0.95f), arrowOff = Rgba(70, 70, 76, 1.0f);
+            const float ak = S(7);
+            Chevron(vx - arrowW * 0.5f, vy + vh * 0.5f, ak, 0, stroke,
+                    current > 0 ? (leftHot ? kAccentHot : arrowOn) : arrowOff);
+            Chevron(vx + vw + arrowW * 0.5f, vy + vh * 0.5f, ak, 1, stroke,
+                    current < count - 1 ? (rightHot ? kAccentHot : arrowOn) : arrowOff);
+            RoundedRect(vx, vy, vw, vh, S(2), valueHot ? Rgba(214, 214, 220, 1.0f) : Rgba(150, 150, 156, 1.0f));
+            RoundedRect(vx + thin, vy + thin, vw - 2 * thin, vh - 2 * thin, S(2), Rgba(10, 10, 12, 1.0f));
+            const char* shown = options[Clamp(current, 0, count - 1)];
+            Text(kFontValue, std::round(vx + (vw - TextWidth(kFontValue, shown, 0)) * 0.5f),
+                 vy + std::round((vh - LineHeight(kFontValue)) * 0.5f), shown, valueColor, 0);
+            const float gap = S(3), barY = vy + vh + S(4), barH = std::fmax(2.0f, S(3));
+            const float segW = (vw - (count - 1) * gap) / count;
+            for (int o = 0; o < count; ++o)
+                Rect(vx + o * (segW + gap), barY, segW, barH,
+                     o == current ? (inactive ? kDim : White(0.95f)) : Rgba(64, 64, 70, 1.0f));
         }
         if (kept)
             g_keepRanges.push_back({ keptBegin, g_batch.size() });
         y += rowH;
     }
-    y = rowsTop + contentH;
-
-    // ---- Live readout for the current tab ----
-    Rect(x, y + S(10), innerW, 1, kLine);
-    y += S(24);
-    char readout[256];
-    const camera::Telemetry& t = camera::LastTelemetry();
-    if (g_panel.tab == kTabGraphics) {
-        const char* tires = postfx::TireStatusText();
-        snprintf(readout, sizeof readout, "%s   \xB7   %s", postfx::StatusText(), tires[0] ? tires : texfilter::StatusText());
-    } else if (g_panel.tab == kTabKeybinds) {
-        snprintf(readout, sizeof readout, "CLICK A KEY, THEN PRESS THE NEW ONE   \xB7   ESC CANCELS   \xB7   SAVE TO KEEP THEM");
-    } else if (g_panel.tab == kTabWeather) {
-        if (!cfg.shaders)
-            snprintf(readout, sizeof readout, "WEATHER NEEDS THE SHADERS ON (GRAPHICS TAB)");
-        else if (!cfg.snow)
-            snprintf(readout, sizeof readout, "NO WEATHER   \xB7   TURN ON SNOW TO MAKE IT SNOW");
-        else
-            snprintf(readout, sizeof readout, "SNOW ON   \xB7   SNOWFALL %.0f%%   \xB7   WIND %.0f%%", cfg.snowfall * 100.0,
-                     cfg.snowWind * 100.0);
-    } else if (g_panel.tab == kTabOther) {
-        const char* status = GameOverlayStatusText();
-        snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
-    } else if (!cfg.enabled) {
-        snprintf(readout, sizeof readout, "FIRST PERSON MOD IS OFF%s",
-                 g_panel.tab == kTabReplay ? " - REPLAYS USE THE GAME'S OWN CAMERA" : "");
-    } else if (g_panel.tab == kTabFirstPerson) {
-        char view[96];
-        if (cfg.customCamera && !t.bikeTracked)
-            snprintf(view, sizeof view, "%s - RIDE A FEW METRES", bike::StatusText());
-        else
-            snprintf(view, sizeof view, "%s   PITCH %+.0f\xB0   LEAN %.0f\xB0",
-                     t.customActive ? "CUSTOM CAM" : (t.bikeTracked ? "BIKE FOUND" : "GAME CAM"),
-                     t.pitchExcessDeg, std::fabs(t.rawRollDeg));
-        snprintf(readout, sizeof readout, "%s   \xB7   %s   LOOK %+.0f\xB0   %s   \xB7   LAG %.1f\xB0   %.1f G   NECK %+.0f MM",
-                 view, t.airborne > 0.5 ? "AIR" : "GROUND", t.lookYawDeg,
-                 cfg.controllerLook ? gamepad::StatusText() : "LOOK OFF", t.lagDeg, 1.0 + t.verticalAccelG,
-                 t.neckOffset * 1000.0);
-    } else {
-        snprintf(readout, sizeof readout, "%s", replay::StatusText());
+    if (rowsShown == 0) {
+        char none[96];
+        snprintf(none, sizeof none, "Nothing matches \"%s\"", g_panel.query.c_str());
+        Text(kFontLabel, cx, boxY + S(30), none, kDim, 0);
     }
-    Text(kFontSmall, x, y, readout, kSection, S(1));
-    y += S(36);
+    g_clips.push_back({ clipBegin, g_batch.size(), boxX, boxY, boxW, boxH });
 
-    // ---- Buttons (right), hint / status (left) ----
+    // ---- Scrollbar (right of the box): arrows at either end, the thumb between ----
+    {
+        const float sbW = S(6), sbX = boxR + S(17), mid = sbX + sbW * 0.5f;
+        const float trackTop = boxY + S(26), trackLen = boxB - S(26) - trackTop;
+        const bool scrollable = maxScroll > 0.5f;
+        const bool upHot = scrollable && in.Inside(sbX - S(12), boxY - S(6), sbW + S(24), S(28));
+        const bool downHot = scrollable && in.Inside(sbX - S(12), boxB - S(22), sbW + S(24), S(28));
+        const uint32_t idle = Rgba(170, 170, 176, 1.0f), off = Rgba(70, 70, 76, 1.0f);
+        Chevron(mid, boxY + S(8), S(7), 2, stroke, scrollable ? (upHot ? White(1.0f) : idle) : off);
+        Chevron(mid, boxB - S(8), S(7), 3, stroke, scrollable ? (downHot ? White(1.0f) : idle) : off);
+        RoundedRect(sbX, trackTop, sbW, trackLen, sbW * 0.5f, Rgba(36, 36, 40, 1.0f));
+        const float thumbLen = scrollable ? std::fmax(S(36), trackLen * boxH / listH) : trackLen;
+        const float thumbY = trackTop + (scrollable ? (trackLen - thumbLen) * (g_panel.scroll / maxScroll) : 0.0f);
+        const bool thumbHot = scrollable && in.Inside(sbX - S(8), thumbY, sbW + S(16), thumbLen);
+        if (in.pressed && scrollable) {
+            if (upHot)
+                g_panel.scrollTarget -= rowH * 3;
+            else if (downHot)
+                g_panel.scrollTarget += rowH * 3;
+            else if (thumbHot) {
+                g_panel.scrollDrag = true;
+                g_panel.scrollGrab = in.my - thumbY;
+            } else if (in.Inside(sbX - S(8), trackTop, sbW + S(16), trackLen)) {
+                g_panel.scrollTarget += (in.my < thumbY ? -1.0f : 1.0f) * boxH * 0.9f;
+            }
+        }
+        if (g_panel.scrollDrag) {
+            if (!in.down || !scrollable) {
+                g_panel.scrollDrag = false;
+            } else {
+                const float t = Clamp((in.my - g_panel.scrollGrab - trackTop) / std::fmax(1.0f, trackLen - thumbLen), 0.0f, 1.0f);
+                g_panel.scrollTarget = g_panel.scroll = t * maxScroll;
+            }
+        }
+        RoundedRect(sbX, thumbY, sbW, thumbLen, sbW * 0.5f,
+                    !scrollable ? Rgba(60, 60, 66, 1.0f) : (thumbHot || g_panel.scrollDrag ? Rgba(214, 214, 220, 1.0f) : Rgba(150, 150, 156, 1.0f)));
+        g_panel.scrollTarget = Clamp(g_panel.scrollTarget, 0.0f, maxScroll);
+    }
+
+    // ---- Under the box: what's going on (the tab's live readout; a message, while there is one) ----
+    {
+        char readout[256];
+        const camera::Telemetry& t = camera::LastTelemetry();
+        if (searching) {
+            snprintf(readout, sizeof readout, "%d SETTING%s FOUND   \xB7   ESC CLEARS THE SEARCH", rowsShown, rowsShown == 1 ? "" : "S");
+        } else if (g_panel.tab == kTabGraphics) {
+            const char* tires = postfx::TireStatusText();
+            snprintf(readout, sizeof readout, "%s   \xB7   %s", postfx::StatusText(), tires[0] ? tires : texfilter::StatusText());
+        } else if (g_panel.tab == kTabKeybinds) {
+            snprintf(readout, sizeof readout, "CLICK A KEY, THEN PRESS THE NEW ONE   \xB7   ESC CANCELS   \xB7   SAVE TO KEEP THEM");
+        } else if (g_panel.tab == kTabWeather) {
+            if (!cfg.shaders)
+                snprintf(readout, sizeof readout, "WEATHER NEEDS THE SHADERS ON (GRAPHICS TAB)");
+            else if (!cfg.snow)
+                snprintf(readout, sizeof readout, "NO WEATHER   \xB7   TURN ON SNOW TO MAKE IT SNOW");
+            else
+                snprintf(readout, sizeof readout, "SNOW ON   \xB7   SNOWFALL %.0f%%   \xB7   WIND %.0f%%", cfg.snowfall * 100.0,
+                         cfg.snowWind * 100.0);
+        } else if (g_panel.tab == kTabOther) {
+            const char* status = GameOverlayStatusText();
+            snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
+        } else if (!cfg.enabled) {
+            snprintf(readout, sizeof readout, "FIRST PERSON MOD IS OFF%s",
+                     g_panel.tab == kTabReplay ? " - REPLAYS USE THE GAME'S OWN CAMERA" : "");
+        } else if (g_panel.tab == kTabFirstPerson) {
+            char view[96];
+            if (cfg.customCamera && !t.bikeTracked)
+                snprintf(view, sizeof view, "%s - RIDE A FEW METRES", bike::StatusText());
+            else
+                snprintf(view, sizeof view, "%s   PITCH %+.0f\xB0   LEAN %.0f\xB0",
+                         t.customActive ? "CUSTOM CAM" : (t.bikeTracked ? "BIKE FOUND" : "GAME CAM"),
+                         t.pitchExcessDeg, std::fabs(t.rawRollDeg));
+            snprintf(readout, sizeof readout, "%s   \xB7   %s   LOOK %+.0f\xB0   %s   \xB7   LAG %.1f\xB0   %.1f G   NECK %+.0f MM",
+                     view, t.airborne > 0.5 ? "AIR" : "GROUND", t.lookYawDeg,
+                     cfg.controllerLook ? gamepad::StatusText() : "LOOK OFF", t.lagDeg, 1.0 + t.verticalAccelG,
+                     t.neckOffset * 1000.0);
+        } else {
+            snprintf(readout, sizeof readout, "%s", replay::StatusText());
+        }
+        const float ry = boxB + std::round((S(46) - LineHeight(kFontSmall)) * 0.5f);
+        if (g_panel.listening >= 0) {
+            char label[64], hint[160];
+            Upper(kRows[g_panel.listening].label, label, sizeof label);
+            if (kRows[g_panel.listening].kind == RowKind::Pad)
+                snprintf(hint, sizeof hint, "PRESS A BUTTON OR PUSH A STICK FOR %s   \xB7   BACKSPACE CLEARS   \xB7   ESC CANCELS", label);
+            else
+                snprintf(hint, sizeof hint, "PRESS THE NEW KEY FOR %s   \xB7   ESC CANCELS", label);
+            Text(kFontSmall, boxX, ry, hint, White(1.0f), S(1));
+        } else if (now < g_panel.statusUntil) {
+            Text(kFontSmall, boxX, ry, g_panel.status, White(1.0f), S(1));
+        } else {
+            Text(kFontSmall, boxX, ry, readout, kInfo, S(1));
+        }
+    }
+
+    // ---- Buttons: CLOSE (under the tabs), the codes (under the box), DEFAULTS and SAVE (right) ----
     const auto Button = [&](int buttonItem, float bx, float bw, const char* label, bool primary, const char* help) {
-        const bool hot = in.Inside(bx, y, bw, buttonH);
-        OfferHelp(help, y, y + buttonH, bx, bw, hot, g_panel.selected == buttonItem);
+        const float by = buttonsY;
+        const bool hot = in.Inside(bx, by, bw, buttonH);
+        OfferHelp(help, by, by + buttonH, bx, bw, hot, g_panel.selected == buttonItem);
         if (hot && in.pressed) {
             g_panel.pressedItem = buttonItem;
             g_panel.selected = buttonItem;
@@ -2355,26 +2893,25 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         const bool clicked = (hot && in.released && g_panel.pressedItem == buttonItem) ||
                              (g_panel.selected == buttonItem && in.activate);
         const bool focused = hot || g_panel.selected == buttonItem;
-        const float r = S(6);
-        uint32_t textColor;
-        if (primary || (hot && in.down)) {
-            RoundedRect(bx - 1, y - 1, bw + 2, buttonH + 2, r + 1, Rgba(96, 156, 244, 1.0f));
-            RoundedRect(bx, y, bw, buttonH, r, focused ? kBlueHot : kBlue);
-            textColor = White(1.0f);
+        const bool held = hot && in.down && g_panel.pressedItem == buttonItem;
+        const float r = S(4), b = std::fmax(1.0f, S(2));
+        if (primary) {
+            RoundedRect(bx, by, bw, buttonH, r, focused ? Rgba(255, 96, 100, 1.0f) : Rgba(232, 52, 58, 1.0f));
+            GradientV(bx + b, by + b, bw - 2 * b, buttonH - 2 * b, held ? kAccent : (focused ? Rgba(236, 38, 44, 1.0f) : Rgba(214, 22, 30, 1.0f)),
+                      held ? kAccentDeep : Rgba(140, 8, 14, 1.0f));
         } else {
-            RoundedRect(bx, y, bw, buttonH, r, focused ? kBlueHot : kBorder);
-            RoundedRect(bx + 1, y + 1, bw - 2, buttonH - 2, r - 1, focused ? Rgba(20, 36, 66, 1.0f) : kPanelSolid);
-            textColor = White(focused ? 1.0f : 0.88f);
+            RoundedRect(bx, by, bw, buttonH, r, focused ? Rgba(176, 176, 182, 1.0f) : Rgba(88, 88, 94, 1.0f));
+            GradientV(bx + b, by + b, bw - 2 * b, buttonH - 2 * b, held ? Rgba(30, 30, 33, 1.0f) : (focused ? Rgba(54, 54, 58, 1.0f) : Rgba(42, 42, 46, 1.0f)),
+                      Rgba(18, 18, 20, 1.0f));
         }
-        const float labelW = TextWidth(kFontSmall, label, S(2));
-        Text(kFontSmall, std::round(bx + (bw - labelW) * 0.5f), y + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f),
-             label, textColor, S(2));
+        const float labelW = TextWidth(kFontButton, label, 0);
+        Text(kFontButton, std::round(bx + (bw - labelW) * 0.5f), by + std::round((buttonH - LineHeight(kFontButton)) * 0.5f), label,
+             White(1.0f), 0);
         return clicked;
     };
 
-    const float gap = S(10), bw = S(180);
-    const float buttonsX = x + innerW - 3 * bw - 2 * gap;
-    if (Button(saveItem, buttonsX, bw, g_panel.dirty ? "SAVE" : "SAVED", g_panel.dirty,
+    const float bigW = S(210), gap = S(16);
+    if (Button(saveItem, boxR - bigW, bigW, g_panel.dirty ? "SAVE" : "SAVED", g_panel.dirty,
                "Writes your settings and keybinds to MXS_REMASTERED.ini so they load next time.")) {
         if (SaveConfig()) {
             g_panel.dirty = false;
@@ -2383,7 +2920,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             SetStatus("COULD NOT WRITE MXS_REMASTERED.INI", now);
         }
     }
-    if (Button(defaultsItem, buttonsX + bw + gap, bw, "DEFAULTS", false,
+    if (Button(defaultsItem, boxR - 2 * bigW - gap, bigW, "DEFAULTS", false,
                "Puts every first person, replay, graphics and other setting of this preset back to its "
                "default (not the keybinds). Press SAVE to keep it.")) {
         ResetTunables();
@@ -2391,60 +2928,42 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         g_panel.dirty = true;
         SetStatus("DEFAULTS RESTORED - NOT SAVED YET", now);
     }
-    if (Button(closeItem, buttonsX + 2 * (bw + gap), bw, "CLOSE", false,
-               "Closes the menu. Unsaved changes stay until you quit the game."))
+    if (Button(closeItem, sideX, sideW, "CLOSE", false, "Closes the menu. Unsaved changes stay until you quit the game."))
         g_panel.closeRequest = true;
 
-    float hintX = x;
-
-    // ---- Preset codes: COPY <TAB> CODE / PASTE CODE, beside the presets (first person and graphics
-    // have a code each; on the other tabs only PASTE CODE shows) ----
+    // Preset codes: COPY CODE / PASTE CODE (first person and graphics have a code each; on the other
+    // tabs only PASTE CODE shows).
     {
-        const float cw = S(150);
-        const char* tabName = kTabs[g_panel.tab];
-        const bool canCopy = HasPresetCode(g_panel.tab);
+        const float cwBtn = S(170);
+        const int codeTab = searching ? -1 : g_panel.tab;
+        const bool canCopy = codeTab >= 0 && HasPresetCode(codeTab);
         if (!canCopy && g_panel.selected == copyCodeItem)
             g_panel.selected = pasteCodeItem;  // (moved onto with the keyboard or a controller: it isn't shown)
-        // Its label names the tab, as long as it fits beside PASTE CODE (shorter on a narrow screen).
-        const char* const kCameraLabels[] = { "COPY FIRST PERSON CODE", "COPY FIRST PERSON", "COPY CAMERA" };
-        const char* const kGraphicsLabels[] = { "COPY GRAPHICS CODE", "COPY GRAPHICS", "COPY GFX" };
-        const char* const* labels = g_panel.tab == 0 ? kCameraLabels : kGraphicsLabels;
-        const float room = buttonsX - S(12) - hintX - cw - gap;
-        const char* copyLabel = labels[2];
-        float copyW = cw;
-        for (int i = 0; i < 3; ++i) {
-            const float w = std::fmax(cw, TextWidth(kFontSmall, labels[i], S(2)) + S(36));
-            if (w <= room || i == 2) {
-                copyLabel = labels[i];
-                copyW = w;
-                break;
-            }
-        }
         static char copyHelp[320];  // (the help box shows it after this block)
         snprintf(copyHelp, sizeof copyHelp,
                  "Copies your %s settings (this preset's) as a code, one line of text to share: paste it in Discord "
                  "or anywhere. Whoever loads it with PASTE CODE gets your %s settings and keeps the rest of theirs.",
-                 g_panel.tab == 0 ? "first person camera" : "graphics", g_panel.tab == 0 ? "camera" : "graphics");
-        if (canCopy && Button(copyCodeItem, hintX, copyW, copyLabel, false, copyHelp)) {
-            const std::string code = PresetCode(g_panel.tab);
+                 codeTab == 0 ? "first person camera" : "graphics", codeTab == 0 ? "camera" : "graphics");
+        if (canCopy && Button(copyCodeItem, boxX, cwBtn, "COPY CODE", false, copyHelp)) {
+            const std::string code = PresetCode(codeTab);
             char text[112];
             if (code.empty()) {
                 SetStatus("CODES ARE FOR THE FIRST PERSON AND GRAPHICS TABS - OPEN ONE TO COPY ITS CODE", now);
             } else if (CopyToClipboard(code)) {
-                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %s, %d CHARACTERS) - PASTE IT TO SHARE", tabName,
+                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %s, %d CHARACTERS) - PASTE IT TO SHARE", kTabs[codeTab],
                          PresetLabel(ActivePreset()).c_str(), static_cast<int>(code.size()));
                 SetStatus(text, now);
-                Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, tabName, code.c_str());
+                Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, kTabs[codeTab], code.c_str());
             } else {
                 SetStatus("COULD NOT COPY TO THE CLIPBOARD", now);
             }
         }
-        const float pasteX = canCopy ? hintX + copyW + gap : hintX;
-        if (Button(pasteCodeItem, pasteX, cw, "PASTE CODE", false,
+        const float pasteX = canCopy ? boxX + cwBtn + S(12) : boxX;
+        if (Button(pasteCodeItem, pasteX, cwBtn, "PASTE CODE", false,
                    "Copy someone's code first (from Discord or anywhere: the whole message is fine), then press "
                    "this to load it into the preset in use. A first person code sets the first person settings, a "
-                   "graphics code the graphics: everything else stays yours, the preset's name too. Press SAVE to keep it: quit without "
-                   "saving and the preset is as you last saved it.")) {
+                   "graphics code the graphics: everything else stays yours, the preset's name too. Press SAVE to keep "
+                   "it: quit without saving and the preset is as you last saved it.")) {
             const PresetCodeResult r = LoadPresetCode(ClipboardText().c_str());
             char text[128];
             switch (r.status) {
@@ -2461,47 +2980,12 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 camera::Reset();
                 g_panel.dirty = true;
                 snprintf(text, sizeof text, "%s CODE LOADED INTO PRESET %s%s - SAVE TO KEEP IT",
-                         r.tab >= 0 && r.tab < static_cast<int>(sizeof kTabs / sizeof kTabs[0]) ? kTabs[r.tab] : "",
+                         r.tab >= 0 && r.tab < kTabCount ? kTabs[r.tab] : "",
                          PresetLabel(ActivePreset()).c_str(), r.unknown ? " (SOME NEWER SETTINGS LEFT OUT)" : "");
                 SetStatus(text, now);
                 break;
             }
         }
-        hintX = pasteX + cw + S(24);
-    }
-
-    {
-        const float hintY = y + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f);
-        const float room = buttonsX - S(12) - hintX;
-        // Whatever doesn't fit beside the presets goes on the readout line above instead.
-        const auto Hint = [&](const char* text, uint32_t color) {
-            if (TextWidth(kFontSmall, text, S(1)) <= room)
-                Text(kFontSmall, hintX, hintY, text, color, S(1));
-            else
-                Text(kFontSmall, x + innerW - TextWidth(kFontSmall, text, S(1)), y - S(36), text, color, S(1));
-        };
-        if (g_panel.listening >= 0) {
-            char label[64], hint[160];
-            Upper(kRows[g_panel.listening].label, label, sizeof label);
-            if (kRows[g_panel.listening].kind == RowKind::Pad)
-                snprintf(hint, sizeof hint, "PRESS A BUTTON OR PUSH A STICK FOR %s   \xB7   BACKSPACE CLEARS   \xB7   ESC CANCELS", label);
-            else
-                snprintf(hint, sizeof hint, "PRESS THE NEW KEY FOR %s   \xB7   ESC CANCELS", label);
-            Hint(hint, White(1.0f));
-        } else if (now < g_panel.statusUntil) {
-            Hint(g_panel.status, White(1.0f));
-        } else {
-            char hint[128];
-            snprintf(hint, sizeof hint, "%s TO CLOSE   \xB7   ARROW KEYS ADJUST", KeyName(cfg.menuKey));
-            Hint(hint, kDim);
-        }
-    }
-    y += buttonH + S(14);
-
-    // ---- Credit, bottom right ----
-    {
-        const char* author = "By: Voaks";
-        Text(kFontSmall, x + innerW - TextWidth(kFontSmall, author, S(1)), y, author, kDim, S(1));
     }
 
     if (in.released || !in.down) {
@@ -2511,26 +2995,26 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     }
 
     // ---- Help box: beside the panel, level with its row; on a screen too narrow for that, just
-    // under (or over) the row in its own column ----
+    // under (or over) the row ----
     const HelpSpot& help = g_panel.helpForMouse ? hoveredHelp : selectedHelp;
     if (help.text) {
         const float padX = S(16), padY = S(12), lineH = LineHeight(kFontBody), margin = S(8);
         const bool beside = px + panelW + S(14) + S(340) <= screenWidth - margin;
-        const float boxW = beside ? S(340) : std::fmax(help.width, S(300));
+        const float boxWidth = beside ? S(340) : std::fmax(help.width, S(300));
         char lines[kMaxWrapLines][kWrapLineSize];
-        const int count = WrapText(kFontBody, help.text, boxW - 2 * padX, lines);
-        const float boxH = 2 * padY + count * lineH;
+        const int count = WrapText(kFontBody, help.text, boxWidth - 2 * padX, lines);
+        const float boxHeight = 2 * padY + count * lineH;
         float bx, by;
         if (beside) {
             bx = px + panelW + S(14);
-            by = std::fmax(S(16), std::fmin(help.top, screenHeight - boxH - S(16)));
+            by = std::fmax(S(16), std::fmin(help.top, screenHeight - boxHeight - S(16)));
         } else {
-            bx = std::fmax(margin, std::fmin(help.left, screenWidth - boxW - margin));
+            bx = std::fmax(margin, std::fmin(help.left, screenWidth - boxWidth - margin));
             by = help.bottom + S(6);
-            if (by + boxH > screenHeight - margin)
-                by = std::fmax(margin, help.top - boxH - S(6));
+            if (by + boxHeight > screenHeight - margin)
+                by = std::fmax(margin, help.top - boxHeight - S(6));
         }
-        PanelFill(bx, by, boxW, boxH, S(8));
+        PanelFill(bx, by, boxWidth, boxHeight, S(6));
         for (int i = 0; i < count; ++i)
             Text(kFontBody, bx + padX, by + padY + i * lineH, lines[i], kLabel, 0);
     }
@@ -2562,9 +3046,8 @@ void UpdateFade(double now)
             }
     }
     const int row = g_panel.adjustRow;
-    const bool graphicsSlider = row >= 0 && row < kRowCount && kRows[row].tab == g_panel.tab &&
-                                kRows[row].kind == RowKind::Slider &&
-                                (g_panel.tab == kTabGraphics || g_panel.tab == kTabWeather);
+    const bool graphicsSlider = row >= 0 && row < kRowCount && RowShown(row) && kRows[row].kind == RowKind::Slider &&
+                                (kRows[row].tab == kTabGraphics || kRows[row].tab == kTabWeather);
     const bool adjusting = cfg.fadeMenu && graphicsSlider &&
                            (g_panel.dragging == row || (g_panel.adjustedAt >= 0 && now - g_panel.adjustedAt < kAdjustHold));
     const float target = adjusting ? kFadedOpacity : 1.0f;
@@ -2621,7 +3104,23 @@ void DrawBatch(int width, int height)
     g_gl.BindVertexArray(g_gpu.vao);
     g_gl.BindBuffer(kArrayBuffer, g_gpu.vbo);
     g_gl.BufferData(kArrayBuffer, static_cast<ptrdiff_t>(g_batch.size() * sizeof(Vertex)), g_batch.data(), kStreamDraw);
-    g_gl.DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_batch.size()));
+    // In order: what's outside the clip ranges as it is, each clip range inside its rectangle.
+    size_t at = 0;
+    const auto Draw = [](size_t from, size_t to) {
+        if (to > from)
+            g_gl.DrawArrays(GL_TRIANGLES, static_cast<GLint>(from), static_cast<GLsizei>(to - from));
+    };
+    for (const ClipRange& clip : g_clips) {
+        Draw(at, clip.begin);
+        g_gl.Enable(GL_SCISSOR_TEST);
+        const int x0 = static_cast<int>(std::floor(clip.x)), x1 = static_cast<int>(std::ceil(clip.x + clip.w));
+        const int y0 = static_cast<int>(std::floor(clip.y)), y1 = static_cast<int>(std::ceil(clip.y + clip.h));
+        g_gl.Scissor(x0, height - y1, x1 - x0 > 0 ? x1 - x0 : 0, y1 - y0 > 0 ? y1 - y0 : 0);
+        Draw(clip.begin, clip.end);
+        g_gl.Disable(GL_SCISSOR_TEST);
+        at = clip.end;
+    }
+    Draw(at, g_batch.size());
 }
 
 // ===========================================================================
@@ -2656,7 +3155,7 @@ void BuildStartupHint(int width, int height, double now)
     const float x = std::round((width - w) * 0.5f), y = std::round((height - h) * 0.5f), r = S(8);
     RoundedRect(x - S(2), y - S(2), w + S(4), h + S(4), r + S(2), Faded(kBorder, a));
     RoundedRect(x, y, w, h, r, Faded(kPanelColor, a));
-    Text(kFontTitle, x + padX, y + padY, lead, Faded(kBlueHot, a), S(1));
+    Text(kFontTitle, x + padX, y + padY, lead, Faded(kAccentHot, a), S(1));
     Text(kFontTitle, x + padX + leadW + gap, y + padY, rest, Faded(White(1.0f), a), 0);
 }
 
@@ -2675,12 +3174,13 @@ void StartupHintFrame(HWND window, double now)
     if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
         return;
     const int width = client.right, height = client.bottom;
-    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
+    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1440.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
     SavedState saved;
     SaveState(saved);
     if (EnsureResources(scale)) {
         g_batch.clear();
         g_keepRanges.clear();
+        g_clips.clear();
         BuildStartupHint(width, height, now);
         DrawBatch(width, height);
     }
@@ -2725,8 +3225,8 @@ void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, dou
         if (hot && in.pressed)
             chosen = b;
         const bool lit = g_panel.askChoice == b;
-        RoundedRect(x - 1, buttonsY - 1, buttonW + 2, buttonH + 2, S(6) + 1, lit ? kBlueHot : kBorder);
-        RoundedRect(x, buttonsY, buttonW, buttonH, S(6), lit ? kBlue : kPanelSolid);
+        RoundedRect(x - 1, buttonsY - 1, buttonW + 2, buttonH + 2, S(6) + 1, lit ? kAccentHot : kBorder);
+        RoundedRect(x, buttonsY, buttonW, buttonH, S(6), lit ? kAccent : kPanelSolid);
         const char* label = b ? "ON" : "OFF";
         Text(kFontSmall, std::round(x + (buttonW - TextWidth(kFontSmall, label, S(2))) * 0.5f),
              buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), label, White(lit ? 1.0f : 0.88f), S(2));
@@ -2753,15 +3253,24 @@ void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, dou
 // with a foot down), from the game's dab key and settings (dab.cpp).
 // ===========================================================================
 // A line of width w with round ends.
+// Its sides feathered over a pixel (fading to clear), so it's smooth at any angle, and its ends round.
 void Segment(float x0, float y0, float x1, float y1, float w, uint32_t color)
 {
     const float dx = x1 - x0, dy = y1 - y0, length = std::sqrt(dx * dx + dy * dy);
     if (length > 1e-3f) {
-        const float nx = -dy / length * w * 0.5f, ny = dx / length * w * 0.5f;
+        const float ax = -dy / length, ay = dx / length;  // across the line
+        const float core = std::fmax(w - 1.0f, 0.0f) * 0.5f, outer = core + 1.0f;
+        const uint32_t clear = color & 0x00FFFFFFu;
         const float u = 4.0f / kAtlasSize;  // the solid block
-        const Vertex a{ x0 + nx, y0 + ny, u, u, color }, b{ x1 + nx, y1 + ny, u, u, color };
-        const Vertex c{ x1 - nx, y1 - ny, u, u, color }, d{ x0 - nx, y0 - ny, u, u, color };
-        g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+        const auto Strip = [&](float from, float to, uint32_t c0, uint32_t c1) {
+            const Vertex a{ x0 + ax * from, y0 + ay * from, u, u, c0 }, b{ x1 + ax * from, y1 + ay * from, u, u, c0 };
+            const Vertex c{ x1 + ax * to, y1 + ay * to, u, u, c1 }, d{ x0 + ax * to, y0 + ay * to, u, u, c1 };
+            g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+        };
+        if (core > 0)
+            Strip(-core, core, color, color);
+        Strip(core, outer, color, clear);
+        Strip(-core, -outer, color, clear);
     }
     Disc(x0, y0, w * 0.5f, color);
     Disc(x1, y1, w * 0.5f, color);
@@ -2850,12 +3359,13 @@ void DabIndicatorFrame(HWND window)
     if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
         return;
     const int width = client.right, height = client.bottom;
-    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
+    const float scale = std::round(Clamp(std::fmin(height / 1080.0f, width / 1440.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;  // (as the menu's)
     SavedState saved;
     SaveState(saved);
     if (EnsureResources(scale)) {
         g_batch.clear();
         g_keepRanges.clear();
+        g_clips.clear();
         BuildDabIndicator(width, height, sitting);
         DrawBatch(width, height);
     }
@@ -2867,7 +3377,7 @@ void DabIndicatorFrame(HWND window)
 bool OverlayListeningForKey()
 {
     // And a moment after: the key that answered may still be held. (Typing a preset's name too.)
-    return g_panel.listening >= 0 || g_panel.renaming >= 0 || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
+    return g_panel.listening >= 0 || g_panel.renaming >= 0 || g_panel.searchFocus || (g_panel.listenEnded >= 0 && Seconds() - g_panel.listenEnded < 0.5);
 }
 
 bool OverlayPanelOpen() { return g_panel.open; }
@@ -2951,7 +3461,17 @@ void OverlayFrame(HDC dc)
         char tab[8] = "";
         if (GetEnvironmentVariableA("MXCAM_TEST_MENU_TAB", tab, sizeof tab) > 0)
             g_panel.tab = Clamp(atoi(tab), 0, kTabCount - 1);
+        char search[64] = "";
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_SEARCH", search, sizeof search) > 0)
+            g_panel.search = search;
     }
+    // (And scrolled this far down the list, pixels.)
+    static const float testScroll = [] {
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_MENU_SCROLL", text, sizeof text) > 0 ? static_cast<float>(atof(text)) : -1.0f;
+    }();
+    if (testScroll >= 0 && g_panel.open)
+        g_panel.scroll = g_panel.scrollTarget = testScroll;
 
     if (!g_panel.open) {
         if (!window || !g_glAvailable)
@@ -2969,8 +3489,10 @@ void OverlayFrame(HDC dc)
         g_panel.askSticky = false;
     } else if (g_panel.renaming >= 0 && focus && escape) {
         FinishRename(false, now);  // Esc while renaming: the name stays as it was, the menu open
-    } else if (g_panel.closeRequest ||
-               (focus && g_panel.listening < 0 && g_panel.renaming < 0 && !g_panel.askSticky && (menuKey || escape))) {
+    } else if (focus && escape && g_panel.listening < 0 && (g_panel.searchFocus || !g_panel.search.empty())) {
+        ClearSearch();  // Esc with a search: the search goes, the menu stays
+    } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && g_panel.renaming < 0 && !g_panel.searchFocus &&
+                                        !g_panel.askSticky && (menuKey || escape))) {
         g_panel.askSticky = false;
         ClosePanel();
         return;
@@ -2983,6 +3505,7 @@ void OverlayFrame(HDC dc)
         return;
     const int width = client.right, height = client.bottom;
     Input in = ReadInput(window, focus, width, height, now);
+    UpdateQuery();
     if (g_panel.listening >= 0) {
         // The next key press is the answer, not navigation.
         if (focus)
@@ -2992,12 +3515,15 @@ void OverlayFrame(HDC dc)
         in.nav = in.step = 0;
         in.activate = false;
     }
-    if (g_panel.renaming >= 0) {
-        // Keys type the name: none of them move around the menu.
-        if (focus)
-            TypeName(now);
-        else
-            FinishRename(true, now);
+    if (g_panel.renaming >= 0 || g_panel.searchFocus) {
+        // Keys type the name (or the search): none of them move around the menu.
+        if (g_panel.renaming >= 0) {
+            if (!focus || TypeInto(g_panel.nameDraft, kPresetNameMax, now))
+                FinishRename(true, now);
+        } else if (!focus || TypeInto(g_panel.search, kSearchMax, now)) {
+            g_panel.searchFocus = false;  // Enter: done typing, the results stay
+        }
+        UpdateQuery();
         in.nav = in.step = 0;
         in.activate = in.rename = false;
     }
@@ -3007,15 +3533,23 @@ void OverlayFrame(HDC dc)
     // held down so the whole panel fits top to bottom: the tallest tab grew past what 1080 holds at
     // 1.0 (a window 1074 high cut the buttons off), and rounding to a step never takes it back over.
     const float panelHeight = PanelHeightAtScale1();
-    float scale = std::round(Clamp(std::fmin(height / std::fmax(1080.0f, panelHeight), width / 1320.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;
+    float scale = std::round(Clamp(std::fmin(height / std::fmax(1080.0f, panelHeight), width / 1440.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;
     while (scale > 0.6f && scale * panelHeight > height)
         scale -= 0.05f;
+    // For automated tests: drawn at this scale whatever the window (to see that a 4K screen's fits).
+    static const float testScale = [] {
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_MENU_SCALE", text, sizeof text) > 0 ? static_cast<float>(atof(text)) : 0.0f;
+    }();
+    if (testScale > 0)
+        scale = testScale;
 
     SavedState saved;
     SaveState(saved);
     if (EnsureResources(scale)) {
         g_batch.clear();
         g_keepRanges.clear();
+        g_clips.clear();
         UpdateFade(now);
         if (g_panel.askSticky) {
             // The question takes every click and key; the menu behind it is shown, untouched.

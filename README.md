@@ -42,19 +42,21 @@ Coming from a version that used `mxcam.ini` and `mxcam_sounds`? The mod renames 
 
 ## The menu
 
-Press **E** in game to open the menu. It has six tabs: **FIRST PERSON**, **GRAPHICS**, **WEATHER**, **REPLAY**, **KEYBINDS** and **OTHER**. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back.
+Press **E** in game to open the menu. Its six tabs run down the left: **FIRST PERSON**, **GRAPHICS**, **WEATHER**, **REPLAY**, **KEYBINDS** and **OTHER**. The tab's settings are listed in the box on the right: scroll with the mouse wheel, the arrows or the scrollbar beside it. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back.
+
+Looking for a setting? Click **Search** above the tabs and type part of its name (or its section, like "shadow"): every matching setting from every tab is listed. **Esc** or the **x** clears it.
 
 While you drag a **GRAPHICS** or **WEATHER** slider (or step it with the arrow keys), the menu fades out except for that slider, so you can see the whole picture change. You can turn this off on the **OTHER** tab.
 
 ### Presets
 
-At the top right of the menu, **PRESET 1 / 2 / 3 / 4 / 5** switches between five setting profiles, for example one for racing, one for replays and one for night riding. Each preset has its own copy of every setting on the FIRST PERSON, GRAPHICS, WEATHER, REPLAY and OTHER tabs (keybinds are shared). Changes you make stay with the preset you made them in, and **DEFAULTS** only resets the preset in use. Press **SAVE** to keep them all, and the game starts on whichever preset was in use when you saved. A preset you haven't set up yet starts as a copy of your current settings.
+At the top of the menu, next to the logo, **PRESET 1 / 2 / 3 / 4 / 5** switches between five setting profiles, for example one for racing, one for replays and one for night riding. Each preset has its own copy of every setting on the FIRST PERSON, GRAPHICS, WEATHER, REPLAY and OTHER tabs (keybinds are shared). Changes you make stay with the preset you made them in, and **DEFAULTS** only resets the preset in use. Press **SAVE** to keep them all, and the game starts on whichever preset was in use when you saved. A preset you haven't set up yet starts as a copy of your current settings.
 
 To rename a preset, click the one in use again (or press **F2** with the presets selected), type a name of up to 16 characters and press **Enter**. **Esc** leaves the old name, and an empty name goes back to the number. Press **SAVE** to keep it. Names are yours alone: pasting someone else's code never changes them.
 
 ### Preset codes
 
-Share your setup without sending files. On the **FIRST PERSON** tab, **COPY FIRST PERSON CODE** copies your camera settings as one line of text (it starts with `MXS-REMASTERED-CAM-`); on the **GRAPHICS** tab, **COPY GRAPHICS CODE** does the same for your graphics (`MXS-REMASTERED-GFX-`). Paste it in Discord or anywhere.
+Share your setup without sending files. On the **FIRST PERSON** tab, **COPY CODE** copies your camera settings as one line of text (it starts with `MXS-REMASTERED-CAM-`); on the **GRAPHICS** tab, **COPY CODE** does the same for your graphics (`MXS-REMASTERED-GFX-`). Paste it in Discord or anywhere.
 
 To load someone's code, copy it (the whole message is fine), open the menu and press **PASTE CODE**, from any tab. It loads into the preset you're on: a first person code changes only your first person settings and a graphics code only your graphics, and everything else stays yours (keybinds are never in a code). Press **SAVE** to keep it, or quit without saving to go back to how that preset was.
 
