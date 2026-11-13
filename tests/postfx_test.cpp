@@ -16,6 +16,10 @@
 //     offscreen shadow maps: a tower behind the camera shades the ground in view
 //     stadium   the same under a roof 120 m across: the roof is left out, the ground stays sunny
 //     stadiumswap  the roof made in a deleted box's place (another track loaded): still left out
+//     hilltree  the offscreen scene with a box 18 m up (a tree on a hill above you): no stadium, so it
+//               still casts (stadium / stadiumswap: the same box is left out, as the stands' are);
+//               and a see-through puff before the tower whose depth writes come back by glPopAttrib,
+//               and after it a draw whose uniform makes the shader discard (a lobby's faded rider)
 //     headlight TimeOfDay=0 and the headlight: a lit pool ahead, the rest night
 //     headlightup / headlightdown  the same aimed 15 degrees up / 20 down: it reaches further / not as far
 //     tires     your bike rolling past on spinning wheels: a rut behind the rear one, mud on the tire
@@ -56,7 +60,7 @@ namespace {
     X(wglCreateContext) X(wglMakeCurrent) X(wglDeleteContext) X(wglGetProcAddress) X(glGetError) \
     X(glGetIntegerv) X(glIsEnabled) X(glEnable) X(glDisable) X(glViewport) X(glClearColor)       \
     X(glClear) X(glReadPixels) X(glPixelStorei) X(glFinish) X(glDrawElements) X(glBlendFunc)     \
-    X(glDepthMask)                                                                                \
+    X(glDepthMask) X(glPushAttrib) X(glPopAttrib)                                                 \
     X(glGenTextures) X(glBindTexture) X(glTexImage2D) X(glTexParameteri) X(glGetTexParameterfv)  \
     X(glReadBuffer)
 
@@ -253,6 +257,7 @@ int main(int argc, char** argv)
     // roof must still be measured as the roof and left out.
     const bool stadiumSwap = mode == "stadiumswap";
     const bool stadium = mode == "stadium" || stadiumSwap;
+    const bool hillTree = mode == "hilltree";
 
     // A folder of our own with the DLL and an ini for the mode.
     wchar_t temp[MAX_PATH];
@@ -287,7 +292,7 @@ int main(int argc, char** argv)
         settings = base;
     else if (mode == "shadows")  // screen-space shadows alone
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=0");
-    else if (mode == "offscreen" || stadium)  // shadow maps alone (the screen-space ones as short as they go)
+    else if (mode == "offscreen" || stadium || hillTree)  // shadow maps alone (the screen-space ones as short as they go)
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowLength=1");
     else if (mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson" || mode == "headlightup" ||
              mode == "headlightdown") {
@@ -425,7 +430,9 @@ int main(int argc, char** argv)
         "uniform mat4 u_modelview; uniform mat4 u_projection; uniform vec3 u_light_position;\n"
         "varying float v_light;\n"
         "void main() { v_light = u_light_position.x * 0.0001; gl_Position = u_projection * u_modelview * vec4(a_pos, 1.0); }",
-        "uniform vec3 u_color; varying float v_light; void main() { gl_FragColor = vec4(u_color + v_light, 1.0); }",
+        // (A negative colour throws the object away: how a shader can hide a faded rider - hilltree.)
+        "uniform vec3 u_color; varying float v_light; void main() { if (u_color.r < 0.0) discard; "
+        "gl_FragColor = vec4(u_color + v_light, 1.0); }",
         "a_pos");
     Check(terrain && object, "test shaders compile and link");
     if (!terrain || !object)
@@ -557,9 +564,9 @@ int main(int argc, char** argv)
     // throws its shadow forward onto the visible ground.
     const bool headShadow = mode == "headshadow";
     const bool farTower = mode == "longshadow" || mode == "oldshadow" || mode == "longsharp";
-    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "backshadow" ? 0.25f : (mode == "offscreen" || stadium) || farTower ? 0.0f : headShadow ? -0.5f : 0.3f,
-                              mode == "shadows" ? 0.6f : mode == "backshadow" ? 0.95f : (mode == "offscreen" || stadium) || farTower ? 0.15f : headShadow ? 0.17f : 0.8f,
-                              mode == "shadows" ? 0.0f : (mode == "offscreen" || stadium) || farTower ? 0.99f : headShadow ? 0.83f : 0.5f };
+    const float sunEye[3] = { mode == "shadows" ? 0.8f : mode == "backshadow" ? 0.25f : (mode == "offscreen" || stadium || hillTree) || farTower ? 0.0f : headShadow ? -0.5f : 0.3f,
+                              mode == "shadows" ? 0.6f : mode == "backshadow" ? 0.95f : (mode == "offscreen" || stadium || hillTree) || farTower ? 0.15f : headShadow ? 0.17f : 0.8f,
+                              mode == "shadows" ? 0.0f : (mode == "offscreen" || stadium || hillTree) || farTower ? 0.99f : headShadow ? 0.83f : 0.5f };
     const float hud[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0.3f, -1, 1 };  // scaled: the HUD
     const float flare[16] = { 0.05f, 0, 0, 0, 0, 0.05f, 0, 0, 0, 0, 0.05f, 0, -0.3f, 0.3f, -1, 1 };  // the game's lens flare
     const int flareX = static_cast<int>((1.0f - projection[0] * 0.3f) * 0.5f * W);
@@ -991,7 +998,24 @@ int main(int argc, char** argv)
             p_glDrawElements(GL_TRIANGLES, stadiumSwap && frameIndex < 10 ? 30 : 36, GL_UNSIGNED_SHORT, nullptr);
             gl.BindVertexArray(arrays[1]);
         }
-        if (mode == "offscreen" || stadium) {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
+        if (stadium || hillTree) {  // a small box 60 units (18 m) up, 20 ahead: all of it well above the camera
+            const float high[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0.0f, 60.0f, -20.0f, 1 };
+            Mul(view, high, viewModel);
+            gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+            p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+        }
+        if (mode == "offscreen" || stadium || hillTree) {  // a 2 m tower of two boxes, 0.8 m behind the camera and 1 m right
+            if (hillTree) {
+                // First a see-through puff whose depth writes are put back by glPopAttrib, not
+                // glDepthMask: the tower after it is solid and must still cast.
+                p_glPushAttrib(GL_DEPTH_BUFFER_BIT);
+                p_glDepthMask(GL_FALSE);
+                const float puff[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1.0f, 0.0f, 0.8f, 1 };
+                Mul(view, puff, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+                p_glPopAttrib();
+            }
             // Drawn with blending on, as MX Simulator draws its solid objects: it must still cast.
             p_glEnable(GL_BLEND);
             p_glBlendFunc(GL_ONE, GL_ZERO);
@@ -1014,6 +1038,17 @@ int main(int argc, char** argv)
             }
             p_glDepthMask(GL_TRUE);
             p_glDisable(GL_BLEND);
+            if (hillTree) {
+                // Last before the HUD, a lobby's faded rider: the same program, a uniform its shader
+                // throws everything away with. The tower's held-back cast must still be drawn with
+                // the uniforms it was drawn with, not these.
+                const float ghostColor[3] = { -1.0f, 0.0f, 0.0f };
+                gl.Uniform3fv(oColor, 1, ghostColor);
+                const float ghost[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 3.0f, 0.0f, -8.0f, 1 };
+                Mul(view, ghost, viewModel);
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, viewModel);
+                p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
         }
 
         // Game state the effects must not disturb.
@@ -1026,7 +1061,8 @@ int main(int argc, char** argv)
         // The HUD: a scaled u_modelview. The effects run right before this draw.
         gl.UniformMatrix4fv(oMv, 1, GL_FALSE, hud);
         const float white[3] = { 1, 1, 1 };
-        gl.Uniform3fv(oColor, 1, white);
+        if (!hillTree)  // (hilltree: the faded rider's uniform still set as the scene ends - its HUD isn't drawn)
+            gl.Uniform3fv(oColor, 1, white);
         gl.BindVertexArray(arrays[2]);
         p_glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
         // The game's lens flare: a sprite added onto the picture, left of the HUD.
@@ -1188,7 +1224,7 @@ int main(int argc, char** argv)
             fclose(in);
         }
         Check(log.find("hud: hiding the game's HUD while riding") != std::string::npos, "the log says the HUD is hidden");
-    } else {
+    } else if (!hillTree) {  // (hilltree's HUD square is thrown away by the faded rider's uniform)
         Check(hudPixel.r == 255 && hudPixel.g == 255 && hudPixel.b == 255, "the HUD is drawn after the effects, untouched");
     }
     Check(static_cast<GLuint>(programAfter) == object, "the current program is the game's again");
@@ -1332,7 +1368,23 @@ int main(int argc, char** argv)
             Check(log.find("(18 m around the camera, 4096x4096)") != std::string::npos,
                   "an old ini's ShadowDistance=60 (feet) and ShadowMapSize=4096 read as before: 18 m at 4096");
         }
-    } else if (mode == "offscreen" || stadium) {
+    } else if (mode == "offscreen" || stadium || hillTree) {
+        std::string log;
+        if (FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO)) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        const bool overheadOut = log.find("left out an object all overhead") != std::string::npos;
+        if (hillTree) {
+            Check(!overheadOut, "no stadium: something all above the camera (a tree up a hill) still casts");
+            Check(log.find("has a stadium") == std::string::npos, "and the track isn't taken for a stadium");
+        } else if (stadium) {
+            Check(log.find("has a stadium") != std::string::npos, "the roof makes the track a stadium");
+            Check(overheadOut, "where things all overhead are left out (the stands, the lights)");
+        }
         // Ground 3.5 m ahead and 1 m right (in the tower's shadow) against 1 m left (in the sun).
         const Pixel shaded = At(604, 374), sunny = At(356, 374);
         printf("    ground right %d %d %d (tower's shadow), left %d %d %d\n", shaded.r, shaded.g, shaded.b, sunny.r, sunny.g, sunny.b);

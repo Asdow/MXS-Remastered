@@ -134,6 +134,7 @@ struct Config {
     double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
                                           // reaches further ahead; down: nearer)
     // WEATHER (postfx: the composite pass and the snowfall pass)
+    bool   rain             = false;      // (coming soon: only a placeholder row in the menu, never read or saved)
     bool   snow             = false;      // snow on the ground (terrain only; your ruts dig through it to the
                                           // dirt) and an overcast sky; off = no weather
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
@@ -202,6 +203,13 @@ Config& EditConfig();  // for the settings panel; changes apply from the next fr
 void LoadConfig(const wchar_t* iniPath);
 void ReloadConfig();
 void SetEnabled(bool enabled);
+
+// The shadow map's texels per side, from the Shadow resolution choice as it is now (a change in
+// the menu applies straight away, without reloading the ini).
+inline int ShadowMapSize(const Config& c)
+{
+    return 2048 << (c.shadowResolution < 0 ? 0 : c.shadowResolution > 2 ? 2 : c.shadowResolution);
+}
 
 // Writes Enabled, MenuKey and the camera tunables back to MXS_REMASTERED.ini (comments and other keys are kept).
 bool SaveConfig();

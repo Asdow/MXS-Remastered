@@ -177,6 +177,13 @@ void NoteRiderDrawDropped();
 // see-through, 5 held back (into the shadow map later, with the others).
 bool OwnRiderEye(float out[3]);
 void NoteNearCast(int outcome);
+// The same for every draw offered to the shadow map (the trace's sh_all_* column): 0 a 3D object
+// that writes depth, 1 cast straight away, 2 too big / overhead, 3 out of reach, 4 see-through, 5
+// held back, 6 not a 3D object, 7 depth writes found back on (the game turned them on some other
+// way than glDepthMask: taken as solid).
+void NoteCast(int outcome);
+// How far from the camera (m) a 3D object offered to the shadow map is (sh_seen_m_* in the trace).
+void NoteCastDistance(double metres);
 
 // Whether a point (in the eye space the frame is drawn from) is within reach of any rider: one of last
 // frame's (a bike can be drawn before its rider). For the shadow map: what's with the riders - their

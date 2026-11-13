@@ -145,6 +145,7 @@ using PFN_DeleteObjects         = void (APIENTRY*)(GLsizei count, const GLuint* 
 PFN_DeleteObjects           real_glDeleteBuffers           = nullptr;
 PFN_DeleteObjects           real_glDeleteVertexArrays      = nullptr;
 using PFN_GetIntegerv           = void (APIENTRY*)(GLenum pname, GLint* data);
+using PFN_GetFloatv             = void (APIENTRY*)(GLenum pname, GLfloat* data);
 PFN_GetIntegerv             real_glGetIntegerv             = nullptr;  // OpenGL 1.1 export, for the lens flare check
 
 // What each program's u_modelview last held this frame, to tell the 3D scene from the HUD.
@@ -233,6 +234,8 @@ struct BufferUpdates { unsigned lastFrame = 0; int frames = 0; };
 struct AttribPointer { GLuint buffer = 0; GLint size = 0; GLenum type = 0; GLsizei stride = 0; uintptr_t offset = 0; };
 std::unordered_map<unsigned long long, AttribPointer> g_vaoAttribs;  // (vertex array << 4 | index) -> its pointer
 int g_loggedBigCasters = 0;  // objects left out of the shadow map logged (this track)
+bool g_stadiumTrack = false;  // this track has drawn something far bigger than a track's props
+                              // (a stadium's roof or stands): things all overhead are left out too
 std::unordered_map<GLuint, BufferUpdates> g_bufferUpdates;          // buffers rewritten while running
 
 struct DeferredCaster {
@@ -247,8 +250,104 @@ struct DeferredCaster {
     unsigned vaoGen = 0;         // its vertex array's g_vaoGeneration when kept (for the trace)
     unsigned attribSet = 0;      // the constant vertex attributes it was drawn with (see g_constAttrib)
     GLfloat  attrib[kConstAttribs][4] = {};
+    int      uniforms = -1;      // its program's other uniforms as it was drawn: g_uniformSnaps[uniforms]
 };
 std::vector<DeferredCaster> g_deferredCasters;
+
+// ---- The uniforms a held-back caster was drawn with ------------------------------------------
+// A held-back caster is drawn again at the end of the scene, with its program as the game last
+// left it. Its matrices, textures, bones and constant attributes were put back; its program's other
+// uniforms weren't. In a lobby the last draw before then left one the shader throws everything
+// away with: not one of ~900 held-back casters wrote a depth sample (single player: 4.9 million),
+// and every shadow but those cast as drawn (within 4 m of you) was gone. So each program's
+// single-value uniforms are followed as the game uploads them, each caster keeps a copy of its
+// program's, and the replay uploads the ones that differ (the game's are put back after).
+struct UniformSlot {
+    unsigned char kind = 0;  // 0 none, 1 glUniform1i, 2 glUniform1f, 3 2fv, 4 3fv, 5 4fv
+    GLfloat       v[4] = {};
+    GLint         i = 0;
+    bool          listed = false;  // (in ProgramUniforms::used; not part of the value)
+    bool operator==(const UniformSlot& o) const
+    {
+        return kind == o.kind && i == o.i && v[0] == o.v[0] && v[1] == o.v[1] && v[2] == o.v[2] && v[3] == o.v[3];
+    }
+    bool operator!=(const UniformSlot& o) const { return !(*this == o); }
+};
+struct ProgramUniforms {
+    std::vector<UniformSlot> now;   // as the game uploaded them, by location
+    std::vector<GLint>       used;  // locations that hold one
+    unsigned version = 1;           // bumped on every upload
+    unsigned snapGeneration = 0, snapVersion = 0;
+    int      snapIndex = -1;
+};
+constexpr GLint kMaxTrackedLocation = 1024;
+std::unordered_map<GLuint, ProgramUniforms> g_programUniforms;
+ProgramUniforms* g_currentUniforms = nullptr;  // g_program's
+struct UniformSnap {
+    GLuint program = 0;
+    std::vector<std::pair<GLint, UniformSlot>> slots;
+};
+std::vector<UniformSnap> g_uniformSnaps;  // this frame's (DeferredCaster::uniforms)
+unsigned g_snapGeneration = 1;             // bumped whenever they're let go
+
+void ClearUniformSnaps()
+{
+    g_uniformSnaps.clear();
+    ++g_snapGeneration;
+}
+
+void NoteUniformProgram(GLuint program)
+{
+    g_currentUniforms = program ? &g_programUniforms[program] : nullptr;
+}
+
+// An upload of the game's (the value as it went to GL). Arrays aren't followed: a location given
+// several at once (bones, lights) is forgotten, so it's never put back from a single value.
+void NoteUniformValue(GLint location, GLsizei count, int kind, const GLfloat* f, GLint i)
+{
+    if (!g_currentUniforms || location < 0 || location >= kMaxTrackedLocation)
+        return;
+    ProgramUniforms& u = *g_currentUniforms;
+    if (u.now.size() <= static_cast<size_t>(location))
+        u.now.resize(static_cast<size_t>(location) + 1);
+    UniformSlot& slot = u.now[static_cast<size_t>(location)];
+    if (!slot.listed) {
+        slot.listed = true;
+        u.used.push_back(location);
+    }
+    if (count != 1 || !f && kind != 1) {
+        slot.kind = 0;
+    } else {
+        slot.kind = static_cast<unsigned char>(kind);
+        slot.i = i;
+        const int n = kind == 3 ? 2 : kind == 4 ? 3 : kind == 5 ? 4 : kind == 2 ? 1 : 0;
+        for (int k = 0; k < 4; ++k)
+            slot.v[k] = k < n ? f[k] : 0.0f;
+    }
+    ++u.version;
+}
+
+// g_program's uniforms as they stand: the index of a copy (shared by every caster drawn while they
+// stay the same), or -1.
+int SnapshotUniforms()
+{
+    if (!g_currentUniforms)
+        return -1;
+    ProgramUniforms& u = *g_currentUniforms;
+    if (u.snapGeneration == g_snapGeneration && u.snapVersion == u.version && u.snapIndex >= 0)
+        return u.snapIndex;
+    UniformSnap snap;
+    snap.program = g_program;
+    snap.slots.reserve(u.used.size());
+    for (GLint location : u.used)
+        if (u.now[static_cast<size_t>(location)].kind != 0)
+            snap.slots.emplace_back(location, u.now[static_cast<size_t>(location)]);
+    g_uniformSnaps.push_back(std::move(snap));
+    u.snapGeneration = g_snapGeneration;
+    u.snapVersion = u.version;
+    u.snapIndex = static_cast<int>(g_uniformSnaps.size()) - 1;
+    return u.snapIndex;
+}
 struct CasterBones {
     int     count = 0;
     bool    transposed = false;
@@ -635,6 +734,11 @@ const GLfloat* CorrectModelview(GLuint program, GLint location, GLsizei count, G
     if (!Correcting(cfg) || !value || count != 1 || transpose)
         return value;
     const bool lookOnly = LookOnly(cfg);
+    // The mod off and the look keys not turning the view: once the camera has been seen this frame
+    // there's nothing more to do (the sky only matters before it, the bike tracker is off) - skipped
+    // before the lookups, as this runs for every draw.
+    if (lookOnly && g_camera.capturedThisFrame && !g_camera.haveCorrection)
+        return value;
 
     AcquireSRWLockShared(&g_lock);
     const bool isModelview = g_modelviewUniforms.count(UniformKey(program, location)) != 0;
@@ -1398,6 +1502,7 @@ void PrepareSkinnedDraw()
 void APIENTRY Wrap_glUseProgram(GLuint program)
 {
     NoteUseProgram(program);
+    NoteUniformProgram(program);
     DumpCall("glUseProgram(%u)", program);
     real_glUseProgram(program);
 }
@@ -1405,6 +1510,7 @@ void APIENTRY Wrap_glUseProgram(GLuint program)
 void APIENTRY Wrap_glUseProgramObjectARB(GLuint program)
 {
     NoteUseProgram(program);
+    NoteUniformProgram(program);
     DumpCall("glUseProgramObjectARB(%u)", program);
     real_glUseProgramObjectARB(program);
 }
@@ -1531,7 +1637,9 @@ void APIENTRY Wrap_glUniform4fv(GLint location, GLsizei count, const GLfloat* va
 {
     DumpUniform("glUniform4fv", g_program, location, count, 0, value, 4);
     GLfloat scratch[kMaxLights * 4];
-    real_glUniform4fv(location, count, CorrectLight(location, count, value, 4, scratch));
+    const GLfloat* up = CorrectLight(location, count, value, 4, scratch);
+    NoteUniformValue(location, count, 5, up, 0);
+    real_glUniform4fv(location, count, up);
 }
 
 void APIENTRY Wrap_glUniform4fvARB(GLint location, GLsizei count, const GLfloat* value)
@@ -1560,7 +1668,9 @@ void APIENTRY Wrap_glUniform3fv(GLint location, GLsizei count, const GLfloat* va
     ObserveBones(location, count, value);
     NoteSkinnedVectors(location, count, value, false);
     GLfloat scratch[kMaxLights * 3];
-    real_glUniform3fv(location, count, CorrectLight(location, count, value, 3, scratch));
+    const GLfloat* up = CorrectLight(location, count, value, 3, scratch);
+    NoteUniformValue(location, count, 4, up, 0);
+    real_glUniform3fv(location, count, up);
 }
 
 void APIENTRY Wrap_glUniform3fvARB(GLint location, GLsizei count, const GLfloat* value)
@@ -1606,6 +1716,7 @@ void NoteTerrainUniform(GLint location, GLsizei count, const GLfloat* value, int
             postfx::MarksNewTrack();  // the ground of the marks is another track's as well
             g_variants.clear();
             g_loggedBigCasters = 0;  // (another track: log what's left out of it too)
+            g_stadiumTrack = false;
             Log("terrain: %s = %g %g (a new heightmap)", location == u.spacing ? kSpacingUniform : kHeightsDimUniform,
                 value[0], second);
             // The patches are whole numbers of samples; samples apart / 1 over samples across: the
@@ -1781,6 +1892,7 @@ void APIENTRY Wrap_glUniform2fv(GLint location, GLsizei count, const GLfloat* va
 {
     DumpUniform("glUniform2fv", g_program, location, count, 0, value, 2);
     NoteTerrainUniform(location, count, value, 2);
+    NoteUniformValue(location, count, 3, value, 0);
     real_glUniform2fv(location, count, value);
 }
 
@@ -1789,6 +1901,7 @@ void APIENTRY Wrap_glUniform1f(GLint location, GLfloat v0)
     if (IsDumping())
         DumpCall("glUniform1f prog=%u loc=%d '%s' [%.3f]", g_program, location, UniformName(g_program, location).c_str(), v0);
     NoteTerrainUniform(location, 1, &v0, 1);
+    NoteUniformValue(location, 1, 2, &v0, 0);
     real_glUniform1f(location, v0);
 }
 
@@ -1797,6 +1910,7 @@ void APIENTRY Wrap_glUniform1i(GLint location, GLint v0)
     if (IsDumping())
         DumpCall("glUniform1i prog=%u loc=%d '%s' [%d]", g_program, location, UniformName(g_program, location).c_str(), v0);
     NoteSkinnedCount(location, v0);
+    NoteUniformValue(location, 1, 1, nullptr, v0);
     real_glUniform1i(location, v0);
 }
 
@@ -2227,6 +2341,8 @@ void StartTrace(double seconds)
                      "hl_mode,third_person,bike_pass,bike_object,objects,bike_carry_m,hl_ahead_m,hl_up_m,hl_across_m,"
                      "dab_key,dab_sitting,speed_ms,sh_pieces_drawn,sh_real_body,sh_real_helmet,sh_shapes,sh_late_3d,sh_riders_dropped,"
                      "sh_near_seen/cast_now/big/range/seethrough/held_back,"
+                     "sh_all_seen/cast_now/big/range/seethrough/held_back/not3d/depth_back_on,"
+                     "sh_seen_m_0-50/50-100/100-200/200+,sh_flush_samples,"
                      "sh_replay_skinned_drawn/indices_changed/repointed/no_bones,sh_replay_rigid_drawn/indices_changed/repointed/no_bones,"
                      "sh_real_body_along,marks_repressed,marks_repress_waiting,marks_others_cached,marks_ms,marks_window_still,"
                      "gpu_shadow_flush_ms,gpu_effects_ms,cpu_shadow_flush_ms,cpu_effects_ms,cpu_cast_now_ms,cpu_wheel_watch_ms,"
@@ -2406,6 +2522,7 @@ DeferredCaster MakeCaster(const DrawCall& draw, GLint modelviewLoc, GLint projec
     c.projectionLoc = projectionLoc;
     if (const SkinnedProgram* skin = FindSkinned(g_program))
         c.boneCountLoc = skin->positionLoc >= 0 ? skin->countLoc : -1;
+    c.uniforms = SnapshotUniforms();
     return c;
 }
 
@@ -2618,7 +2735,16 @@ bool TooBigToCast(const DrawCall& draw, const GLfloat uploaded[16])
     const double u = 3.2808;  // (game units: feet)
     const double across = std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) + (hi[2] - lo[2]) * (hi[2] - lo[2]));
     const bool tooBig = across > 80.0 * u;
-    const bool overhead = lowest > 12.0 * u;
+    // All of it well above the camera: a stadium's upper stands, its lights and roof panels - but
+    // only where the track is a stadium (something far too big has been seen). Elsewhere it's a
+    // tree on a hill, or another rider up the hill from you, and it casts: left out, its shadow
+    // only came in once you got up close to it.
+    if (tooBig && !g_stadiumTrack) {
+        g_stadiumTrack = true;
+        Log("postfx: shadow map: this track has a stadium (an object %.0f m across): objects all overhead are left out too",
+            across / u);
+    }
+    const bool overhead = g_stadiumTrack && lowest > 12.0 * u;
     if ((tooBig || overhead) && !b.logged && g_loggedBigCasters < 12) {
         b.logged = true;
         ++g_loggedBigCasters;
@@ -2715,12 +2841,38 @@ void CastShadow(const DrawCall& draw)
     // See-through draws (kicked-up dirt, dust, smoke) don't write depth: they would cast solid
     // squares. (Blending alone says nothing: the game leaves it on for solid objects too.)
     if (!g_depthWrites) {
-        if (nearYou)
-            postfx::NoteNearCast(4);
-        return;
+        // (Asked of GL itself: depth writes turned back on some other way than glDepthMask - a
+        // glPopAttrib - left every draw after taken for see-through, casting nothing. Only asked
+        // when it says off, which is a few draws a frame.)
+        GLint mask = 0;
+        if (!real_glGetIntegerv)
+            real_glGetIntegerv = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+        if (real_glGetIntegerv)
+            real_glGetIntegerv(GL_DEPTH_WRITEMASK, &mask);
+        if (mask) {
+            g_depthWrites = true;
+            postfx::NoteCast(7);
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                Log("postfx: shadow map: depth writes were back on without a glDepthMask call: the draws after it are taken as solid again");
+            }
+        } else {
+            postfx::NoteCast(4);
+            if (nearYou)
+                postfx::NoteNearCast(4);
+            return;
+        }
     }
-    if (!scene3d)
+    if (!scene3d) {
+        postfx::NoteCast(6);
         return;  // not a 3D object this frame (or the sky, which has no position)
+    }
+    postfx::NoteCast(0);
+    {
+        const GLfloat* m = mv->second.uploaded;
+        postfx::NoteCastDistance(std::sqrt(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]) / 3.2808);
+    }
     const auto projection = g_programProjection.find(g_program);
     if (projection == g_programProjection.end() || projection->second.location < 0)
         return;
@@ -2767,6 +2919,7 @@ void CastShadow(const DrawCall& draw)
     if (!postfx::WantsShadowCasters())
         return;  // (collected for the tire dirt's mask only)
     if (TooBigToCast(draw, mv->second.uploaded)) {
+        postfx::NoteCast(2);
         if (nearYou)
             postfx::NoteNearCast(2);
         return;
@@ -2786,6 +2939,7 @@ void CastShadow(const DrawCall& draw)
     float lightModelview[16];
     unsigned cascades = 0;
     if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, &cascades)) {
+        postfx::NoteCast(3);
         if (nearYou)
             postfx::NoteNearCast(3);
         return;
@@ -2801,9 +2955,11 @@ void CastShadow(const DrawCall& draw)
         c.cascades = cascades;
         if (g_deferredCasters.size() < 8192) {
             g_deferredCasters.push_back(c);
+            postfx::NoteCast(5);
             return;
         }
     }
+    postfx::NoteCast(1);
     if (!real_glDrawElements)
         real_glDrawElements = reinterpret_cast<PFN_DrawElements>(GetRealGLFunction("glDrawElements"));
     if (!real_glDrawArrays)
@@ -3729,6 +3885,7 @@ void NoteBindTexture(unsigned int target, unsigned int texture)
 void DiscardShadowCasters()
 {
     g_deferredCasters.clear();
+    ClearUniformSnaps();
     g_nearDraws.clear();
     g_riderDraws.clear();
     g_casterBones.clear();
@@ -3769,8 +3926,43 @@ void FlushShadowCasters()
     if (!upload || !real_glUseProgram || !real_glBindVertexArray || !real_glActiveTexture || !enable || !disable ||
         !bindTexture || !real_glIsEnabled || !postfx::BeginShadowDraw()) {
         g_deferredCasters.clear();
+        ClearUniformSnaps();
         g_casterBones.clear();
         return;
+    }
+    // (For the log: fixed-function state the game left on that the held-back casters are drawn with -
+    // logged whenever it changes, a few times a session, to tell a lobby's from a single race's.)
+    {
+        if (!real_glGetIntegerv)
+            real_glGetIntegerv = reinterpret_cast<PFN_GetIntegerv>(GetRealGLFunction("glGetIntegerv"));
+        static PFN_GetFloatv getFloat = reinterpret_cast<PFN_GetFloatv>(GetRealGLFunction("glGetFloatv"));
+        static int logged = 0;
+        static char last[192] = "";
+        if (real_glGetIntegerv && getFloat && logged < 12) {
+            GLint profile = 0, alphaFunc = 0;
+            real_glGetIntegerv(0x9126, &profile);  // GL_CONTEXT_PROFILE_MASK (0 before 3.2: compatibility)
+            const bool compatibility = (profile & 1) == 0;
+            GLfloat alphaRef = 0, offset[2] = {};
+            const bool alphaTest = compatibility && real_glIsEnabled(GL_ALPHA_TEST) != GL_FALSE;
+            if (alphaTest) {
+                real_glGetIntegerv(GL_ALPHA_TEST_FUNC, &alphaFunc);
+                getFloat(GL_ALPHA_TEST_REF, &alphaRef);
+            }
+            const bool polygonOffset = real_glIsEnabled(GL_POLYGON_OFFSET_FILL) != GL_FALSE;
+            getFloat(GL_POLYGON_OFFSET_FACTOR, &offset[0]);
+            getFloat(GL_POLYGON_OFFSET_UNITS, &offset[1]);
+            char now[192];
+            snprintf(now, sizeof now, "alpha test %s (func 0x%X ref %.2f), polygon offset %s (%.1f %.1f), discard %d, clip %d, "
+                     "alpha to coverage %d, depth clamp %d",
+                     alphaTest ? "ON" : "off", alphaFunc, alphaRef, polygonOffset ? "ON" : "off", offset[0], offset[1],
+                     real_glIsEnabled(0x8C89) != GL_FALSE, real_glIsEnabled(0x3000) != GL_FALSE,
+                     real_glIsEnabled(0x809E) != GL_FALSE, real_glIsEnabled(0x864F) != GL_FALSE);
+            if (strcmp(now, last) != 0) {
+                strcpy_s(last, now);
+                ++logged;
+                Log("postfx: shadow map: the held-back casters are drawn with %s (%zu of them)", now, g_deferredCasters.size());
+            }
+        }
     }
     // Both faces: the nearest surface to the sun is the same either way, and two-sided leaves cast.
     const bool cull = real_glIsEnabled(GL_CULL_FACE) != GL_FALSE;
@@ -3781,6 +3973,24 @@ void FlushShadowCasters()
         bound[u] = g_boundTextures[u];
     std::vector<GLuint> touched, boned;  // programs used; those given bones of ours
     std::vector<GLuint> rigid;           // skinned programs holding the rigid draws' bone now (see below)
+    // Each program's uniforms as GL holds them while the casters are drawn (from the game's, as
+    // each program is first used): what a caster's own differ from is uploaded.
+    std::unordered_map<GLuint, std::vector<UniformSlot>> uniformsNow;
+    const auto UploadSlot = [](GLint location, const UniformSlot& slot) {
+        switch (slot.kind) {
+        case 1: if (real_glUniform1i) real_glUniform1i(location, slot.i); break;
+        case 2: if (real_glUniform1f) real_glUniform1f(location, slot.v[0]); break;
+        case 3: if (real_glUniform2fv) real_glUniform2fv(location, 1, slot.v); break;
+        case 4: if (real_glUniform3fv) real_glUniform3fv(location, 1, slot.v); break;
+        case 5: if (real_glUniform4fv) real_glUniform4fv(location, 1, slot.v); break;
+        default: break;
+        }
+    };
+    // (The bones and their count are a skinned program's own business, below.)
+    const auto BoneLocation = [](const SkinnedProgram* skin, GLint location) {
+        return skin && (location == skin->centreLoc || location == skin->positionLoc || location == skin->rotationLoc ||
+                        location == skin->countLoc);
+    };
     GLfloat attribNow[kConstAttribs][4];  // the constant attributes as they stand (the game's, then ours)
     std::copy(&g_constAttrib[0][0], &g_constAttrib[0][0] + kConstAttribs * 4, &attribNow[0][0]);
     // Cascade by cascade (each a tile of the shadow map), each caster into those it reaches.
@@ -3790,9 +4000,12 @@ void FlushShadowCasters()
     for (const DeferredCaster& c : g_deferredCasters) {
         if (!(c.cascades & (1u << cascade)))
             continue;
+        // (Counted once each, in the first cascade it's drawn into: the far ones are in none of the
+        // near cascades.)
+        const bool first = (c.cascades & ((1u << cascade) - 1)) == 0;
         const auto element = g_elementBuffers.find(c.vao);
         if (c.draw.kind != DrawCall::Arrays && (element == g_elementBuffers.end() || element->second != c.elementBuffer)) {
-            if (cascade == 0)
+            if (first)
                 postfx::NoteReplay(c.bones >= 0, 1);
             continue;  // its vertex array was given other indices since: skip it
         }
@@ -3813,6 +4026,33 @@ void FlushShadowCasters()
                 bound[u] = c.textures[u];
             }
         }
+        if (c.uniforms >= 0 && c.uniforms < static_cast<int>(g_uniformSnaps.size()) &&
+            g_uniformSnaps[static_cast<size_t>(c.uniforms)].program == c.program) {
+            auto at = uniformsNow.find(c.program);
+            if (at == uniformsNow.end())
+                at = uniformsNow.emplace(c.program, g_programUniforms[c.program].now).first;
+            std::vector<UniformSlot>& now = at->second;
+            const SkinnedProgram* own = FindSkinned(c.program);
+            for (const auto& [location, slot] : g_uniformSnaps[static_cast<size_t>(c.uniforms)].slots) {
+                if (location == c.modelviewLoc || location == c.projectionLoc || BoneLocation(own, location))
+                    continue;
+                if (now.size() <= static_cast<size_t>(location))
+                    now.resize(static_cast<size_t>(location) + 1);
+                if (now[static_cast<size_t>(location)] == slot)
+                    continue;
+                UploadSlot(location, slot);
+                now[static_cast<size_t>(location)] = slot;
+                static int logged = 0;
+                static std::vector<unsigned long long> seen;
+                const unsigned long long key = UniformKey(c.program, location);
+                if (logged < 10 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                    seen.push_back(key);
+                    ++logged;
+                    Log("postfx: shadow map: '%s' (program %u) put back for the held-back casters drawn with it (the game "
+                        "had changed it before they were drawn again)", UniformName(c.program, location).c_str(), c.program);
+                }
+            }
+        }
         upload(c.modelviewLoc, 1, GL_FALSE, c.lightModelview);
         upload(c.projectionLoc, 1, GL_FALSE, cascadeProjection);
         const SkinnedProgram* skin = c.bones >= 0 ? FindSkinned(c.program) : nullptr;
@@ -3827,7 +4067,7 @@ void FlushShadowCasters()
                 boned.push_back(c.program);
             rigid.erase(std::remove(rigid.begin(), rigid.end(), c.program), rigid.end());
         } else if (c.bones >= 0) {
-            if (cascade == 0)
+            if (first)
                 postfx::NoteReplay(true, 3);
             continue;
         } else if (c.boneCountLoc >= 0 && real_glUniform1i) {
@@ -3852,7 +4092,7 @@ void FlushShadowCasters()
                 }
             }
         }
-        if (cascade == 0)
+        if (first)
             postfx::NoteReplay(c.bones >= 0, g_vaoGeneration[c.vao] != c.vaoGen ? 2 : 0);
         if (real_glVertexAttrib4f) {
             for (int k = 0; k < kConstAttribs; ++k) {
@@ -3880,6 +4120,18 @@ void FlushShadowCasters()
     // Back as the game left it: each program's own matrices, its program, arrays and textures.
     for (GLuint p : touched) {
         real_glUseProgram(p);
+        // Its other uniforms as the game left them (those a caster's own changed).
+        if (const auto at = uniformsNow.find(p); at != uniformsNow.end()) {
+            const ProgramUniforms& game = g_programUniforms[p];
+            const SkinnedProgram* own = FindSkinned(p);
+            for (GLint location : game.used) {
+                const size_t l = static_cast<size_t>(location);
+                if (l >= game.now.size() || l >= at->second.size() || game.now[l].kind == 0 || BoneLocation(own, location))
+                    continue;
+                if (at->second[l] != game.now[l])
+                    UploadSlot(location, game.now[l]);
+            }
+        }
         const auto mv = g_programModelview.find(p);
         if (mv != g_programModelview.end() && mv->second.location >= 0)
             upload(mv->second.location, 1, GL_FALSE, mv->second.uploaded);
@@ -3919,6 +4171,7 @@ void FlushShadowCasters()
             static_cast<int>(g_deferredCasters.size()), g_castAtOnce);
     }
     g_deferredCasters.clear();
+    ClearUniformSnaps();
     g_casterBones.clear();
 }
 
@@ -3991,6 +4244,7 @@ bool NoteDraw(const DrawCall& draw)
 bool EndShaderFrame()
 {
     g_deferredCasters.clear();  // a frame whose shadows weren't applied
+    ClearUniformSnaps();
     g_nearDraws.clear();
     g_riderDraws.clear();
     g_casterBones.clear();

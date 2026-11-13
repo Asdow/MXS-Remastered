@@ -276,6 +276,9 @@ struct AtlasImage {
 };
 AtlasImage g_logo;
 constexpr float kLogoHeight = 32.0f;
+// The logo's "Remastered" as a white silhouette (the logo's alpha, nothing left of where it starts),
+// right under the logo in the atlas: what the light sweeping across it lights (LogoSweep).
+AtlasImage g_logoShine;
 
 // The logo's PNG (logo_png.h), decoded once: RGBA, straight alpha.
 struct DecodedImage {
@@ -556,6 +559,33 @@ bool BuildAtlas(GLuint texture, float scale)
             g_logo.v0 = static_cast<float>(logoTop) / kAtlasSize;
             g_logo.u1 = static_cast<float>(1 + w) / kAtlasSize;
             g_logo.v1 = static_cast<float>(logoTop + h) / kAtlasSize;
+            // "Remastered" starts right of the last red (the flag and "MXS" are red, it's silver).
+            g_logoShine = AtlasImage{};
+            const int shineTop = logoTop + h + 2;
+            if (shineTop + h + 2 <= kAtlasSize) {
+                int lastRed = -1;
+                for (int x = 0; x < w; ++x)
+                    for (int y = 0; y < h; ++y) {
+                        const uint8_t* t = &rgba[(static_cast<size_t>(logoTop + y) * kAtlasSize + 1 + x) * 4];
+                        if (t[3] > 96 && t[0] > 110 && t[0] > t[1] + 60)
+                            lastRed = x;
+                    }
+                const int from = lastRed + 1;
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        const uint8_t* t = &rgba[(static_cast<size_t>(logoTop + y) * kAtlasSize + 1 + x) * 4];
+                        uint8_t* o = &rgba[(static_cast<size_t>(shineTop + y) * kAtlasSize + 1 + x) * 4];
+                        o[0] = o[1] = o[2] = 255;
+                        o[3] = x >= from ? t[3] : 0;
+                    }
+                g_logoShine.valid = lastRed >= 0 && from < w;
+                g_logoShine.w = static_cast<float>(w);
+                g_logoShine.h = static_cast<float>(h);
+                g_logoShine.u0 = 1.0f / kAtlasSize;
+                g_logoShine.v0 = static_cast<float>(shineTop) / kAtlasSize;
+                g_logoShine.u1 = static_cast<float>(1 + w) / kAtlasSize;
+                g_logoShine.v1 = static_cast<float>(shineTop + h) / kAtlasSize;
+            }
         }
     }
 
@@ -600,7 +630,8 @@ bool BuildAtlas(GLuint texture, float scale)
     g_gl.PixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
     g_gl.PixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     g_atlasScale = scale;
-    Log("overlay: font atlas built at scale %.2f (%d of %d rows used%s)", scale, g_logo.valid ? logoTop + static_cast<int>(g_logo.h) : logoTop,
+    Log("overlay: font atlas built at scale %.2f (%d of %d rows used%s)", scale,
+        g_logo.valid ? logoTop + static_cast<int>(g_logo.h) * (g_logoShine.valid ? 2 : 1) + (g_logoShine.valid ? 2 : 0) : logoTop,
         kAtlasSize, g_logo.valid ? ", logo included" : ", no logo");
     return true;
 }
@@ -840,6 +871,51 @@ struct ClipRange {
 };
 std::vector<ClipRange> g_clips;
 
+// A light sweeping across the logo's "Remastered" (drawn over the logo at x, y): a soft, slanted
+// band of white through its silhouette, left to right, now and then. Only while the menu is drawn:
+// a few triangles, nothing else.
+constexpr double kSweepEvery   = 6.0;  // s from one sweep to the next
+constexpr double kSweepLasts   = 1.3;  // s it takes to cross
+constexpr double kSweepFirstAt = 0.8;  // s after the menu opens
+void LogoSweep(float x, float y, double sinceOpen)
+{
+    const AtlasImage& m = g_logoShine;
+    // (For automated tests: held this far across, 0..1.)
+    static const double testAt = [] {
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_LOGO_SWEEP", text, sizeof text) > 0 ? atof(text) : -1.0;
+    }();
+    if (!m.valid || (testAt < 0 && sinceOpen < kSweepFirstAt))
+        return;
+    const double t = std::fmod(sinceOpen - kSweepFirstAt, kSweepEvery);
+    if (testAt < 0 && t >= kSweepLasts)
+        return;
+    double p = testAt >= 0 ? testAt : t / kSweepLasts;
+    p = p * p * (3.0 - 2.0 * p);  // eased in and out
+    const float w = m.w, h = m.h;
+    const float slant = h * 0.55f;  // the band leans forward: its top ahead of its bottom
+    const float half = h * 0.85f;   // half its width, the soft edges included
+    // From wholly left of "Remastered" to wholly right of the logo.
+    const float from = x + w * 0.35f - half - slant, to = x + w + half;
+    const float centre = from + static_cast<float>(p) * (to - from);
+    // (Each corner's texel is where it is on the logo: the silhouette lines up with the logo's.)
+    const auto Corner = [&](float sx, float sy, float alpha) {
+        const float u = m.u0 + (sx - x) / w * (m.u1 - m.u0), v = m.v0 + (sy - y) / h * (m.v1 - m.v0);
+        return Vertex{ sx, sy, u, v, White(alpha) };
+    };
+    const auto Piece = [&](float left, float right, float alphaLeft, float alphaRight) {
+        const Vertex bl = Corner(left, y + h, alphaLeft), br = Corner(right, y + h, alphaRight);
+        const Vertex tr = Corner(right + slant, y, alphaRight), tl = Corner(left + slant, y, alphaLeft);
+        g_batch.insert(g_batch.end(), { tl, tr, br, tl, br, bl });
+    };
+    const size_t begin = g_batch.size();
+    const float peak = 0.95f, core = half * 0.22f;
+    Piece(centre - half, centre - core, 0.0f, peak);
+    Piece(centre - core, centre + core, peak, peak);
+    Piece(centre + core, centre + half, peak, 0.0f);
+    g_clips.push_back({ begin, g_batch.size(), x, y, w, h });  // (nothing past the logo's edges)
+}
+
 void Segment(float x0, float y0, float x1, float y1, float w, uint32_t color);  // (with the dab indicator, below)
 
 // A chevron (an arrow head) centred at (x, y): dir 0 left, 1 right, 2 up, 3 down.
@@ -998,6 +1074,7 @@ struct RowDef {
     int Config::*    key = nullptr;  // Key: a virtual-key code, picked by pressing the key
     const char*      help = nullptr; // shown beside the panel while the row is selected / under the mouse
     bool             locked = false; // work in progress: drawn dimmed and can't be changed
+    const char*      badge = nullptr; // a small tag after the label ("COMING SOON")
     int Config::*    option = nullptr;     // Choice of three or four: 0 / 1 / 2 (/ 3), instead of flag
     const char*      thirdText = nullptr;  // its third option
     const char*      fourthText = nullptr; // and fourth, if it has one
@@ -1036,6 +1113,12 @@ struct RowDef {
     {
         RowDef def = *this;
         def.locked = true;
+        return def;
+    }
+    RowDef Badge(const char* text) const
+    {
+        RowDef def = *this;
+        def.badge = text;
         return def;
     }
     RowDef Clock() const
@@ -1104,330 +1187,340 @@ RowDef PadRow(int tab, const char* section, const char* label, int Config::* con
     return def;
 }
 
-const char* const kTabs[] = { "FIRST PERSON", "GRAPHICS", "WEATHER", "REPLAY", "KEYBINDS", "OTHER" };
-constexpr int kTabFirstPerson = 0, kTabGraphics = 1, kTabWeather = 2, kTabReplay = 3, kTabKeybinds = 4, kTabOther = 5;
+const char* const kTabs[] = { "FIRST PERSON", "LOOK", "GRAPHICS", "WEATHER", "REPLAY", "KEYBINDS", "SOUNDS", "OTHER" };
+constexpr int kTabFirstPerson = 0, kTabLook = 1, kTabGraphics = 2, kTabWeather = 3, kTabReplay = 4, kTabKeybinds = 5,
+              kTabSounds = 6, kTabOther = 7;
 constexpr int kTabCount = static_cast<int>(sizeof kTabs / sizeof kTabs[0]);
+// Preset codes (config.cpp) number their tab themselves - 0 the first person camera's, 1 the
+// graphics' - as they always have (codes already shared keep loading), whatever order the menu's
+// tabs are in.
+int CodeOfTab(int tab) { return tab == kTabFirstPerson ? 0 : tab == kTabGraphics ? 1 : -1; }
+int TabOfCode(int code) { return code == 0 ? kTabFirstPerson : code == 1 ? kTabGraphics : -1; }
 
 // Each tab's rows, column by column (.Col starts the next one).
 const RowDef kRows[] = {
     // ======== FIRST PERSON ========
-    Toggle(0, "CAMERA",          "First person mod",     &Config::enabled)
+    Toggle(kTabFirstPerson, "CAMERA",          "First person mod",     &Config::enabled)
         .Help("The first-person camera mod (its key is on the KEYBINDS tab). Off gives you the game's own "
               "cameras and replays untouched, and only the shaders stay on (and Controller look, if it's "
               "on: it still turns the game's camera).")
         .Col(0),
-    Choice(0, nullptr,           "Camera",               &Config::customCamera, "GAME", "CUSTOM")
+    Choice(kTabFirstPerson, nullptr,           "Camera",               &Config::customCamera, "GAME", "CUSTOM")
         .Help("GAME adjusts the game's own first-person camera (and its 1st Person Angle). CUSTOM builds "
               "the view from your bike instead. The first time, ride a few metres so it can find your bike; "
               "after that it knows it as soon as you spawn."),
-    Slider(0, nullptr,           "Look-down angle",      &Config::cameraAngleDeg,   -10.0, 30.0, 0.5,  1.0,   1, "\xB0", nullptr, true)
+    Slider(kTabFirstPerson, nullptr,           "Look-down angle",      &Config::cameraAngleDeg,   -10.0, 30.0, 0.5,  1.0,   1, "\xB0", nullptr, true)
         .Help("Custom camera: how far the view tilts down. Negative tilts it up. (The GAME camera uses "
               "the game's own 1st Person Angle.)"),
-    Slider(0, "STABILIZATION",   "Horizon lock",         &Config::horizonLock,      0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, "STABILIZATION",   "Horizon lock",         &Config::horizonLock,      0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("How much of the bike's lean is removed from the view. 0% leans with the bike, 100% keeps "
               "the horizon level."),
-    Slider(0, nullptr,           "Pitch lock",           &Config::pitchLock,        0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, nullptr,           "Pitch lock",           &Config::pitchLock,        0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("How much of the bike's nose up / down tilt (wheelies, jump faces) is removed. 0% tilts "
               "with the bike, 100% keeps the view steady."),
-    Slider(0, nullptr,           "Steadiness",           &Config::steadiness,       0.0,   2.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, nullptr,           "Steadiness",           &Config::steadiness,       0.0,   2.0,  0.01, 100.0, 0, "%", "Off")
         .Help("Keeps the view calm: the quick jolts of the bike (bumps, landings, the suspension diving "
               "under braking) don't reach it. It still eases into a corner's lean or a wheelie, as far as "
               "the locks above let it. Off follows every jolt."),
-    Slider(0, "HEAD POSITION",   "Head forward / back",  &Config::headForward,      -3.0,  3.0,  0.01, 1.0,   2, " m")
+    Slider(kTabFirstPerson, "HEAD POSITION",   "Head forward / back",  &Config::headForward,      -3.0,  3.0,  0.01, 1.0,   2, " m")
         .Help("Moves your eyes forward (+) or back (-) along the bike."),
-    Slider(0, nullptr,           "Head height",          &Config::headHeight,       -3.0,  3.0,  0.01, 1.0,   2, " m")
+    Slider(kTabFirstPerson, nullptr,           "Head height",          &Config::headHeight,       -3.0,  3.0,  0.01, 1.0,   2, " m")
         .Help("Moves your eyes up (+) or down (-)."),
-    Toggle(0, nullptr,           "Hide torso & head",    &Config::hideOwnBody)
+    Toggle(kTabFirstPerson, nullptr,           "Hide torso & head",    &Config::hideOwnBody)
         .Help("Hides your own rider's torso and head (helmet included), so a high FOV doesn't show "
               "them from the inside. Arms and legs stay, and your shadow keeps them all. Only yours: "
               "other riders keep theirs."),
-    Slider(0, "CORNERS",         "Look to apex",         &Config::apexLook,         0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, "CORNERS",         "Look to apex",         &Config::apexLook,         0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("In corners the head turns toward the apex, the way the bike is turning: more the "
               "tighter the corner. Higher looks further into the turn (100% looks about a second "
               "down your line, at most 45\xB0). Off at walking pace and in the air.")
         .Col(1),
-    Slider(0, nullptr,           "Apex turn speed",      &Config::apexSpeed,        0.5,   5.0,  0.5, 1.0,   1, "")
+    Slider(kTabFirstPerson, nullptr,           "Apex turn speed",      &Config::apexSpeed,        0.5,   5.0,  0.5, 1.0,   1, "")
         .Help("How quickly the head turns toward the apex and back to straight ahead after the "
               "corner. It eases in and out gently either way; lower is more gradual: 2.5 takes "
               "about a second to settle, 1 about three. Too low and it lags behind short corners."),
-    Slider(0, nullptr,           "Anticipation",         &Config::apexAnticipation, 0.0,   0.5,  0.05, 1.0,  2, " s",
+    Slider(kTabFirstPerson, nullptr,           "Anticipation",         &Config::apexAnticipation, 0.0,   0.5,  0.05, 1.0,  2, " s",
            "Work in progress")
         .Help("Work in progress, off for now. It will set how early the head turns: reading where the "
               "corner is going, so it turns in sooner as a corner tightens and comes back to straight "
               "ahead sooner as it opens up on the exit.")
         .Locked(),
-    Toggle(0, "LOOKING AROUND",  "Controller look",      &Config::controllerLook)
+    Toggle(kTabLook,        "LOOKING AROUND",  "Controller look",      &Config::controllerLook)
         .Help("Look around with a controller: the d-pad's left / right to look sideways and down to "
               "look behind, unless you bind other buttons, paddles or stick directions on the KEYBINDS "
               "tab. Release to look ahead again. It works with the First person mod off too: then it "
               "only turns the game's own camera (not in replays)."),
-    Slider(0, nullptr,           "Side look angle",      &Config::lookSideDeg,      30.0,   90.0, 1.0, 1.0,   0, "\xB0")
+    Slider(kTabLook,        nullptr,           "Side look angle",      &Config::lookSideDeg,      30.0,   90.0, 1.0, 1.0,   0, "\xB0")
         .Help("How far the head turns when looking left / right with the controller."),
-    Slider(0, nullptr,           "Turn speed",           &Config::lookTurnSpeed,    2.0,   40.0, 1.0, 1.0,   0, "")
+    Slider(kTabLook,        nullptr,           "Turn speed",           &Config::lookTurnSpeed,    2.0,   40.0, 1.0, 1.0,   0, "")
         .Help("How quickly the head turns to look left / right / back and ahead again. Higher is "
               "faster: 12 turns 90\xB0 in about a quarter of a second, 40 is nearly instant."),
-    Slider(0, nullptr,           "Sideways: forward",    &Config::lookSideForward,  -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
+    Slider(kTabLook,        nullptr,           "Sideways: forward",    &Config::lookSideForward,  -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
         .Help("Custom camera: moves your eyes forward (+) or back (-) while looking left / right."),
-    Slider(0, nullptr,           "Sideways: height",     &Config::lookSideHeight,   -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
+    Slider(kTabLook,        nullptr,           "Sideways: height",     &Config::lookSideHeight,   -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
         .Help("Custom camera: moves your eyes up (+) or down (-) while looking left / right."),
-    Slider(0, nullptr,           "Back: forward",        &Config::lookBackForward,  -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
+    Slider(kTabLook,        nullptr,           "Back: forward",        &Config::lookBackForward,  -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
         .Help("Custom camera: moves your eyes forward (+) or back (-) while looking back."),
-    Slider(0, nullptr,           "Back: height",         &Config::lookBackHeight,   -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
+    Slider(kTabLook,        nullptr,           "Back: height",         &Config::lookBackHeight,   -1.0,  1.0,  0.01, 1.0,   2, " m", nullptr, true)
         .Help("Custom camera: moves your eyes up (+) or down (-) while looking back."),
-    Slider(0, "IN THE AIR",      "Looseness",            &Config::airLooseness,     0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, "IN THE AIR",      "Looseness",            &Config::airLooseness,     0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("In the air only: the view keeps pointing forward while the bike swings left / right "
               "(scrubs, whips), by up to 15\xB0 x this. Off follows the bike tightly.")
         .Col(2),
-    Slider(0, nullptr,           "Whip lock",            &Config::whipLock,         0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
+    Slider(kTabFirstPerson, nullptr,           "Whip lock",            &Config::whipLock,         0.0,   1.0,  0.01, 100.0, 0, "%", "Off")
         .Help("In the air only: holds the view on your direction of travel, horizon level, at your "
               "normal look-down angle, while the bike swings, leans and tilts under it. 100% keeps "
               "it completely straight; it eases back onto the bike after landing."),
-    Slider(0, "SMOOTHING",       "Rotation response",    &Config::rotationResponse, 0.0,   40.0,  0.5,    1.0,    1, " /s", "Off")
+    Slider(kTabFirstPerson, "SMOOTHING",       "Rotation response",    &Config::rotationResponse, 0.0,   40.0,  0.5,    1.0,    1, " /s", "Off")
         .Help("How fast the view's rotation catches up to the bike. Higher is sharper, lower is "
               "floatier. Works on the ground and in the air."),
-    Slider(0, nullptr,           "Max lag",              &Config::maxLagDeg,        0.0,   90.0,  0.5,    1.0,    1, "\xB0")
+    Slider(kTabFirstPerson, nullptr,           "Max lag",              &Config::maxLagDeg,        0.0,   90.0,  0.5,    1.0,    1, "\xB0")
         .Help("The furthest the smoothed view can fall behind the bike. Past this it turns with the "
               "bike instead of trailing further."),
-    Slider(0, "NECK & IMPACTS",  "Landing compression",  &Config::compressionPerG,  0.0,   0.05,  0.0005, 1000.0, 1, " mm/g", "Off")
+    Slider(kTabFirstPerson, "NECK & IMPACTS",  "Landing compression",  &Config::compressionPerG,  0.0,   0.05,  0.0005, 1000.0, 1, " mm/g", "Off")
         .Help("How much your head sinks on landings and big hits (and lifts in the air)."),
-    Slider(0, nullptr,           "Max compression",      &Config::maxCompression,   0.0,   0.2,   0.001,  1000.0, 0, " mm")
+    Slider(kTabFirstPerson, nullptr,           "Max compression",      &Config::maxCompression,   0.0,   0.2,   0.001,  1000.0, 0, " mm")
         .Help("The most your head can sink on a landing."),
-    Slider(0, nullptr,           "Neck stiffness",       &Config::springHz,         0.5,   10.0,  0.1,    1.0,    1, " Hz")
+    Slider(kTabFirstPerson, nullptr,           "Neck stiffness",       &Config::springHz,         0.5,   10.0,  0.1,    1.0,    1, " Hz")
         .Help("How quickly your head springs back after a hit. Higher is a tighter neck."),
-    Slider(0, nullptr,           "Neck damping",         &Config::dampingRatio,     0.05,  2.0,   0.05,   1.0,    2, "")
+    Slider(kTabFirstPerson, nullptr,           "Neck damping",         &Config::dampingRatio,     0.05,  2.0,   0.05,   1.0,    2, "")
         .Help("How much your head bounces after a hit. Lower is bouncier, 1.00 settles with no bounce."),
-    Slider(0, nullptr,           "Head nod",             &Config::nodDegPerMeter,   0.0,   150.0, 1.0,    1.0,    0, "\xB0" "/m", "Off")
+    Slider(kTabFirstPerson, nullptr,           "Head nod",             &Config::nodDegPerMeter,   0.0,   150.0, 1.0,    1.0,    0, "\xB0" "/m", "Off")
         .Help("How far your head nods forward as your neck compresses on a landing."),
-    Slider(0, nullptr,           "Height smoothing",     &Config::verticalResponse, 0.0,   60.0,  1.0,    1.0,    0, " /s", "Off")
+    Slider(kTabFirstPerson, nullptr,           "Height smoothing",     &Config::verticalResponse, 0.0,   60.0,  1.0,    1.0,    0, " /s", "Off")
         .Help("Smooths small up / down head jitter. Higher follows the bike's height more closely."),
     // ======== GRAPHICS ========
-    Toggle(1, "SHADERS",         "Shaders",              &Config::shaders)
+    Toggle(kTabGraphics, "SHADERS",         "Shaders",              &Config::shaders)
         .Help("Turns every effect on this tab on or off (its key is on the KEYBINDS tab). Off is the game "
               "exactly as it looks without the mod.")
         .Col(0),
-    Slider(1, "TIME OF DAY",     "Time of day",          &Config::timeOfDay,        -1.0,  24.0,  0.25,   1.0,    0, "", "Game")
+    Slider(kTabGraphics, "TIME OF DAY",     "Time of day",          &Config::timeOfDay,        -1.0,  24.0,  0.25,   1.0,    0, "", "Game")
         .Clock()
         .Help("Sets the hour: the sun moves across the sky, sunsets turn the light orange, and at "
               "night the sky fills with stars and a moon lights the track. Game keeps the game's "
               "own lighting."),
-    Toggle(1, nullptr,           "Move the sun",         &Config::moveSun)
+    Toggle(kTabGraphics, nullptr,           "Move the sun",         &Config::moveSun)
         .Help("The time of day also moves the game's sun, so lighting and shading on bikes and "
               "objects follow it. Off only changes the colours and the sky."),
-    Slider(1, nullptr,           "Night brightness",     &Config::nightBrightness,  0.0,   2.0,   0.05,   100.0,  0, "%")
+    Slider(kTabGraphics, nullptr,           "Night brightness",     &Config::nightBrightness,  0.0,   2.0,   0.05,   100.0,  0, "%")
         .Help("How much the moon lights the track at night. Lower is darker (the headlight stands "
               "out more), 0% is pitch black."),
-    Slider(1, "HEADLIGHT",       "Headlight",            &Config::headlight,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, "HEADLIGHT",       "Headlight",            &Config::headlight,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("A headlight on your bike's front plate that lights the track ahead when the time of "
               "day makes it dark. It turns with the bike, not your head."),
-    Slider(1, nullptr,           "Beam width",           &Config::headlightBeamDeg, 10.0,  90.0,  1.0,    2.0,    0, "\xB0")
+    Slider(kTabGraphics, nullptr,           "Beam width",           &Config::headlightBeamDeg, 10.0,  90.0,  1.0,    2.0,    0, "\xB0")
         .Help("How far the headlight's beam spreads to the sides. It always lights the ground from "
               "just in front of the plate out, narrower only makes it skinnier."),
-    Slider(1, nullptr,           "Beam aim",             &Config::headlightAimDeg,  -20.0, 15.0,  0.5,    1.0,    1, "\xB0")
+    Slider(kTabGraphics, nullptr,           "Beam aim",             &Config::headlightAimDeg,  -20.0, 15.0,  0.5,    1.0,    1, "\xB0")
         .Help("Where the headlight is aimed. Up shows more of what's ahead (the light reaches further "
               "and lights up jump faces), down keeps it close in front of the bike. 0 is level."),
-    Toggle(1, nullptr,           "Every bike's headlight", &Config::headlightEveryBike)
+    Toggle(kTabGraphics, nullptr,           "Every bike's headlight", &Config::headlightEveryBike)
         .Help("A headlight on every bike around you too, not just yours: any model, found by its "
               "wheels once it has ridden a moment. The nearest bikes' are drawn."),
-    Slider(1, "GLOW",            "Sun rays",             &Config::sunRays,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, "GLOW",            "Sun rays",             &Config::sunRays,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Light shafts from the sun when it's on screen."),
-    Slider(1, nullptr,           "Bloom",                &Config::bloom,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Bloom",                &Config::bloom,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("A soft glow around bright parts of the picture: the sky, the sun, white plastics."),
-    Toggle(1, nullptr,           "Hide game flare",      &Config::hideGameFlare)
+    Toggle(kTabGraphics, nullptr,           "Hide game flare",      &Config::hideGameFlare)
         .Help("With a time of day set, hides the game's own lens flare: it stays where the game's "
               "sun is, so at night it would glare out of the dark sky."),
-    Slider(1, "SHADOWS",         "Shadows",              &Config::shadows,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, "SHADOWS",         "Shadows",              &Config::shadows,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Real-time sun shadows from bikes, riders, trees and track objects. Fades out at night "
               "(the moon casts faint ones).")
         .Col(1),
-    Toggle(1, nullptr,           "Detailed shadows",     &Config::shadowMap)
+    Toggle(kTabGraphics, nullptr,           "Detailed shadows",     &Config::shadowMap)
         .Help("Draws bikes, riders and objects again from the sun for full, sharp shadows, even from "
               "things off screen. Off uses cheaper screen-space shadows only."),
-    Slider(1, nullptr,           "Shadow distance",      &Config::shadowDistance,   5.0,   200.0, 1.0,    1.0,    0, " m")
+    Slider(kTabGraphics, nullptr,           "Shadow distance",      &Config::shadowDistance,   5.0,   200.0, 1.0,    1.0,    0, " m")
         .Help("Detailed shadows: how far around you they reach. Shadows near you stay sharp at any "
               "distance; the far ones get softer the further it goes. Further costs some speed."),
-    Choice3(1, nullptr,          "Shadow resolution",    &Config::shadowResolution, "2048", "4096", "8192")
+    Choice3(kTabGraphics, nullptr,          "Shadow resolution",    &Config::shadowResolution, "2048", "4096", "8192")
         .Help("Detailed shadows: how sharp they are, near and far. Higher is sharper, at the cost of "
               "graphics memory and speed (8192 is for high-end graphics cards)."),
-    Slider(1, nullptr,           "Shadow softness",      &Config::shadowSoftness,   0.0,   1.0,   0.01,   100.0,  0, "%", "Crisp")
+    Slider(kTabGraphics, nullptr,           "Shadow softness",      &Config::shadowSoftness,   0.0,   1.0,   0.01,   100.0,  0, "%", "Crisp")
         .Help("Detailed shadows: how soft their edges are. Lower is crisper; higher smooths the steps a "
               "low sun can leave along shadows on berms and slopes. No cost either way."),
-    Slider(1, nullptr,           "Contact shadows",      &Config::shadowLength,     1.0,   20.0,  0.5,    1.0,    1, " m")
+    Slider(kTabGraphics, nullptr,           "Contact shadows",      &Config::shadowLength,     1.0,   20.0,  0.5,    1.0,    1, " m")
         .Help("Screen-space shadows: how far they reach from what casts them. They add shadows from "
               "the ground's own shape (ruts, jumps)."),
-    Slider(1, nullptr,           "Ambient occlusion",    &Config::ambientOcclusion, 0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Ambient occlusion",    &Config::ambientOcclusion, 0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Soft contact shadows in ruts, corners and under the bikes, where light can't reach."),
-    Choice3(1, "ANTI-ALIASING",   "Anti-aliasing",        &Config::antiAliasing, "OFF", "FXAA", "HIGH")
+    Choice3(kTabGraphics, "ANTI-ALIASING",   "Anti-aliasing",        &Config::antiAliasing, "OFF", "FXAA", "HIGH")
         .Help("Smooths jagged edges (FXAA). HIGH follows long edges further for cleaner lines at "
               "a slightly higher cost."),
-    Slider(1, nullptr,           "Sharpen",              &Config::sharpen,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Sharpen",              &Config::sharpen,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Brings back fine detail, more where the picture is soft. Pairs well with anti-aliasing."),
-    Slider(1, "TEXTURES",        "Anisotropic filter",   &Config::anisotropy,       1.0,   16.0,  1.0,    1.0,    0, "x", "Off")
+    Slider(kTabGraphics, "TEXTURES",        "Anisotropic filter",   &Config::anisotropy,       1.0,   16.0,  1.0,    1.0,    0, "x", "Off")
         .Help("Keeps textures sharp when you look along them at a low angle: the track ahead, "
               "the ruts in the distance. 16x is the sharpest."),
-    Toggle(1, nullptr,           "Trilinear filtering",  &Config::trilinear)
+    Toggle(kTabGraphics, nullptr,           "Trilinear filtering",  &Config::trilinear)
         .Help("Blends between texture detail levels, so there are no visible lines where the "
               "ground's texture changes sharpness."),
-    Slider(1, nullptr,           "Texture LOD bias",     &Config::textureLodBias,   -2.0,  0.0,   0.05,   1.0,    2, "")
+    Slider(kTabGraphics, nullptr,           "Texture LOD bias",     &Config::textureLodBias,   -2.0,  0.0,   0.05,   1.0,    2, "")
         .Help("Below 0 uses sharper texture detail further away. Too low shimmers in motion; "
               "-0.5 is a good start with 16x anisotropic."),
-    Slider(1, "GROUND & TIRES",  "Dirt detail",          &Config::dirtDetail,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, "GROUND & TIRES",  "Dirt detail",          &Config::dirtDetail,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Adds fine high-resolution grain, pebbles and clods to the track surface up close, "
               "lit by the sun. Only on the ground, never on bikes or riders.")
         .Col(2),
-    Slider(1, nullptr,           "Detail size",          &Config::dirtScale,        0.5,   2.0,   0.05,   1.0,    2, "x")
+    Slider(kTabGraphics, nullptr,           "Detail size",          &Config::dirtScale,        0.5,   2.0,   0.05,   1.0,    2, "x")
         .Help("How big the dirt detail's grains and pebbles are."),
-    Slider(1, nullptr,           "Tire marks",           &Config::tireMarks,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Tire marks",           &Config::tireMarks,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Your tires dig ruts in the dirt behind you: packed, darker dirt with the knobs' "
               "imprint and loose clods along the edges. They stay on the track for about 160 m "
               "around you, and come back exactly as you made them whenever you return to a spot "
               "you'd ridden (see the mark cache below for how far back that reaches)."),
-    Slider(1, nullptr,           "Mark depth",           &Config::markDepth,        0.0,   1.0,   0.01,   100.0,  0, "%", "Flat")
+    Slider(kTabGraphics, nullptr,           "Mark depth",           &Config::markDepth,        0.0,   1.0,   0.01,   100.0,  0, "%", "Flat")
         .Help("How dug-in the ruts look: the groove's floor is read where your eye actually sees "
               "it through the groove, so at low angles the near lip covers the floor and the far "
               "wall shows, and the floors lose light near the lips. 0 keeps the marks flat on the ground."),
-    Slider(1, nullptr,           "Mark cache",           &Config::markCacheSegs,    10000.0, 1000000.0, 25000.0, 1.0, 0, "", nullptr)
+    Slider(kTabGraphics, nullptr,           "Mark cache",           &Config::markCacheSegs,    10000.0, 1000000.0, 25000.0, 1.0, 0, "", nullptr)
         .Help("How far back along your ride the tire marks are remembered. "
               "A cache of 40 000 is ~11 minutes of riding at 60fps"
               "The cache size doesn't effect FPS, it only changes how much memory is used"),
-    Slider(1, nullptr,           "Tire dirt",            &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Tire dirt",            &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Mud caked on your tires, in clumps that turn with the wheels, lit by the sun."),
-    Toggle(1, nullptr,           "Marks & dirt on every bike", &Config::marksEveryBike)
+    Toggle(kTabGraphics, nullptr,           "Marks & dirt on every bike", &Config::marksEveryBike)
         .Help("Tire marks and tire dirt on every bike around you in a lobby or a replay, not just yours: "
               "any model, found by its wheels turning. Their ruts are pressed where the ground under "
               "them is on screen, out to about 100 m."),
-    Slider(1, "COLOR",           "Brightness",           &Config::exposure,         -2.0,  2.0,   0.05,   1.0,    2, " EV")
+    Slider(kTabGraphics, "COLOR",           "Brightness",           &Config::exposure,         -2.0,  2.0,   0.05,   1.0,    2, " EV")
         .Help("Overall exposure. +1 EV is twice as bright, -1 EV half."),
-    Slider(1, nullptr,           "Contrast",             &Config::contrast,         -0.5,  0.5,   0.01,   100.0,  0, "%")
+    Slider(kTabGraphics, nullptr,           "Contrast",             &Config::contrast,         -0.5,  0.5,   0.01,   100.0,  0, "%")
         .Help("More (+) or less (-) difference between dark and bright."),
-    Slider(1, nullptr,           "Saturation",           &Config::saturation,       -1.0,  1.0,   0.01,   100.0,  0, "%")
+    Slider(kTabGraphics, nullptr,           "Saturation",           &Config::saturation,       -1.0,  1.0,   0.01,   100.0,  0, "%")
         .Help("More (+) or less (-) colourful. -100% is black and white."),
-    Slider(1, nullptr,           "Vignette",             &Config::vignette,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Vignette",             &Config::vignette,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Darkens the corners of the picture, like a camera lens."),
-    Slider(1, "CAMERA EFFECTS",  "Motion blur",          &Config::motionBlur,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, "CAMERA EFFECTS",  "Motion blur",          &Config::motionBlur,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Blurs the picture with the camera's movement for a sense of speed. Your own bike "
               "stays sharp."),
-    Slider(1, nullptr,           "Depth of field",       &Config::depthOfField,     0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabGraphics, nullptr,           "Depth of field",       &Config::depthOfField,     0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Blurs what's out of focus: the bars and the far distance when focused down the "
               "track."),
-    Slider(1, nullptr,           "Focus distance",       &Config::dofFocus,         0.0,   100.0, 0.5,    1.0,    1, " m", "Auto")
+    Slider(kTabGraphics, nullptr,           "Focus distance",       &Config::dofFocus,         0.0,   100.0, 0.5,    1.0,    1, " m", "Auto")
         .Help("Where depth of field focuses. Auto focuses on the middle of the screen, easing "
               "between distances like an eye."),
     // ======== REPLAY ========
-    Choice3(3, "REPLAY CAMERA",   "Camera",               &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
+    Choice3(kTabReplay, "REPLAY CAMERA",   "Camera",               &Config::replayCamera, "GAME", "3RD PERSON", "HELMET")
         .Help("GAME is the replay's own camera, which faces one way while the rider swivels in front "
               "of it. 3RD PERSON locks the camera behind the rider. HELMET is a GoPro on the rider's "
               "helmet, on top or on its side.")
         .Col(0),
-    Slider(3, "3RD PERSON CAMERA", "Distance behind",      &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
+    Slider(kTabReplay, "3RD PERSON CAMERA", "Distance behind",      &Config::replayDistance,   0.5,   12.0,  0.1,    1.0,    1, " m")
         .Help("3rd person replays: how far behind the rider the camera sits. Lower moves it forward, "
               "closer to the rider."),
-    Slider(3, nullptr,           "Height",               &Config::replayHeight,     -0.5,  5.0,   0.05,   1.0,    2, " m")
+    Slider(kTabReplay, nullptr,           "Height",               &Config::replayHeight,     -0.5,  5.0,   0.05,   1.0,    2, " m")
         .Help("3rd person replays: how high above the rider the camera sits."),
-    Slider(3, nullptr,           "Pitch",                &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
+    Slider(kTabReplay, nullptr,           "Pitch",                &Config::replayPitchDeg,   -10.0, 45.0,  0.5,    1.0,    1, "\xB0")
         .Help("3rd person replays: how far the camera looks down. Negative looks up."),
-    Choice4(3, "HELMET CAMERA",   "Mount",                &Config::helmetMount, "TOP", "LEFT", "RIGHT", "CHEST")
+    Choice4(kTabReplay, "HELMET CAMERA",   "Mount",                &Config::helmetMount, "TOP", "LEFT", "RIGHT", "CHEST")
         .Help("Helmet replays: TOP mounts the camera on top of the helmet, LEFT and RIGHT on its side, "
               "CHEST on the rider's chest (it turns with the body, not the head). Each keeps its own "
               "height, forward and tilt.")
         .Col(1),
-    Slider(3, nullptr,           "Mount height",         &Config::helmetHeight,     -1.5,  2.0,   0.01,   1.0,    2, " m")
+    Slider(kTabReplay, nullptr,           "Mount height",         &Config::helmetHeight,     -1.5,  2.0,   0.01,   1.0,    2, " m")
         .Side(&Config::sideHeight).Chest(&Config::chestHeight)
         .Help("Helmet replays: how far above the rider's eyes the camera sits (chest mount: above the "
               "middle of the shoulders, negative is below them)."),
-    Slider(3, nullptr,           "Mount forward",        &Config::helmetForward,    -1.5,  1.5,   0.01,   1.0,    2, " m")
+    Slider(kTabReplay, nullptr,           "Mount forward",        &Config::helmetForward,    -1.5,  1.5,   0.01,   1.0,    2, " m")
         .Side(&Config::sideForward).Chest(&Config::chestForward)
         .Help("Helmet replays: moves the camera forward (+) or back (-) along the helmet (chest mount: "
               "how far in front of the shoulders it sits)."),
-    Slider(3, nullptr,           "Mount out",            &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
+    Slider(kTabReplay, nullptr,           "Mount out",            &Config::sideOut,          0.0,   1.5,   0.01,   1.0,    2, " m")
         .Help("Side-mounted helmet replays: how far out to the side of the head the camera sits. Raise "
               "it if the camera ends up inside the helmet."),
-    Slider(3, nullptr,           "Tilt",                 &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
+    Slider(kTabReplay, nullptr,           "Tilt",                 &Config::helmetTiltDeg,    -10.0, 60.0,  0.5,    1.0,    1, "\xB0")
         .Side(&Config::sideTiltDeg).Chest(&Config::chestTiltDeg)
         .Help("Helmet replays: how far the camera is angled down from where the helmet faces. More "
               "shows more of the bars and the bike, less shows more of the track ahead."),
-    Slider(3, nullptr,           "Stabilization",        &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabReplay, nullptr,           "Stabilization",        &Config::helmetSmoothing,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Helmet replays: smooths the camera's rotation, like a GoPro's stabilization. Off shakes "
               "with every jolt of the rider's head."),
-    Slider(3, nullptr,           "Horizon lock",         &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabReplay, nullptr,           "Horizon lock",         &Config::helmetLevel,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Helmet replays: how much of the rider's lean is taken out of the view. 0% leans with "
               "the head, 100% keeps the horizon level."),
     // ======== KEYBINDS ========
-    KeyRow(4, "KEYBINDS",       "Open / close this menu",    &Config::menuKey)
+    KeyRow(kTabKeybinds, "KEYBINDS",       "Open / close this menu",    &Config::menuKey)
         .Help("Opens and closes this menu. Click the key, then press the new one. Esc cancels."),
-    KeyRow(4, nullptr,          "First person mod on / off", &Config::toggleKey)
+    KeyRow(kTabKeybinds, nullptr,          "First person mod on / off", &Config::toggleKey)
         .Help("Turns the first-person camera mod on and off in game (the FIRST PERSON tab's First "
               "person mod switch). Click the key, then press the new one. Esc cancels."),
-    KeyRow(4, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
+    KeyRow(kTabKeybinds, nullptr,          "Shaders on / off",          &Config::shaderToggleKey)
         .Help("Turns all the shaders on and off in game, for before / after comparisons (the GRAPHICS "
               "tab's Shaders switch). Click the key, then press the new one. Esc cancels."),
-    PadRow(4, "CONTROLLER",     "Look left",                 &Config::lookLeftControl)
-        .Help("Hold to look left (FIRST PERSON tab: Controller look, Side look angle). Click it, then "
+    PadRow(kTabKeybinds, "CONTROLLER",     "Look left",                 &Config::lookLeftControl)
+        .Help("Hold to look left (LOOK tab: Controller look, Side look angle). Click it, then "
               "press any button, trigger or paddle on your controller, or push a stick the way you want. "
               "Backspace clears it, Esc cancels."),
-    PadRow(4, nullptr,          "Look right",                &Config::lookRightControl)
+    PadRow(kTabKeybinds, nullptr,          "Look right",                &Config::lookRightControl)
         .Help("Hold to look right. Click it, then press any button, trigger or paddle on your controller, "
               "or push a stick the way you want. Backspace clears it, Esc cancels."),
-    PadRow(4, nullptr,          "Look back",                 &Config::lookBackControl)
+    PadRow(kTabKeybinds, nullptr,          "Look back",                 &Config::lookBackControl)
         .Help("Hold to look behind you (it wins over left and right). Click it, then press any button, "
               "trigger or paddle on your controller, or push a stick the way you want. Backspace clears "
               "it, Esc cancels. Paddles: an Xbox Elite controller's paddles work when they aren't mapped "
               "to another button in the Xbox Accessories app; other controllers' paddles work when they "
               "show up as buttons of their own."),
     // ======== OTHER ========
-    Toggle(5, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
+    Toggle(kTabOther, "WHILE RIDING",   "Hide HUD",                  &Config::hideHud)
         .Help("Hides the game's HUD (timing, positions, chat) while you ride, spectate or watch a "
               "replay, for a clean view. Open the game's menu (Esc) and it's all there as usual; "
               "close it and the HUD goes again. Never hidden in the game's menus.")
         .Col(0),
-    Toggle(5, nullptr,          "Hide cursor",               &Config::hideCursor)
+    Toggle(kTabOther, nullptr,          "Hide cursor",               &Config::hideCursor)
         .Help("Hides the game's mouse cursor while you ride or watch a replay. It comes back as soon "
               "as you move the mouse, and is never hidden in the game's menus."),
-    Toggle(5, nullptr,          "Dab indicator",             &Config::dabIndicator)
+    Toggle(kTabOther, nullptr,          "Dab indicator",             &Config::dabIndicator)
         .Help("Shows at the bottom right, next to the speedometer, whether your rider is standing or "
               "sitting: a red rider standing on the bike, or a green one sitting with a foot down while "
               "you hold the game's Sit/Dab key. Follows the game's own settings: your Sit/Dab key or "
               "button and Dab When Stopped. Turning it on asks whether the game's Sticky Sit/Dab is on "
               "(turn it off and on again to change your answer)."),
-    Toggle(5, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
+    Toggle(kTabOther, "WINDOW",         "Fullscreen window",         &Config::fullscreenWindow)
         .Help("With the game in windowed mode, makes its window cover the whole screen with no border "
               "(borderless fullscreen): Alt+Tab stays instant. Off puts the window back as it was. "
               "Shared by all the presets."),
-    Toggle(5, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
+    Toggle(kTabOther, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
         .Help("While you drag a GRAPHICS slider (or step it with the arrow keys) the menu fades out, "
               "all but that slider, so you can see the whole picture change."),
-    Toggle(5, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
+    Toggle(kTabSounds, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
         .Help("A fuller engine sound for every bike that uses the game's stock 125 two-stroke engine. "
               "The stock sounds repeat one recorded engine cycle over and over; this one plays 16 "
               "cycles in a random order, each firing a little differently, like a real engine. "
               "Heard from the next time the game starts.")
         .Col(1),
-    Toggle(5, nullptr,          "250 two-stroke",            &Config::soundPack250)
+    Toggle(kTabSounds, nullptr,          "250 two-stroke",            &Config::soundPack250)
         .Help("A fuller engine sound for every bike that uses the game's stock 250 two-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
-    Toggle(5, nullptr,          "250 four-stroke",           &Config::soundPack250f)
+    Toggle(kTabSounds, nullptr,          "250 four-stroke",           &Config::soundPack250f)
         .Help("A fuller engine sound for every bike that uses the game's stock 250 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts."),
-    Toggle(5, nullptr,          "450 four-stroke",           &Config::soundPack450f)
+    Toggle(kTabSounds, nullptr,          "450 four-stroke",           &Config::soundPack450f)
         .Help("A fuller engine sound for every bike that uses the game's stock 450 four-stroke engine "
               "(16 varied cycles instead of one repeated). Heard from the next time the game starts. "
               "Bikes with their own custom sounds keep them."),
-    Toggle(5, nullptr,          "450 four-stroke (clear)",   &Config::soundPack450fClear)
+    Toggle(kTabSounds, nullptr,          "450 four-stroke (clear)",   &Config::soundPack450fClear)
         .Help("The same 450 four-stroke sound, less muffled: everything but the rev limiter brighter, the "
               "limiter very slightly more muffled. One 450 sound or the other: turning this on turns the "
               "other off. Heard from the next time the game starts."),
-    Slider(5, nullptr,          "Brake squeal",              &Config::brakeSqueal,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabSounds, "BRAKES",       "Brake squeal",              &Config::brakeSqueal,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Your brakes squeal when you brake hard: the game's own brake controls pressed most of "
               "the way while you're moving and slowing down. Its loudness; heard right away, with "
               "any bike."),
 
     // ======== WEATHER ========
-    Toggle(2, "SNOW",           "Snow",                      &Config::snow)
+    Toggle(kTabWeather, "RAIN",           "Rain",                      &Config::rain)
+        .Help("Rain is coming in a future update: wet, darker dirt, puddles and rain falling around you.")
+        .Badge("COMING SOON")
+        .Locked(),
+    Toggle(kTabWeather, "SNOW",           "Snow",                      &Config::snow)
         .Help("Snow on the track: the ground turns white (thinner on steep slopes, your ruts dig "
               "through it to the dirt) under a grey, overcast sky. Needs the shaders on (GRAPHICS)."),
-    Slider(2, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabWeather, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
-    Slider(2, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
+    Slider(kTabWeather, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
         .Help("How hard the wind blows the falling snow sideways."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
@@ -1459,6 +1552,14 @@ struct PanelState {
     // game's settings file can't be trusted for it: see Config::dabSticky). 0 OFF, 1 ON highlighted.
     bool   askSticky    = false;
     int    askChoice    = 0;
+    // DEFAULTS was pressed: asking first (0 CANCEL, 1 RESET highlighted). Too many lost their
+    // settings to one click.
+    bool   askDefaults  = false;
+    double openedAt     = 0;  // when the menu last opened (the logo's light sweep counts from it)
+    // Something just changed that only takes effect once the game restarts (the sound mods): saying
+    // so, with an OK. restartText: what changed.
+    bool   askRestart   = false;
+    char   restartText[128] = "";
     // A preset being renamed (its index, -1: none): what's typed so far, and when typing started
     // (the caret blinks from then).
     int    renaming     = -1;
@@ -1521,7 +1622,14 @@ void UpdateSoundPacks(double now)
     for (int i = 0; i < soundpacks::kCount; ++i) {
         if (*switches[i] == soundpacks::Installed(i))
             continue;
-        SetStatus(soundpacks::Set(i, *switches[i]), now);
+        const char* status = soundpacks::Set(i, *switches[i]);
+        SetStatus(status, now);
+        // (Installed or taken out: heard only once the game starts again. Not when it failed.)
+        if (g_panel.open && (strstr(status, "RESTART") || strstr(status, "NEXT TIME") || strstr(status, "CLOSE THE GAME"))) {
+            snprintf(g_panel.restartText, sizeof g_panel.restartText, "%s", status);
+            g_panel.askRestart = true;
+            g_panel.askChoice = 0;
+        }
         *switches[i] = soundpacks::Installed(i);  // (back off if it couldn't be installed)
     }
 }
@@ -1752,6 +1860,7 @@ void OpenPanel(HWND window)
     g_panel.pressedItem = -1;
     g_panel.listening = -1;
     g_panel.closeRequest = false;
+    g_panel.openedAt = Seconds();
     g_menuOpen = true;
     Log("panel: opened");
 }
@@ -1765,6 +1874,8 @@ void ClosePanel()
         FinishRename(true, Seconds());
     ClearSearch();
     g_panel.scrollDrag = false;
+    g_panel.askDefaults = false;
+    g_panel.askRestart = false;
     g_panel.open = false;
     g_panel.dragging = -1;
     g_panel.listening = -1;
@@ -2182,7 +2293,8 @@ bool RowInactive(const RowDef& def, const Config& cfg)
     // (Controller look and its angle and speed work with the mod off too.)
     const bool lookRow = def.flag == &Config::controllerLook || def.number == &Config::lookSideDeg ||
                          def.number == &Config::lookTurnSpeed;
-    if ((def.tab == kTabFirstPerson || def.tab == kTabReplay) && !cfg.enabled && def.flag != &Config::enabled && !lookRow)
+    if ((def.tab == kTabFirstPerson || def.tab == kTabLook || def.tab == kTabReplay) && !cfg.enabled &&
+        def.flag != &Config::enabled && !lookRow)
         return true;  // the first person mod is off (it does the replay cameras too)
     if (def.tab == kTabReplay && def.number) {  // placement for a replay camera that isn't the one chosen
         const bool chase = def.number == &Config::replayDistance || def.number == &Config::replayHeight ||
@@ -2273,6 +2385,20 @@ std::string ClipboardText()
     return text;
 }
 
+// Where the panel is on screen (at the atlas's scale): its left, top, width and height.
+struct PanelPlace { float x = 0, y = 0, w = 0, h = 0; };
+PanelPlace PanelOnScreen(int screenHeight)
+{
+    const float s = g_atlasScale;
+    const auto S = [s](float v) { return std::round(v * s); };
+    PanelPlace p;
+    p.w = S(kPanelW);
+    p.h = S(kPanelH);
+    p.x = S(32);
+    p.y = std::fmax(S(16), std::round((screenHeight - p.h) * 0.5f));
+    return p;
+}
+
 void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
 {
     Config& cfg = EditConfig();
@@ -2287,11 +2413,14 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     const int presetItem = kFirstRowItem + rowsShown;
     const int saveItem = presetItem + 1, defaultsItem = saveItem + 1, closeItem = saveItem + 2;
     const int copyCodeItem = closeItem + 1, pasteCodeItem = closeItem + 2;
-    const int itemCount = pasteCodeItem + 1;
+    const int cancelItem = pasteCodeItem + 1;  // (only while there are unsaved changes)
+    const int itemCount = cancelItem + 1;
     if (g_panel.selected >= itemCount)
         g_panel.selected = itemCount - 1;
     if (in.nav)
         g_panel.selected = (g_panel.selected + in.nav + itemCount) % itemCount;
+    if (!g_panel.dirty && g_panel.selected == cancelItem)
+        g_panel.selected = in.nav < 0 ? cancelItem - 1 : 0;  // (not shown: stepped over)
     const bool reveal = in.nav != 0;  // moved with the keys: the row it's on scrolls into view
 
     // Help follows whichever was used last: the mouse (what's under it) or the keys (the selection).
@@ -2314,9 +2443,10 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
 
     // ---- Layout: the tabs down the left (search over them), the logo and the presets along the
     // top, the settings in a box, the buttons along the bottom ----
-    const float panelW = S(kPanelW), panelH = S(kPanelH);
-    const float px = S(32);
-    const float py = std::fmax(S(16), std::round((screenHeight - panelH) * 0.5f));
+    const PanelPlace place = PanelOnScreen(screenHeight);
+    const float panelW = place.w, panelH = place.h;
+    const float px = place.x;
+    const float py = place.y;
     const float pad = S(34);
     const float sideX = px + pad, sideW = S(262);
     const float topY = py + pad, topH = S(48);
@@ -2391,6 +2521,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     if (g_logo.valid) {
         const float lx = boxR - g_logo.w, ly = topY + std::round((topH - g_logo.h) * 0.5f);
         Quad(lx, ly, lx + g_logo.w, ly + g_logo.h, g_logo.u0, g_logo.v0, g_logo.u1, g_logo.v1, White(1.0f));
+        LogoSweep(lx, ly, now - g_panel.openedAt);
         logoLeft = lx;
     } else {
         const char* title = "MXS Remastered";
@@ -2405,15 +2536,19 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         const float labelW = TextWidth(kFontSmall, label, S(2));
         const float segH = S(34), segY = topY + std::round((topH - segH) * 0.5f);
         const float minW = S(46), padW = S(28), editW = S(150);
+        const float pencilW = S(22);  // the preset in use: room for its pencil (click to rename)
         const float lx = boxX, sx0 = lx + labelW + S(14);
         const float room = std::fmax(kPresetCount * minW, logoLeft - S(28) - sx0);
         // Each segment fits its name; when they don't all fit, the one being renamed keeps its room
         // and the rest share what's left (their names cut short).
         std::string names[kPresetCount];
         float w[kPresetCount], total = 0;
+        const int inUse = ActivePreset();
         for (int p = 0; p < kPresetCount; ++p) {
             names[p] = p == g_panel.renaming ? g_panel.nameDraft : PresetLabel(p);
             w[p] = std::fmax(minW, TextWidth(kFontSmall, names[p].c_str(), S(2)) + padW);
+            if (p == inUse && p != g_panel.renaming)
+                w[p] += pencilW;
             if (p == g_panel.renaming)
                 w[p] = std::fmax(w[p] + S(6), editW);
             total += w[p];
@@ -2443,8 +2578,8 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         const bool focused = g_panel.selected == presetItem;
         const bool areaHot = in.Inside(lx, segY, sx0 + total - lx, segH);
         OfferHelp("Five presets, each with its own copy of every setting (not the keybinds). Click one to switch "
-                  "to it: your changes stay with the preset you made them in. Click the one in use again (or press "
-                  "F2) to rename it: type the name, Enter keeps it, Esc leaves it as it was. A pasted code never "
+                  "to it: your changes stay with the preset you made them in. To rename the one in use, click it (its "
+                  "pencil) or press F2: type the name, Enter keeps it, Esc leaves it as it was. A pasted code never "
                   "changes a name. SAVE writes them all to MXS_REMASTERED.ini, and the game starts with the one in use.",
                   segY, segY + segH, lx, sx0 + total - lx, areaHot, focused);
         if (focused)
@@ -2475,8 +2610,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 RoundedRect(sx, segY, w[p], segH, S(5), White(0.06f));
             }
             // The name, cut short with ".." if its segment is too narrow (while typing, its end shows).
+            const bool pencil = p == current && !editing;
             std::string shown = names[p];
-            const float fit = w[p] - padW;
+            const float fit = w[p] - padW - (pencil ? pencilW : 0.0f);
             if (editing) {
                 while (!shown.empty() && TextWidth(kFontSmall, shown.c_str(), S(2)) > fit - S(6))
                     shown.erase(0, 1);
@@ -2487,8 +2623,17 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             }
             const float textW = TextWidth(kFontSmall, shown.c_str(), S(2));
             const float ty = segY + std::round((segH - LineHeight(kFontSmall)) * 0.5f);
-            const float tx = std::round(sx + (w[p] - textW - (editing ? S(6) : 0.0f)) * 0.5f);
+            const float tx = std::round(sx + (w[p] - textW - (editing ? S(6) : 0.0f) - (pencil ? pencilW : 0.0f)) * 0.5f);
             Text(kFontSmall, tx, ty, shown.c_str(), editing || p == current ? White(1.0f) : (hot ? kLabel : kDim), S(2));
+            if (pencil) {
+                // A pencil after the name: this one can be renamed (click it, or anywhere on the preset).
+                const float cx = std::round(tx + textW + pencilW * 0.5f + S(4)), cy = std::round(segY + segH * 0.5f);
+                const uint32_t ink = White(hot ? 1.0f : 0.72f);
+                const float k = s;  // (the icon's size follows the menu's scale)
+                Segment(cx - 3.5f * k, cy + 3.5f * k, cx + 3.0f * k, cy - 3.0f * k, std::fmax(2.0f, 3.0f * k), ink);  // its body
+                Segment(cx - 3.5f * k, cy + 3.5f * k, cx - 5.0f * k, cy + 5.0f * k, std::fmax(1.0f, 1.4f * k), ink);  // the tip
+                Segment(cx + 4.2f * k, cy - 4.2f * k, cx + 5.2f * k, cy - 5.2f * k, std::fmax(2.0f, 3.0f * k), ink);  // the eraser
+            }
             if (editing && std::fmod(now - g_panel.renameStarted, 1.0) < 0.6)  // the caret
                 Rect(tx + textW + S(2), ty, S(2), LineHeight(kFontSmall), White(1.0f));
             sx += w[p];
@@ -2661,6 +2806,16 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         OfferHelp(def.help, std::fmax(y, boxY), std::fmin(y + rowH, boxB), hx, hw, hot, focused);
         const float midY = std::round(y + rowH * 0.5f);
         Text(kFontLabel, cx, y + std::round((rowH - LineHeight(kFontLabel)) * 0.5f), def.label, labelColor, 0);
+        if (def.badge) {
+            // A small red-outlined tag right after the label.
+            const float tagX = cx + TextWidth(kFontLabel, def.label, 0) + S(14);
+            const float tagW = TextWidth(kFontSmall, def.badge, S(2)) + S(16), tagH = S(22);
+            const float tagY = std::round(y + (rowH - tagH) * 0.5f);
+            RoundedRect(tagX, tagY, tagW, tagH, S(4), kAccent);
+            RoundedRect(tagX + 1, tagY + 1, tagW - 2, tagH - 2, std::fmax(0.0f, S(4) - 1), kBoxSolid);
+            Text(kFontSmall, tagX + S(8), tagY + std::round((tagH - LineHeight(kFontSmall)) * 0.5f), def.badge,
+                 Rgba(236, 38, 44, 1.0f), S(2));
+        }
 
         if (def.kind == RowKind::Slider) {
             // A white bar on a thin red track, the value at the right.
@@ -2702,7 +2857,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         } else if (def.kind == RowKind::Toggle) {
             // A checkbox: red with a white tick when on.
             bool& flag = cfg.*def.flag;
-            if ((hot && in.pressed) || (focused && (in.step || in.activate))) {
+            if (!def.locked && ((hot && in.pressed) || (focused && (in.step || in.activate)))) {
                 SetFlag(flag, !flag);
                 if (def.flag == &Config::enabled)
                     camera::Reset();
@@ -2861,6 +3016,12 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             else
                 snprintf(readout, sizeof readout, "SNOW ON   \xB7   SNOWFALL %.0f%%   \xB7   WIND %.0f%%", cfg.snowfall * 100.0,
                          cfg.snowWind * 100.0);
+        } else if (g_panel.tab == kTabLook) {
+            snprintf(readout, sizeof readout, "%s   \xB7   THE LOOK BUTTONS ARE ON THE KEYBINDS TAB",
+                     cfg.controllerLook ? gamepad::StatusText() : "CONTROLLER LOOK OFF");
+        } else if (g_panel.tab == kTabSounds) {
+            snprintf(readout, sizeof readout, "ENGINE SOUNDS ARE HEARD FROM THE NEXT TIME THE GAME STARTS   \xB7   "
+                     "THE BRAKE SQUEAL RIGHT AWAY");
         } else if (g_panel.tab == kTabOther) {
             const char* status = GameOverlayStatusText();
             snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");
@@ -2939,11 +3100,22 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     }
     if (Button(defaultsItem, boxR - 2 * bigW - gap, bigW, "DEFAULTS", false,
                "Puts every first person, replay, graphics and other setting of this preset back to its "
-               "default (not the keybinds). Press SAVE to keep it.")) {
-        ResetTunables();
-        camera::Reset();
-        g_panel.dirty = true;
-        SetStatus("DEFAULTS RESTORED - NOT SAVED YET", now);
+               "default (not the keybinds). It asks first; press SAVE afterwards to keep it, CANCEL to undo it.")) {
+        g_panel.askDefaults = true;
+        g_panel.askChoice = 0;  // (CANCEL highlighted: Enter by mistake changes nothing)
+    }
+    // CANCEL: only while something is changed - every change since the last SAVE undone.
+    if (g_panel.dirty) {
+        const float cancelW = S(150);
+        if (Button(cancelItem, boxR - 2 * bigW - 2 * gap - cancelW, cancelW, "CANCEL", false,
+                   "Undoes every change since you last pressed SAVE: all your settings, presets and keybinds go "
+                   "back to what's in MXS_REMASTERED.ini.")) {
+            ReloadConfig();
+            camera::Reset();
+            g_panel.dirty = false;
+            SetStatus("CHANGES CANCELLED - BACK TO YOUR SAVED SETTINGS", now);
+            Log("panel: unsaved changes cancelled (settings read again from the ini)");
+        }
     }
     if (Button(closeItem, sideX, sideW, "CLOSE", false, "Closes the menu. Unsaved changes stay until you quit the game."))
         g_panel.closeRequest = true;
@@ -2952,7 +3124,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     // tabs only PASTE CODE shows).
     {
         const float cwBtn = S(170);
-        const int codeTab = searching ? -1 : g_panel.tab;
+        const int codeTab = searching ? -1 : CodeOfTab(g_panel.tab);
         const bool canCopy = codeTab >= 0 && HasPresetCode(codeTab);
         if (!canCopy && g_panel.selected == copyCodeItem)
             g_panel.selected = pasteCodeItem;  // (moved onto with the keyboard or a controller: it isn't shown)
@@ -2967,10 +3139,10 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             if (code.empty()) {
                 SetStatus("CODES ARE FOR THE FIRST PERSON AND GRAPHICS TABS - OPEN ONE TO COPY ITS CODE", now);
             } else if (CopyToClipboard(code)) {
-                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %s, %d CHARACTERS) - PASTE IT TO SHARE", kTabs[codeTab],
+                snprintf(text, sizeof text, "%s CODE COPIED (PRESET %s, %d CHARACTERS) - PASTE IT TO SHARE", kTabs[TabOfCode(codeTab)],
                          PresetLabel(ActivePreset()).c_str(), static_cast<int>(code.size()));
                 SetStatus(text, now);
-                Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, kTabs[codeTab], code.c_str());
+                Log("overlay: preset %d's %s code copied: %s", ActivePreset() + 1, kTabs[TabOfCode(codeTab)], code.c_str());
             } else {
                 SetStatus("COULD NOT COPY TO THE CLIPBOARD", now);
             }
@@ -2997,7 +3169,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                 camera::Reset();
                 g_panel.dirty = true;
                 snprintf(text, sizeof text, "%s CODE LOADED INTO PRESET %s%s - SAVE TO KEEP IT",
-                         r.tab >= 0 && r.tab < kTabCount ? kTabs[r.tab] : "",
+                         TabOfCode(r.tab) >= 0 ? kTabs[TabOfCode(r.tab)] : "",
                          PresetLabel(ActivePreset()).c_str(), r.unknown ? " (SOME NEWER SETTINGS LEFT OUT)" : "");
                 SetStatus(text, now);
                 break;
@@ -3205,36 +3377,41 @@ void StartupHintFrame(HWND window, double now)
 }
 
 // ===========================================================================
-// Turning the dab indicator on asks whether the game's Sticky Sit/Dab is on (Config::dabSticky): its
-// settings file can say the old setting for a long while after it's changed (the game writes it only
-// now and then), so the answer is asked, not read. OFF / ON with the mouse, the arrow keys and Enter;
-// Esc never minds (the indicator goes back off).
-void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, double now)
+// A question over the menu, centred on it (the rest of the screen dimmed): a title, the question,
+// two lines under it and its buttons at the bottom right, "ESC CANCELS" at the left when Esc does.
+// The buttons answer to the mouse, the arrow keys and Enter (g_panel.askChoice is the one lit).
+// Returns the button chosen this frame, or -1.
+int BuildQuestion(int screenWidth, int screenHeight, const Input& in, const char* title, const char* question,
+                  const char* line1, const char* line2, const char* const* labels, int buttons, bool escCancels)
 {
     const float s = g_atlasScale;
     const auto S = [s](float v) { return std::round(v * s); };
     Rect(0, 0, static_cast<float>(screenWidth), static_cast<float>(screenHeight), Rgba(0, 0, 0, 0.55f));
+    const PanelPlace panel = PanelOnScreen(screenHeight);
     const float boxW = S(640), boxH = S(260);
-    const float bx = std::round((screenWidth - boxW) * 0.5f), by = std::round((screenHeight - boxH) * 0.5f);
+    const float bx = std::round(panel.x + (panel.w - boxW) * 0.5f), by = std::round(panel.y + (panel.h - boxH) * 0.5f);
     RoundedRect(bx - 1, by - 1, boxW + 2, boxH + 2, S(10) + 1, kBorder);
     RoundedRect(bx, by, boxW, boxH, S(10), kPanelSolid);
     const float pad = S(28);
     float y = by + pad;
-    Text(kFontSmall, bx + pad, y, "DAB INDICATOR", kSection, S(2));
+    Text(kFontSmall, bx + pad, y, title, kSection, S(2));
     y += LineHeight(kFontSmall) + S(14);
-    Text(kFontBody, bx + pad, y, "Is Sticky Sit/Dab on in MX Simulator's settings?", kLabel, 0);
+    Text(kFontBody, bx + pad, y, question, kLabel, 0);
     y += LineHeight(kFontBody) + S(10);
-    Text(kFontSmall, bx + pad, y, "OFF: you sit while you hold the Sit/Dab button.", kDim, S(1));
+    if (line1 && *line1)
+        Text(kFontSmall, bx + pad, y, line1, kDim, S(1));
     y += LineHeight(kFontSmall) + S(4);
-    Text(kFontSmall, bx + pad, y, "ON: one press sits you, the next stands you up.", kDim, S(1));
+    if (line2 && *line2)
+        Text(kFontSmall, bx + pad, y, line2, kDim, S(1));
 
     const float buttonW = S(150), buttonH = S(42), gap = S(16);
     const float buttonsY = by + boxH - pad - buttonH;
-    const float firstX = bx + boxW - pad - 2 * buttonW - gap;
+    const float firstX = bx + boxW - pad - buttons * buttonW - (buttons - 1) * gap;
     if (in.step)
-        g_panel.askChoice = in.step > 0 ? 1 : 0;
+        g_panel.askChoice = Clamp(g_panel.askChoice + (in.step > 0 ? 1 : -1), 0, buttons - 1);
+    g_panel.askChoice = Clamp(g_panel.askChoice, 0, buttons - 1);
     int chosen = -1;
-    for (int b = 0; b < 2; ++b) {
+    for (int b = 0; b < buttons; ++b) {
         const float x = firstX + b * (buttonW + gap);
         const bool hot = in.Inside(x, buttonsY, buttonW, buttonH);
         if (hot)
@@ -3244,13 +3421,31 @@ void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, dou
         const bool lit = g_panel.askChoice == b;
         RoundedRect(x - 1, buttonsY - 1, buttonW + 2, buttonH + 2, S(6) + 1, lit ? kAccentHot : kBorder);
         RoundedRect(x, buttonsY, buttonW, buttonH, S(6), lit ? kAccent : kPanelSolid);
-        const char* label = b ? "ON" : "OFF";
-        Text(kFontSmall, std::round(x + (buttonW - TextWidth(kFontSmall, label, S(2))) * 0.5f),
-             buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), label, White(lit ? 1.0f : 0.88f), S(2));
+        Text(kFontSmall, std::round(x + (buttonW - TextWidth(kFontSmall, labels[b], S(2))) * 0.5f),
+             buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), labels[b], White(lit ? 1.0f : 0.88f), S(2));
     }
-    Text(kFontSmall, bx + pad, buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), "ESC CANCELS", kDim, S(1));
+    if (escCancels)
+        Text(kFontSmall, bx + pad, buttonsY + std::round((buttonH - LineHeight(kFontSmall)) * 0.5f), "ESC CANCELS", kDim, S(1));
     if (in.activate)
         chosen = g_panel.askChoice;
+    // The menu's own cursor, over the question (the menu behind it was drawn without the mouse).
+    if (in.inside) {
+        Disc(in.mx, in.my, S(6) + 1.5f, Rgba(0, 0, 0, 0.55f));
+        Disc(in.mx, in.my, S(5), White(1.0f));
+    }
+    return chosen;
+}
+
+// Turning the dab indicator on asks whether the game's Sticky Sit/Dab is on (Config::dabSticky): its
+// settings file can say the old setting for a long while after it's changed (the game writes it only
+// now and then), so the answer is asked, not read. Esc never minds (the indicator goes back off).
+void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, double now)
+{
+    static const char* const kLabels[2] = { "OFF", "ON" };
+    const int chosen = BuildQuestion(screenWidth, screenHeight, in, "DAB INDICATOR",
+                                     "Is Sticky Sit/Dab on in MX Simulator's settings?",
+                                     "OFF: you sit while you hold the Sit/Dab button.",
+                                     "ON: one press sits you, the next stands you up.", kLabels, 2, true);
     if (chosen >= 0) {
         EditConfig().dabSticky = chosen ? 2 : 1;
         g_panel.dirty = true;
@@ -3258,11 +3453,38 @@ void BuildStickyQuestion(int screenWidth, int screenHeight, const Input& in, dou
         SetStatus(chosen ? "DAB INDICATOR ON (STICKY SIT/DAB ON) - SAVE TO KEEP IT"
                          : "DAB INDICATOR ON (STICKY SIT/DAB OFF) - SAVE TO KEEP IT", now);
     }
-    // The menu's own cursor, over the question (the menu behind it was drawn without the mouse).
-    if (in.inside) {
-        Disc(in.mx, in.my, S(6) + 1.5f, Rgba(0, 0, 0, 0.55f));
-        Disc(in.mx, in.my, S(5), White(1.0f));
+}
+
+// DEFAULTS asks first (CANCEL lit to start with: Enter by mistake changes nothing); Esc never minds.
+void BuildDefaultsQuestion(int screenWidth, int screenHeight, const Input& in, double now)
+{
+    static const char* const kLabels[2] = { "CANCEL", "RESET" };
+    char question[96];
+    snprintf(question, sizeof question, "Reset preset %s to its default settings?", PresetLabel(ActivePreset()).c_str());
+    const int chosen = BuildQuestion(screenWidth, screenHeight, in, "DEFAULTS", question,
+                                     "Every first person, replay, graphics and other setting goes back.",
+                                     "Your keybinds stay. Nothing is saved until you press SAVE.", kLabels, 2, true);
+    if (chosen == 1) {
+        ResetTunables();
+        camera::Reset();
+        g_panel.dirty = true;
+        SetStatus("DEFAULTS RESTORED - SAVE TO KEEP THEM, CANCEL TO UNDO", now);
+        Log("panel: preset %d reset to its defaults (not saved yet)", ActivePreset() + 1);
     }
+    if (chosen >= 0)
+        g_panel.askDefaults = false;
+}
+
+// A change that only takes effect once the game restarts (the sound mods): said so, with an OK
+// (Esc and Enter close it too).
+void BuildRestartNotice(int screenWidth, int screenHeight, const Input& in, double)
+{
+    static const char* const kLabels[1] = { "OK" };
+    const int chosen = BuildQuestion(screenWidth, screenHeight, in, "RESTART NEEDED",
+                                     "Restart MX Simulator for this to take effect.", g_panel.restartText,
+                                     "Press SAVE first, so the change is still there after the restart.", kLabels, 1, false);
+    if (chosen >= 0)
+        g_panel.askRestart = false;
 }
 
 // The dab indicator (Config::dabIndicator): bottom right, by the game's speedometer, whether your
@@ -3481,6 +3703,15 @@ void OverlayFrame(HDC dc)
         char search[64] = "";
         if (GetEnvironmentVariableA("MXCAM_TEST_MENU_SEARCH", search, sizeof search) > 0)
             g_panel.search = search;
+        // (Shown with a change made - its CANCEL button - or with the DEFAULTS question up.)
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_DIRTY", nullptr, 0) > 0)
+            g_panel.dirty = true;
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_ASK_DEFAULTS", nullptr, 0) > 0)
+            g_panel.askDefaults = true;
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_ASK_RESTART", nullptr, 0) > 0) {
+            snprintf(g_panel.restartText, sizeof g_panel.restartText, "250F SOUND ON - RESTART THE GAME TO HEAR IT");
+            g_panel.askRestart = true;
+        }
     }
     // (And scrolled this far down the list, pixels.)
     static const float testScroll = [] {
@@ -3500,6 +3731,10 @@ void OverlayFrame(HDC dc)
         }
         g_hintDone = true;  // (they've found it)
         OpenPanel(window);
+    } else if (g_panel.askRestart && focus && escape) {
+        g_panel.askRestart = false;  // Esc on the notice: read, the menu stays open
+    } else if (g_panel.askDefaults && focus && escape) {
+        g_panel.askDefaults = false;  // Esc on the question: nothing reset, the menu stays open
     } else if (g_panel.askSticky && focus && escape) {
         // Esc on the question: never mind (the indicator goes back off), the menu stays open.
         EditConfig().dabIndicator = false;
@@ -3509,7 +3744,8 @@ void OverlayFrame(HDC dc)
     } else if (focus && escape && g_panel.listening < 0 && (g_panel.searchFocus || !g_panel.search.empty())) {
         ClearSearch();  // Esc with a search: the search goes, the menu stays
     } else if (g_panel.closeRequest || (focus && g_panel.listening < 0 && g_panel.renaming < 0 && !g_panel.searchFocus &&
-                                        !g_panel.askSticky && (menuKey || escape))) {
+                                        !g_panel.askSticky && !g_panel.askDefaults && !g_panel.askRestart &&
+                                        (menuKey || escape))) {
         g_panel.askSticky = false;
         ClosePanel();
         return;
@@ -3568,13 +3804,18 @@ void OverlayFrame(HDC dc)
         g_keepRanges.clear();
         g_clips.clear();
         UpdateFade(now);
-        if (g_panel.askSticky) {
+        if (g_panel.askSticky || g_panel.askDefaults || g_panel.askRestart) {
             // The question takes every click and key; the menu behind it is shown, untouched.
             Input none;
             none.mx = none.my = -1;
             BuildPanel(width, height, none, now);
             ApplyFade();
-            BuildStickyQuestion(width, height, in, now);
+            if (g_panel.askRestart)
+                BuildRestartNotice(width, height, in, now);
+            else if (g_panel.askDefaults)
+                BuildDefaultsQuestion(width, height, in, now);
+            else
+                BuildStickyQuestion(width, height, in, now);
         } else {
             BuildPanel(width, height, in, now);
             ApplyFade();

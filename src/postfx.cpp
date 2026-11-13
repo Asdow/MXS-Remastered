@@ -1164,7 +1164,7 @@ void SetupShadowFrame()
     // From 12 m around you out to the shadow distance, each about the same times bigger than the
     // last; each mostly ahead of the camera. Their centres move in whole texels of their own, so
     // shadow edges don't crawl as the camera moves.
-    const double tile = cfg.shadowMapSize / 2.0;
+    const double tile = ShadowMapSize(cfg) / 2.0;
     const double nearest = std::fmin(half, 12.0 * UnitsPerMetre());
     for (int c = 0; c < kCascades; ++c) {
         const double h = nearest * std::pow(half / nearest, double(c) / (kCascades - 1));
@@ -5520,6 +5520,8 @@ int   g_standInsCast = 0;          // this frame, for the trace (F11): the shape
 int   g_lateSceneDraws = 0;        // this frame, for the trace: 3D draws after the effects were applied
 int   g_riderDrawsDropped = 0;     // this frame, for the trace: rider pieces not collected (the list full)
 int   g_nearCasts[6] = {};         // this frame, for the trace: the draws around your rider (NoteNearCast)
+int   g_allCasts[8] = {};          // this frame, for the trace: every draw the shadow map was offered (NoteCast)
+int   g_castBands[4] = {};         // and the 3D ones by how far from the camera (NoteCastDistance)
 int   g_replays[2][4] = {};        // this frame, for the trace: repeats into the shadow map (NoteReplay)
 int   g_realBodyDrawn = 0;         // this frame: pieces of your rider drawn along with one the game drew (NoteRealBodyDrawn)
 int   g_realBodyTraced = 0;        // (the last frame's, for the trace)
@@ -5899,6 +5901,12 @@ unsigned g_timerFrame = 0;
 double g_gpuMs[kTimerSlots] = {}, g_cpuMs[kTimerSlots] = {};
 std::chrono::steady_clock::time_point g_timerStart[kTimerSlots];
 double g_castNowMs = 0, g_castNowMsTraced = 0, g_lobbyMs = 0;
+// And how many depth samples the held-back casters wrote into the shadow map (GL_SAMPLES_PASSED,
+// read the same few frames later): none at all while things should be casting = drawn but thrown away.
+constexpr GLenum kSamplesPassed = 0x8914;
+GLuint g_sampleQ[kTimerRing] = {};
+bool   g_samplePending[kTimerRing] = {};
+long long g_flushSamples = -1;
 
 bool TimersOk()
 {
@@ -5912,6 +5920,7 @@ void TimerBegin(int slot)
         return;
     if (!g_timersMade) {
         g_gl.GenQueries(kTimerRing * kTimerSlots, &g_timerQ[0][0]);
+        g_gl.GenQueries(kTimerRing, g_sampleQ);
         g_timersMade = true;
     }
     const int r = static_cast<int>(g_timerFrame % kTimerRing);
@@ -5927,6 +5936,20 @@ void TimerBegin(int slot)
         g_timerPending[r][slot] = false;
     }
     g_gl.BeginQuery(kTimeElapsed, q);
+    if (slot == 0) {
+        const GLuint s = g_sampleQ[r];
+        if (g_samplePending[r]) {
+            GLint available = 0;
+            g_gl.GetQueryObjectiv(s, kQueryResultAvailable, &available);
+            if (available) {
+                unsigned long long samples = 0;
+                g_gl.GetQueryObjectui64v(s, kQueryResult, &samples);
+                g_flushSamples = static_cast<long long>(samples);
+            }
+            g_samplePending[r] = false;
+        }
+        g_gl.BeginQuery(kSamplesPassed, s);
+    }
 }
 
 void TimerEnd(int slot)
@@ -5936,6 +5959,10 @@ void TimerEnd(int slot)
         return;
     g_gl.EndQuery(kTimeElapsed);
     g_timerPending[g_timerFrame % kTimerRing][slot] = true;
+    if (slot == 0) {
+        g_gl.EndQuery(kSamplesPassed);
+        g_samplePending[g_timerFrame % kTimerRing] = true;
+    }
 }
 
 bool g_effectsTimerOpen = false;
@@ -6003,7 +6030,7 @@ bool ReadyResources()
 // The shadow map's depth texture and framebuffer, at the configured size.
 bool EnsureShadowMap()
 {
-    const int size = GetConfig().shadowMapSize;
+    const int size = ShadowMapSize(GetConfig());  // (a change in the menu takes effect next frame)
     if (g_res.shadowMap && g_res.shadowSize == size)
         return true;
     GLint active = 0, bound = 0;
@@ -6556,6 +6583,12 @@ const char* WheelTraceText()
              g_riderPartCast ? 1 : 0, shapes[0] ? shapes : "-", g_lateSceneDraws, g_riderDrawsDropped, g_nearCasts[0], g_nearCasts[1],
              g_nearCasts[2], g_nearCasts[3], g_nearCasts[4], g_nearCasts[5]);
     n = static_cast<int>(strlen(text));
+    snprintf(text + n, sizeof text - n, ",%d/%d/%d/%d/%d/%d/%d/%d", g_allCasts[0], g_allCasts[1], g_allCasts[2], g_allCasts[3],
+             g_allCasts[4], g_allCasts[5], g_allCasts[6], g_allCasts[7]);
+    n = static_cast<int>(strlen(text));
+    snprintf(text + n, sizeof text - n, ",%d/%d/%d/%d,%lld", g_castBands[0], g_castBands[1], g_castBands[2], g_castBands[3],
+             g_flushSamples);
+    n = static_cast<int>(strlen(text));
     snprintf(text + n, sizeof text - n, ",%d/%d/%d/%d,%d/%d/%d/%d,%d", g_replays[1][0], g_replays[1][1], g_replays[1][2],
              g_replays[1][3], g_replays[0][0], g_replays[0][1], g_replays[0][2], g_replays[0][3], g_realBodyTraced);
     n = static_cast<int>(strlen(text));
@@ -6569,6 +6602,10 @@ const char* WheelTraceText()
             c = 0;
     g_lateSceneDraws = g_riderDrawsDropped = 0;  // (read once a frame, at its end)
     for (int& c : g_nearCasts)
+        c = 0;
+    for (int& c : g_allCasts)
+        c = 0;
+    for (int& c : g_castBands)
         c = 0;
     return text;
 }
@@ -6744,6 +6781,17 @@ void NoteNearCast(int outcome)
 {
     if (outcome >= 0 && outcome < 6)
         ++g_nearCasts[outcome];
+}
+
+void NoteCast(int outcome)
+{
+    if (outcome >= 0 && outcome < 8)
+        ++g_allCasts[outcome];
+}
+
+void NoteCastDistance(double metres)
+{
+    ++g_castBands[metres < 50 ? 0 : metres < 100 ? 1 : metres < 200 ? 2 : 3];
 }
 
 bool WantsSceneEnd()
