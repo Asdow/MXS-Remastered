@@ -4456,10 +4456,21 @@ bool EndShaderFrame()
         const bool haveSpeed = postfx::RiderSpeed(speed);
         brake::Update(haveSpeed, speed);
     }
-    // The rain's thunder (thunder.h): its sound output on while the lightning is.
+    // The rain's sound and its lightning's (thunder.h): the sound output on while either is heard -
+    // only out on a track (the game's 3D camera seen in the last half second), never in its menus.
     {
+        static std::chrono::steady_clock::time_point lastScene{};
+        static bool sceneSeen = false;
+        const auto nowTime = std::chrono::steady_clock::now();
+        if (captured) {
+            lastScene = nowTime;
+            sceneSeen = true;
+        }
+        const bool onTrack = sceneSeen && nowTime - lastScene < std::chrono::milliseconds(500);
         const Config& c = GetConfig();
-        thunder::Update(c.shaders && c.weather == kWeatherRain && c.lightning > 0.0, c.thunder);
+        const bool rain = onTrack && c.shaders && c.weather == kWeatherRain;
+        thunder::Update(rain && c.lightning > 0.0 ? c.lightningSound : 0.0,
+                        rain ? c.rainSound * std::sqrt(c.rainfall) : 0.0);
     }
 
     // No camera this frame (menu, effect off): don't carry a stale correction into the

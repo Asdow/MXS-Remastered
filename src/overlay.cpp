@@ -1689,14 +1689,18 @@ const RowDef kRows[] = {
     Slider(kTabWeather, nullptr,          "Reflections",               &Config::rainReflections,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How strongly the puddles and the wet ground reflect: the sky and what stands around them "
               "(bikes, riders, trees, banners). Lower costs a little less."),
+    Slider(kTabWeather, nullptr,          "Rain sound",                &Config::rainSound,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How loud the rain sounds: steady rain all around you, louder the harder it rains (silent "
+              "with Rainfall off). Played beside the game's own sound, and quiet while the game is in the "
+              "background."),
     Slider(kTabWeather, nullptr,          "Lightning",                 &Config::lightning,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("A thunderstorm: how often lightning strikes. A bolt comes down out of the clouds somewhere "
               "around you, flickering, and its flash lights up the clouds, the track and the rain. Low: "
               "a strike now and then; high: every few seconds."),
-    Slider(kTabWeather, nullptr,          "Thunder",                   &Config::thunder,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
-        .Help("How loud the thunder is. It comes as late as the strike was far (about 3 seconds a "
-              "kilometre): a sharp crack for a strike close by, a long low rumble for a far one. Played "
-              "beside the game's own sound."),
+    Slider(kTabWeather, nullptr,          "Lightning sound",           &Config::lightningSound,   0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How loud each lightning strike sounds: the crack and the boom of the bolt. It comes as late "
+              "as the strike was far (about 3 seconds a kilometre); close by it's sharper and louder, far "
+              "off deeper and softer. Played beside the game's own sound."),
     Slider(kTabWeather, "SNOW",           "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
@@ -2304,7 +2308,8 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
 {
     const bool rainRow = def.number == &Config::rainfall || def.number == &Config::rainWind || def.number == &Config::wetness ||
                          def.number == &Config::puddles || def.number == &Config::rainReflections ||
-                         def.number == &Config::lightning || def.number == &Config::thunder;
+                         def.number == &Config::lightning || def.number == &Config::lightningSound ||
+                         def.number == &Config::rainSound;
     const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
 }
@@ -2533,11 +2538,11 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::roostDust || def.flag == &Config::roostEveryBike)
             return cfg.roost <= 0.0;
-        if (def.number == &Config::rainWind)
+        if (def.number == &Config::rainWind || def.number == &Config::rainSound)
             return cfg.rainfall <= 0.0;
         if (def.number == &Config::rainReflections)
             return cfg.wetness <= 0.0 && cfg.puddles <= 0.0;
-        if (def.number == &Config::thunder)
+        if (def.number == &Config::lightningSound)
             return cfg.lightning <= 0.0;
         if (def.number == &Config::snowWind)
             return cfg.snowfall <= 0.0;

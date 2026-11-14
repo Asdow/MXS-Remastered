@@ -392,8 +392,9 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Weather",   L"Wetness",              c.wetness },
         { L"Weather",   L"Puddles",              c.puddles },
         { L"Weather",   L"Reflections",          c.rainReflections },
+        { L"Weather",   L"RainSound",            c.rainSound },
         { L"Weather",   L"Lightning",            c.lightning },
-        { L"Weather",   L"Thunder",              c.thunder },
+        { L"Weather",   L"LightningSound",       c.lightningSound },
         { L"Weather",   L"Snow",                 c.weather == kWeatherSnow ? 1.0 : 0.0 },  // (for older versions)
         { L"Weather",   L"Snowfall",             c.snowfall },
         { L"Weather",   L"Wind",                 c.snowWind },
@@ -594,8 +595,9 @@ void CopyTunables(const Config& from, Config& to)
     to.wetness              = from.wetness;
     to.puddles              = from.puddles;
     to.rainReflections      = from.rainReflections;
+    to.rainSound            = from.rainSound;
     to.lightning            = from.lightning;
-    to.thunder              = from.thunder;
+    to.lightningSound       = from.lightningSound;
     to.snowfall             = from.snowfall;
     to.snowWind             = from.snowWind;
     to.tireDirt             = from.tireDirt;
@@ -881,8 +883,9 @@ Config ParseConfig(const Config& base)
     c.wetness          = Clamp(ReadDouble(L"Weather", L"Wetness", c.wetness), 0.0, 1.0);
     c.puddles          = Clamp(ReadDouble(L"Weather", L"Puddles", c.puddles), 0.0, 1.0);
     c.rainReflections  = Clamp(ReadDouble(L"Weather", L"Reflections", c.rainReflections), 0.0, 1.0);
+    c.rainSound        = Clamp(ReadDouble(L"Weather", L"RainSound", c.rainSound), 0.0, 1.0);
     c.lightning        = Clamp(ReadDouble(L"Weather", L"Lightning", c.lightning), 0.0, 1.0);
-    c.thunder          = Clamp(ReadDouble(L"Weather", L"Thunder", c.thunder), 0.0, 1.0);
+    c.lightningSound   = Clamp(ReadDouble(L"Weather", L"LightningSound", c.lightningSound), 0.0, 1.0);
     c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
     c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);

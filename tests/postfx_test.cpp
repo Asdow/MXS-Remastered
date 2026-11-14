@@ -309,7 +309,7 @@ int main(int argc, char** argv)
         settings = base + "[Weather]\nRain=1\nRainfall=1\nRainWind=0.3\nWetness=0.8\nPuddles=" +
                    std::string(getenv("MXCAM_TEST_PUDDLES") ? getenv("MXCAM_TEST_PUDDLES") : "0.8") + "\nReflections=1\n";
     else if (mode == "lightning")
-        settings = base + "[Weather]\nRain=1\nRainfall=0.6\nWetness=0.8\nPuddles=0.5\nLightning=1\nThunder=0\n";
+        settings = base + "[Weather]\nRain=1\nRainfall=0.6\nWetness=0.8\nPuddles=0.5\nLightning=1\nLightningSound=0\n";
     else if (mode == "snowperf0")  // timing: the same scene without the weather
         settings = base;
     else if (mode == "shadows")  // screen-space shadows alone

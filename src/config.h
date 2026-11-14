@@ -149,9 +149,11 @@ struct Config {
                                           // the deepest ruts
     double rainReflections  = 0.8;        // 0..1 how strongly the puddles and wet surfaces reflect (the sky,
                                           // and what's on screen: bikes, trees, the track's banners)
+    double rainSound        = 0.6;        // 0..1 how loud the rain sounds (0: silent; thunder.h), with how
+                                          // hard it rains
     double lightning        = 0.0;        // 0..1 how often lightning strikes in the rain (0: never): a bolt in
                                           // the sky, the clouds and the ground lit by its flash (postfx)
-    double thunder          = 0.7;        // 0..1 how loud its thunder is (0: silent; thunder.h), heard as late
+    double lightningSound   = 0.7;        // 0..1 how loud a strike sounds (0: silent; thunder.h), heard as late
                                           // as the strike was far
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
     double snowWind         = 0.2;        // 0..1 how hard the wind blows the falling snow
