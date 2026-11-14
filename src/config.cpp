@@ -379,6 +379,9 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Graphics",  L"HeadlightColor",       static_cast<double>(c.headlightColor) },
         { L"Graphics",  L"UltraGraphics",        c.ultraGraphics ? 1.0 : 0.0 },
         { L"Graphics",  L"TireDirt",             c.tireDirt },
+        { L"Graphics",  L"Roost",                c.roost },
+        { L"Graphics",  L"RoostDust",            c.roostDust },
+        { L"Graphics",  L"RoostEveryBike",       c.roostEveryBike ? 1.0 : 0.0 },
         { L"Graphics",  L"MotionBlur",           c.motionBlur },
         { L"Graphics",  L"DepthOfField",         c.depthOfField },
         { L"Graphics",  L"DofFocus",             c.dofFocus },
@@ -389,6 +392,8 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Weather",   L"Wetness",              c.wetness },
         { L"Weather",   L"Puddles",              c.puddles },
         { L"Weather",   L"Reflections",          c.rainReflections },
+        { L"Weather",   L"Lightning",            c.lightning },
+        { L"Weather",   L"Thunder",              c.thunder },
         { L"Weather",   L"Snow",                 c.weather == kWeatherSnow ? 1.0 : 0.0 },  // (for older versions)
         { L"Weather",   L"Snowfall",             c.snowfall },
         { L"Weather",   L"Wind",                 c.snowWind },
@@ -589,9 +594,14 @@ void CopyTunables(const Config& from, Config& to)
     to.wetness              = from.wetness;
     to.puddles              = from.puddles;
     to.rainReflections      = from.rainReflections;
+    to.lightning            = from.lightning;
+    to.thunder              = from.thunder;
     to.snowfall             = from.snowfall;
     to.snowWind             = from.snowWind;
     to.tireDirt             = from.tireDirt;
+    to.roost                = from.roost;
+    to.roostDust            = from.roostDust;
+    to.roostEveryBike       = from.roostEveryBike;
     to.motionBlur           = from.motionBlur;
     to.depthOfField         = from.depthOfField;
     to.dofFocus             = from.dofFocus;
@@ -871,9 +881,14 @@ Config ParseConfig(const Config& base)
     c.wetness          = Clamp(ReadDouble(L"Weather", L"Wetness", c.wetness), 0.0, 1.0);
     c.puddles          = Clamp(ReadDouble(L"Weather", L"Puddles", c.puddles), 0.0, 1.0);
     c.rainReflections  = Clamp(ReadDouble(L"Weather", L"Reflections", c.rainReflections), 0.0, 1.0);
+    c.lightning        = Clamp(ReadDouble(L"Weather", L"Lightning", c.lightning), 0.0, 1.0);
+    c.thunder          = Clamp(ReadDouble(L"Weather", L"Thunder", c.thunder), 0.0, 1.0);
     c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
     c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
+    c.roost            = Clamp(ReadDouble(L"Graphics", L"Roost", c.roost), 0.0, 1.0);
+    c.roostDust        = Clamp(ReadDouble(L"Graphics", L"RoostDust", c.roostDust), 0.0, 1.0);
+    c.roostEveryBike   = ReadInt(L"Graphics", L"RoostEveryBike", c.roostEveryBike) != 0;
     c.motionBlur       = ReadDouble(L"Graphics", L"MotionBlur", c.motionBlur);
     c.depthOfField     = ReadDouble(L"Graphics", L"DepthOfField", c.depthOfField);
     c.dofFocus         = ReadDouble(L"Graphics", L"DofFocus", c.dofFocus);

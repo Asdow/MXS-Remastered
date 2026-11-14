@@ -125,6 +125,7 @@ The mod also includes a free shader pack, built the same way as the camera: pure
 - **Ambient occlusion**: soft contact shadows in ruts, corners and under the bikes.
 - **Dirt detail**: fine, high-resolution grain, pebbles and clods on the track surface up close, only on the ground.
 - **Tire marks** and **tire dirt**: your tires dig ruts into the track behind you, and your tires get caked with mud.
+- **Roost**: your rear tire throws dirt. Dark clods fly back in arcs, and a sheet of fine dust hangs in the air behind you, spreads out and settles. It's strongest when you're on the gas and when you slide through a turn, and it's thrown toward the outside of the turn. The dust takes the colour of the track around you, including the sun and shade on it. In the rain it's mostly mud and in the snow it's white. **Roost dust** sets how much dust there is: at None you only get the clods. **Roost on every bike** (on by default) gives every bike around you in a lobby or a replay its own roost, found by its wheels, out to about 120 m.
 - **Sun rays**, **bloom**, **depth of field** (auto-focus), **motion blur** (your own bike stays sharp).
 - **Anti-aliasing** (FXAA), **sharpening**, **anisotropic and trilinear texture filtering**.
 - **Brightness**, **contrast**, **saturation**, **vignette**.
@@ -146,6 +147,8 @@ On the **WEATHER** tab (it needs the shaders on), pick one weather with the **We
 - **Wetness**: how wet everything looks. It controls how dark the soaked dirt gets, the sheen on the ground toward the distance, and the shine and water beads on bikes, riders and gear.
 - **Puddles**: how much standing water there is: puddles on the flat parts of the track, and water in the deepest ruts.
 - **Reflections**: how strongly the puddles and the wet ground reflect the sky and whatever stands near them (bikes, riders, trees, banners). Puddles are darker seen from straight above and turn into mirrors toward the distance, like real water.
+- **Lightning**: turns the rain into a thunderstorm and sets how often lightning strikes (Off by default). Strikes come anywhere from half a kilometre to 6 km away, most often somewhere ahead of you. A branching bolt comes down out of the clouds and flickers as it strikes again two to five times. Its flash lights up the clouds around it, the track, the puddles and the falling rain. Some flashes stay inside the clouds. The bolt only shows against the sky, so hills and trees hide it.
+- **Thunder**: how loud the thunder is. It arrives as late as the strike was far away, about 3 seconds per kilometre. A close strike starts with a ripping crack and a boom, then rolls; a far one is only a long, low rumble. It plays alongside the game's own sound and goes quiet while the game is in the background.
 
 **SNOW**: the track turns white, with less snow on steep slopes and drifts across the ground, under a grey, overcast sky with soft light. Your ruts dig through it: pressed snow where a tire just rolled, grey slush deeper down and wet dirt at the bottom, with a lip of pushed-up snow along the edges. The tires get packed with snow too, even with Tire dirt off. The rest of the bike and the riders stay clean.
 

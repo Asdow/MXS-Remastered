@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
@@ -24,7 +25,8 @@ namespace lobby {
 namespace {
 
 constexpr int    kMaxCopies     = 96;     // a mesh drawn more often than this a frame is scenery
-constexpr double kMatchRange    = 4.0;    // game units a copy moves between frames, at most (~1.2 m)
+constexpr double kMatchRange    = 10.0;   // game units a copy moves between frames, at most (~3 m: another rider's
+                                          // place comes in network steps, a jump now and then)
 constexpr double kSpinMin       = 0.03;   // rad a frame below which a copy isn't turning
 constexpr double kSpinMax       = 1.5;    // ...and above which it's no wheel's roll (or a mismatch)
 constexpr double kStatsSeconds  = 10.0;   // the turning statistics forget over this long
@@ -41,6 +43,10 @@ constexpr double kMinTireUnits  = 0.2 * 3.2808;  // a tire's radius at least (20
 // ridden by a lobby came out in streaks. A copy whose centre lies within a larger wheel copy's tire
 // is part of that wheel, and is left to it.
 constexpr int    kLogLinesMax   = 24;
+// (LogLearning: what the wheels were learnt from, for the log.)
+int    g_diagFrames = 0, g_diagViewFrames = 0, g_diagRigid = 0, g_diagBoned = 0, g_diagStreamed = 0, g_diagLines = 0;
+int    g_diagReports = 0;  // (lines logged: postfx adds what it made of the wheels, see LearningReports)
+constexpr int kDiagEvery = 300, kDiagLinesMax = 36;
 // In the air, from how the contact moves (not from the ground): its height over the last
 // kAirWindow fitted with a parabola; falling faster than kAirFall of the game's gravity for
 // kAirOnFrames frames on end is a flight, slower than kAirLand for kAirOffFrames frames a landing.
@@ -142,7 +148,7 @@ bool Enabled()
     const Config& cfg = GetConfig();
     // (Tire dirt watches them whatever else is on: the mud goes only on meshes seen turning like a
     // wheel - see PaintTireDirt.)
-    return cfg.tireMarks > 0.0 || TireCoat(cfg) > 0.0 ||
+    return cfg.tireMarks > 0.0 || TireCoat(cfg) > 0.0 || (cfg.roost > 0.0 && cfg.roostEveryBike) ||
            (cfg.headlightEveryBike && cfg.headlight > 0.0 && cfg.timeOfDay >= 0.0);
 }
 
@@ -255,6 +261,7 @@ bool NoteRigidDraw(unsigned program, unsigned vao, unsigned elementBuffer, const
 {
     if (!Enabled())
         return false;
+    ++g_diagRigid;
     Mesh& m = g_meshes[KeyOf(program, vao, elementBuffer, draw)];
     if (m.raws.size() >= 16 * kMaxCopies)
         return false;
@@ -341,8 +348,65 @@ void GiveBounds(unsigned program, unsigned vao, unsigned elementBuffer, const Dr
             "its copies leave tire marks", m.program, m.count, m.axle[0], m.axle[1], m.axle[2], m.radius);
 }
 
+// What the wheels were learnt from, for the log (LogLearning): every few seconds for a session's first
+// minutes, so a lobby where no other bike's wheels are found says why.
+
+int LearningReports() { return g_diagReports; }
+
+void NoteNotRigid(int why)
+{
+    if (why == 1)
+        ++g_diagBoned;
+    else
+        ++g_diagStreamed;
+}
+
+void LogLearning()
+{
+    if (++g_diagFrames < kDiagEvery || g_diagLines >= kDiagLinesMax)
+        return;
+    struct Top { const Mesh* m; size_t copies; };
+    Top top[3] = {};
+    int wheels = 0, measured = 0;
+    for (const auto& kv : g_meshes) {
+        const Mesh& m = kv.second;
+        if (m.wheel)
+            ++wheels;
+        if (m.wheel && m.shape == 2)
+            ++measured;
+        const size_t copies = m.now.size();
+        for (int t = 0; t < 3; ++t)  // (the most turning: the wheels it's learning)
+            if (!top[t].m || m.turning > top[t].m->turning || (m.turning == top[t].m->turning && copies > top[t].copies)) {
+                for (int s = 2; s > t; --s)
+                    top[s] = top[s - 1];
+                top[t] = Top{ &m, copies };
+                break;
+            }
+    }
+    char best[384] = "";
+    int used = 0;
+    for (int t = 0; t < 3 && top[t].m; ++t) {
+        const Mesh& m = *top[t].m;
+        const double n = std::sqrt(m.axis[0] * m.axis[0] + m.axis[1] * m.axis[1] + m.axis[2] * m.axis[2]);
+        used += snprintf(best + used, sizeof best - used, "%s[prog %u, %d idx: %d copies, turning %.0f of %.0f, axis %.2f%s]",
+                         t ? " " : "", m.program, m.count, static_cast<int>(top[t].copies), m.turning, m.matched,
+                         m.turning > 0 ? n / m.turning : 0.0, m.wheel ? ", WHEEL" : "");
+    }
+    Log("lobby wheels: over %d frames: a frame's 3D draws noted %.1f rigid, %.1f with bones, %.1f streamed (not learnt "
+        "from); %d meshes watched, %d wheels (%d measured); turning most: %s",
+        g_diagFrames, double(g_diagRigid) / g_diagFrames, double(g_diagBoned) / g_diagFrames,
+        double(g_diagStreamed) / g_diagFrames, static_cast<int>(g_meshes.size()), wheels, measured, best);
+    ++g_diagReports;
+    ++g_diagLines;
+    g_diagFrames = g_diagViewFrames = g_diagRigid = g_diagBoned = g_diagStreamed = 0;
+}
+
 void FrameEnd(const double* rawView, double now)
 {
+    if (Enabled() && rawView) {  // (only frames with a 3D scene: the game's menus have none)
+        ++g_diagViewFrames;
+        LogLearning();
+    }
     if (!Enabled()) {
         if (!g_meshes.empty()) {
             g_meshes.clear();
@@ -436,9 +500,23 @@ void FrameEnd(const double* rawView, double now)
             }
             if (m.wheel)
                 continue;  // (its statistics have done their job)
-            m.matched += 1;
+            // Only frames it changed in count: another rider's bike is drawn where the last network update
+            // put it, the same for frames on end (counted, those frames had its wheels "not turning", and
+            // they never were found), and a turn too big to read between two updates says nothing either way.
+            // (And it's its turn that tells: a frame it only moved - the game slides another rider's bike
+            // along between its updates, turning its wheels only when one comes - says nothing either.)
+            bool changed = false;
+            for (int k = 0; k < 11 && !changed; ++k)
+                if (k != 3 && k != 7)
+                    changed = std::fabs(c.m[k] - best->m[k]) > 1e-6 * (1.0 + std::fabs(best->m[k]));
+            if (!changed)
+                continue;
             double angle, axis[3];
-            if (!TurnBetween(best->m, c.m, angle, axis) || angle < kSpinMin || angle > kSpinMax)
+            const bool turned = TurnBetween(best->m, c.m, angle, axis);
+            if (turned && angle > kSpinMax)
+                continue;
+            m.matched += 1;
+            if (!turned || angle < kSpinMin)
                 continue;
             m.turning += 1;
             for (int k = 0; k < 3; ++k)

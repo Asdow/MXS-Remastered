@@ -40,6 +40,10 @@ bool SeenTurning(unsigned program, unsigned vao, unsigned elementBuffer, const D
 
 // The frame is done: rawView is the game's view for it (null if none was found).
 void FrameEnd(const double* rawView, double now);
+// (For the log: a 3D draw the wheels can't be learnt from - 1: drawn with bones, 2: its geometry streamed.)
+void NoteNotRigid(int why);
+// How many of those lines have been logged (postfx adds its own line after each).
+int LearningReports();
 
 // A wheel's path over the ground between two frames (world, game units), for the tire marks.
 struct Segment {

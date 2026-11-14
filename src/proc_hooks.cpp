@@ -56,6 +56,7 @@
 #include "camera.h"
 #include "config.h"
 #include "brake.h"
+#include "thunder.h"
 #include "dab.h"
 #include "gamepad.h"
 #include "hooks.h"
@@ -2209,8 +2210,26 @@ void NoteBufferContents(GLenum target)
         ++g_bufferGeneration[buffer];
 }
 
+// (F10 dump: an array buffer's upload, with its first values - a streamed one each frame is
+// particles, text or the like, and its first values show its layout.)
+void DumpBufferUpload(const char* call, GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data, GLenum usage)
+{
+    if (!IsDumping() || target != kArrayBufferTarget)
+        return;
+    char values[256] = "";
+    if (data && size >= 4) {
+        const float* f = static_cast<const float*>(data);
+        const int n = static_cast<int>(std::min<ptrdiff_t>(size / 4, 12));
+        int used = 0;
+        for (int k = 0; k < n && used < static_cast<int>(sizeof values) - 16; ++k)
+            used += snprintf(values + used, sizeof values - used, "%s%.3f", k ? " " : "", f[k]);
+    }
+    DumpCall("%s buffer=%u offset=%td size=%td usage=0x%X [%s]", call, g_arrayBuffer, offset, size, usage, values);
+}
+
 void APIENTRY Wrap_glBufferData(GLenum target, ptrdiff_t size, const void* data, GLenum usage)
 {
+    DumpBufferUpload("glBufferData", target, 0, size, data, usage);
     NoteBufferUpdate(target);
     NoteBufferContents(target);
     real_glBufferData(target, size, data, usage);
@@ -2235,6 +2254,7 @@ void APIENTRY Wrap_glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat 
 
 void APIENTRY Wrap_glBufferSubData(GLenum target, ptrdiff_t offset, ptrdiff_t size, const void* data)
 {
+    DumpBufferUpload("glBufferSubData", target, offset, size, data, 0);
     NoteBufferUpdate(target);
     NoteBufferContents(target);
     real_glBufferSubData(target, offset, size, data);
@@ -2243,6 +2263,9 @@ void APIENTRY Wrap_glBufferSubData(GLenum target, ptrdiff_t offset, ptrdiff_t si
 void APIENTRY Wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride,
                                          const void* pointer)
 {
+    if (IsDumping())
+        DumpCall("glVertexAttribPointer index=%u size=%d type=0x%X normalized=%d stride=%d offset=%p buffer=%u vertexArray=%u",
+                 index, size, type, normalized, stride, pointer, g_arrayBuffer, g_vao);
     if (g_vao) {
         std::vector<GLuint>& buffers = g_vaoArrayBuffers[g_vao];
         if (std::find(buffers.begin(), buffers.end(), g_arrayBuffer) == buffers.end())
@@ -4298,6 +4321,15 @@ bool NoteDraw(const DrawCall& draw)
         }
         if (LeaveOutGameOverlay(draw))
             return false;
+        if (IsDumping()) {
+            const auto mv = g_programModelview.find(g_program);
+            const bool fresh = mv != g_programModelview.end() && mv->second.frame == g_frameNumber;
+            DumpCall("%s prog=%u mode=0x%X count=%d first=%d vertexArray=%u tex0=%u at=%.2f,%.2f,%.2f%s%s",
+                     draw.kind == DrawCall::Elements ? "glDrawElements" : draw.kind == DrawCall::Arrays ? "glDrawArrays" : "glDrawRangeElements",
+                     g_program, draw.mode, draw.count, draw.first, g_vao, g_boundTextures[0],
+                     fresh ? mv->second.uploaded[12] : 0.0f, fresh ? mv->second.uploaded[13] : 0.0f, fresh ? mv->second.uploaded[14] : 0.0f,
+                     g_blending ? " blend" : "", g_depthWrites ? "" : "  SEE-THROUGH");
+        }
         // (For the trace: a 3D object after the effects were applied this frame gets no shadow.)
         if (postfx::SceneApplied()) {
             const auto mv = g_programModelview.find(g_program);
@@ -4309,8 +4341,13 @@ bool NoteDraw(const DrawCall& draw)
         // Every bike's wheels (lobby_wheels.h): this rigid 3D draw, by its mesh and where it is.
         {
             const auto mv = g_programModelview.find(g_program);
-            if (mv != g_programModelview.end() && mv->second.frame == g_frameNumber && mv->second.kind == ModelviewKind::Scene &&
-                !mv->second.transposed && HasTranslation(mv->second.raw) && StaticDraw(draw)) {
+            const bool scene = mv != g_programModelview.end() && mv->second.frame == g_frameNumber &&
+                               mv->second.kind == ModelviewKind::Scene && !mv->second.transposed && HasTranslation(mv->second.raw);
+            if (scene && !StaticDraw(draw)) {
+                const SkinnedProgram* skin = FindSkinned(g_program);
+                lobby::NoteNotRigid(skin && skin->positionLoc >= 0 && skin->bones != 0 ? 1 : 2);
+            }
+            if (scene && StaticDraw(draw)) {
                 const auto element = g_elementBuffers.find(g_vao);
                 const GLuint elements = element != g_elementBuffers.end() ? element->second : 0;
                 if (lobby::NoteRigidDraw(g_program, g_vao, elements, draw, mv->second.raw)) {
@@ -4418,6 +4455,11 @@ bool EndShaderFrame()
         double speed = 0;
         const bool haveSpeed = postfx::RiderSpeed(speed);
         brake::Update(haveSpeed, speed);
+    }
+    // The rain's thunder (thunder.h): its sound output on while the lightning is.
+    {
+        const Config& c = GetConfig();
+        thunder::Update(c.shaders && c.weather == kWeatherRain && c.lightning > 0.0, c.thunder);
     }
 
     // No camera this frame (menu, effect off): don't carry a stale correction into the

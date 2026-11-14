@@ -244,6 +244,10 @@ uniform float u_rainfall;       // 0..1 how hard it rains (the rings in the pudd
 uniform float u_wet;            // 0..1 how wet the ground is (Config::wetness)
 uniform float u_puddles;        // 0..1 how much standing water
 uniform float u_reflect;        // 0..1 how strongly the water and the wet ground reflect
+uniform float u_flash;          // WEATHER: how bright the lightning's flash is now (0: none; 1 a close strike's)
+uniform vec3  u_flashDir;       // world: toward the cloud it lit (above the strike)
+uniform float u_flashSpread;    // how tightly the lit cloud gathers round it (more: a far strike's, smaller)
+uniform vec3  u_flashColour;    // its light (a cold white)
 
 // 1 = lit, 0 = in the shadow of something the sun's view saw first. 3 x 3 hardware-filtered
 // taps for soft edges; fades out at the edge of the map.
@@ -884,6 +888,17 @@ vec3 SkyLook(vec3 game, vec3 d)
         c = mix(c, overcast, (0.85 + 0.1 * u_rain) * u_overcast);
         c = mix(c, u_weatherFog, 0.35 * u_weatherHaze * u_overcast * (1.0 - smoothstep(0.0, 0.35, dot(d, u_up))));
     }
+    if (u_flash > 0.0) {
+        // Lightning: the clouds lit from inside - brightest round the strike, patchy as clouds are
+        // (thicker parts brighter), and the whole deck a little.
+        float h = dot(d, u_up);
+        vec3 onCloud = d / max(h, 0.08);  // where d meets the cloud deck, a deck's height up
+        float patchy = ValueNoise(onCloud * 0.9 + 3.1) * 0.65 + ValueNoise(onCloud * 2.6 + 7.7) * 0.35;
+        float atStrike = exp(u_flashSpread * (dot(d, u_flashDir) - 1.0));
+        float thick = clamp(Luma(c) / max(Luma(u_weatherFog), 1e-3), 0.5, 1.8);
+        c += u_flashColour * (u_flash * thick * smoothstep(-0.08, 0.1, h) *
+                              (0.25 + 1.7 * atStrike * (0.3 + 0.95 * patchy)));
+    }
     return c;
 }
 
@@ -1214,10 +1229,19 @@ void main()
             c = mix(c, vec3(Luma(c)) * vec3(0.96, 0.99, 1.04), 0.25 * u_overcast);
             c *= 1.0 - 0.15 * u_rain;
             if (u_depthOk > 0.5)
-                c = mix(c, u_weatherFog, (1.0 - exp(-z / (90.0 * u_metre))) * 0.7 * u_weatherHaze * u_overcast);
+                c = mix(c, u_weatherFog + u_flashColour * (0.3 * u_flash),
+                        (1.0 - exp(-z / (90.0 * u_metre))) * 0.7 * u_weatherHaze * u_overcast);
         }
         if (u_headlight > 0.0)
             c += Headlight(albedo, p, nView);
+        if (u_flash > 0.0) {
+            // Lightning: the whole sky lights everything for a moment - from above, more toward the
+            // strike. (Fading with the haze: the distance is lit as the haze is, above.)
+            vec3 nW = u_viewToWorld * nView;
+            float lit = 0.5 + 0.4 * dot(nW, u_up) + 0.35 * max(dot(nW, u_flashDir), 0.0);
+            float clear = u_depthOk > 0.5 ? exp(-z / (90.0 * u_metre) * u_weatherHaze) : 1.0;
+            c += albedo * u_flashColour * (1.5 * u_flash * lit * clear);
+        }
     }
     o_color = vec4(c, 1.0);
 }
@@ -1521,6 +1545,170 @@ void main()
         a *= clamp((sceneZ - v_z + 0.12 * u_metre) / (0.06 * u_metre + 0.01 * v_z), 0.0, 1.0);
     }
     o_color = vec4(v_light * a, a);  // premultiplied
+}
+)GLSL";
+
+// ---- Roost: the dirt your rear tire throws (postfx.cpp: Roost*) ---------------------------------
+// The dirt's colour, learnt from the picture: the ground right behind your rear wheel where the roost
+// comes from, your front wheel's, and a few places on the ground ahead of you (in first person the
+// wheels are out of view), each only where the picture shows bare ground there (the terrain's own
+// depth: not your bike, not a rider). Blended into what it held (a 1 x 1 target), so it follows the
+// track, the sun and the shade, the time of day and the weather (the snow's white) without flicker.
+constexpr const char* kRoostProbeVertex = R"GLSL(
+void main()
+{
+    gl_Position = vec4(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0, 0.0, 1.0);
+}
+)GLSL";
+
+constexpr const char* kRoostProbeFragment = R"GLSL(
+uniform sampler2D u_scene;          // the composite's picture (linear)
+uniform sampler2D u_depth, u_terrainDepth;
+uniform float u_haveTerrain;
+uniform mat4  u_invProj;
+uniform vec2  u_texel;
+uniform vec2  u_probe[6];           // screen places to look (outside the screen: none)
+uniform float u_rate;               // how much of this frame's colour goes in
+out vec4 o_color;
+
+float LinZ(float d)
+{
+    float n = min(d, 0.9999999) * 2.0 - 1.0;
+    return -(u_invProj[2][2] * n + u_invProj[3][2]) / (u_invProj[2][3] * n + u_invProj[3][3]);
+}
+
+void main()
+{
+    vec3 sum = vec3(0.0);
+    float count = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        vec2 uv = u_probe[i];
+        if (uv.x < 0.02 || uv.y < 0.02 || uv.x > 0.98 || uv.y > 0.98)
+            continue;
+        float d = textureLod(u_depth, uv, 0.0).r;
+        if (d >= 0.999999)
+            continue;
+        float z = LinZ(d);
+        if (u_haveTerrain > 0.5 && abs(LinZ(textureLod(u_terrainDepth, uv, 0.0).r) - z) > 0.004 * z + 0.02)
+            continue;  // not bare ground there
+        for (int k = 0; k < 5; ++k) {
+            vec2 o = (k == 1 ? vec2(6.0, 0.0) : k == 2 ? vec2(-6.0, 0.0) : k == 3 ? vec2(0.0, 6.0) : k == 4 ? vec2(0.0, -6.0) : vec2(0.0)) * u_texel;
+            sum += textureLod(u_scene, uv + o, 0.0).rgb;
+            count += 1.0;
+        }
+    }
+    if (count < 0.5)
+        discard;
+    o_color = vec4(sum / count, u_rate);
+}
+)GLSL";
+
+// The roost itself: each bit of it a quad facing the camera (6 vertices, its own values in each).
+// Dust: a soft, billowing puff, turned at its own angle, that grows as it drifts. A clod: a small
+// dark lump, drawn streaked along the way it moves across the picture in an exposure (so a fast one
+// reads as flying, not as a dotted line), at least about a pixel across, fainter rather than smaller.
+constexpr const char* kRoostVertex = R"GLSL(
+in vec4 a_pos;              // from the camera (world directions), and its radius: game units
+in vec4 a_data;             // how opaque, which (0 dust, 1 a clod), its own random number, its age (0..1)
+in vec3 a_move;             // how far it moves across the picture in an exposure (world)
+uniform mat3  u_viewRot;    // world -> view (rotation)
+uniform mat4  u_proj;
+uniform float u_pixel;      // game units per pixel at one unit away
+uniform float u_metre;
+out vec2  v_uv;
+out float v_alpha;
+out float v_kind;
+out float v_seed;
+out float v_z;
+out float v_size;
+
+void main()
+{
+    int corner = gl_VertexID - (gl_VertexID / 6) * 6;
+    vec2 c = vec2((corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0,
+                  (corner == 2 || corner == 4 || corner == 5) ? 1.0 : -1.0);
+    vec3 v = u_viewRot * a_pos.xyz;
+    float z = max(-v.z, 1e-3);
+    float r = a_pos.w;
+    float shown = max(r, 0.7 * u_pixel * z);
+    float a = a_data.x * (r / shown) * (r / shown);
+    if (a_data.y > 0.5) {
+        vec2 m = (u_viewRot * a_move).xy;
+        float ml = length(m);
+        vec2 along = ml > 1e-5 ? m / ml : vec2(0.0, 1.0);
+        vec2 side = vec2(-along.y, along.x);
+        float halfLength = shown + 0.5 * ml;
+        v.xy += side * (c.x * shown) + along * (c.y * halfLength);
+        a *= shown / halfLength;  // streaked: spread thinner
+    } else {
+        float turn = a_data.z * 6.2831853;
+        v.xy += mat2(cos(turn), sin(turn), -sin(turn), cos(turn)) * (c * shown);
+    }
+    a *= smoothstep(0.3 * u_metre, 1.0 * u_metre, z);  // not right in front of the lens
+    v_uv = c;
+    v_alpha = a;
+    v_kind = a_data.y;
+    v_seed = a_data.z;
+    v_z = -v.z;
+    v_size = shown;
+    gl_Position = u_proj * vec4(v, 1.0);
+}
+)GLSL";
+
+constexpr const char* kRoostFragment = R"GLSL(
+uniform sampler2D u_depth;  // the scene's
+uniform sampler2D u_dirt;   // the dirt's colour (1 x 1, kRoostProbeFragment)
+uniform mat4  u_invProj;
+uniform vec2  u_texel;
+uniform float u_metre;
+uniform vec3  u_clodShade;  // a clod's colour against the dirt's (darker; mud in the rain, snow in the snow)
+uniform float u_dustBright; // the dust's against the dirt's
+in vec2  v_uv;
+in float v_alpha;
+in float v_kind;
+in float v_seed;
+in float v_z;
+in float v_size;
+out vec4 o_color;
+
+float Hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float Noise(vec2 p)
+{
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(Hash(i), Hash(i + vec2(1.0, 0.0)), f.x), mix(Hash(i + vec2(0.0, 1.0)), Hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+
+void main()
+{
+    float d2 = dot(v_uv, v_uv);
+    if (d2 > 1.0 || v_alpha < 0.002)
+        discard;
+    vec3 dirt = textureLod(u_dirt, vec2(0.5), 0.0).rgb;
+    float a;
+    vec3 col;
+    if (v_kind < 0.5) {
+        // Dust: soft-edged, billowing (thicker and lighter in places, thin and wispy at its edges).
+        vec2 q = v_uv * 1.7 + v_seed * 37.0;
+        float billow = Noise(q) * 0.6 + Noise(q * 2.4 + 5.0) * 0.4;
+        a = smoothstep(1.0, 0.1, sqrt(d2)) * (0.3 + 0.9 * billow);
+        // (Lighter and paler than the ground it came off: fine dust in the air scatters the light.)
+        col = mix(dirt, vec3(dot(dirt, vec3(0.2126, 0.7152, 0.0722))), 0.2) * u_dustBright * mix(0.85, 1.15, billow);
+    } else {
+        // A clod: a lump with a ragged edge.
+        float r = sqrt(d2) * (0.8 + 0.35 * Noise(v_uv * 2.0 + v_seed * 53.0));
+        a = smoothstep(1.0, 0.75, r);
+        col = dirt * u_clodShade;
+    }
+    a = clamp(a, 0.0, 1.0) * v_alpha;
+    // Softly into what's nearer: dust settling on the ground fades into it rather than cutting off.
+    float d = texture(u_depth, gl_FragCoord.xy * u_texel).r;
+    if (d < 0.999999) {
+        float n = d * 2.0 - 1.0;
+        float sceneZ = -(u_invProj[2][2] * n + u_invProj[3][2]) / (u_invProj[2][3] * n + u_invProj[3][3]);
+        a *= clamp((sceneZ - v_z) / max(v_kind < 0.5 ? 0.6 * v_size : 0.04 * u_metre, 0.02 * u_metre), 0.0, 1.0);
+    }
+    o_color = vec4(col * a, a);  // premultiplied
 }
 )GLSL";
 
@@ -2125,6 +2313,75 @@ void main()
         c = clamp((c + (n + s + e + w) * wgt) / (1.0 + 4.0 * wgt), 0.0, 1.0);
     }
     o_color = vec4(c, 1.0);
+}
+)GLSL";
+
+// ---- Lightning (WEATHER): the bolt, drawn into the HDR image after the composite ----------------
+// Each piece of the channel (the main one and its branches) is a quad between two points of it, as
+// directions from the camera (it's kilometres away: drawn at infinity), a few pixels wide on screen:
+// a white-hot core and a blue-white glow round it. Only where the sky shows (behind the hills and the
+// trees it's hidden); its pieces meet by the brighter of the two (GL_MAX), never doubling at a joint.
+constexpr const char* kBoltVertex = R"GLSL(
+in vec4 a_from;            // world direction to one end, and its core's half width (pixels)
+in vec4 a_to;              // world direction to the other end, and how bright it is
+uniform mat3 u_viewRot;    // world -> view (rotation)
+uniform mat4 u_proj;
+uniform vec2 u_screen;     // pixels
+out vec2  v_at;            // pixels: across it from its middle, and along it from its start
+out float v_length;        // its length, pixels
+out float v_core;          // its core's half width, pixels
+out float v_bright;
+
+void main()
+{
+    int corner = gl_VertexID - (gl_VertexID / 6) * 6;
+    vec2 c = vec2((corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0,
+                  (corner == 2 || corner == 4 || corner == 5) ? 1.0 : -1.0);
+    vec4 a = u_proj * vec4(u_viewRot * a_from.xyz, 0.0);
+    vec4 b = u_proj * vec4(u_viewRot * a_to.xyz, 0.0);
+    v_core = a_from.w;
+    v_bright = a_to.w;
+    if (a.w < 1e-3 || b.w < 1e-3) {  // (behind you)
+        v_at = vec2(0.0);
+        v_length = 0.0;
+        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+        return;
+    }
+    vec2 sa = a.xy / a.w * 0.5 * u_screen, sb = b.xy / b.w * 0.5 * u_screen;
+    vec2 d = sb - sa;
+    float l = length(d);
+    vec2 along = l > 1e-4 ? d / l : vec2(0.0, 1.0);
+    vec2 side = vec2(-along.y, along.x);
+    float halfWidth = 3.0 * v_core + 5.0;
+    vec2 s = (c.y < 0.0 ? sa : sb) + along * (c.y * halfWidth) + side * (c.x * halfWidth);
+    v_at = vec2(c.x * halfWidth, c.y < 0.0 ? -halfWidth : l + halfWidth);
+    v_length = l;
+    gl_Position = vec4(s / (0.5 * u_screen), 0.0, 1.0);
+}
+)GLSL";
+
+constexpr const char* kBoltFragment = R"GLSL(
+uniform sampler2D u_depth;
+uniform vec2  u_texel;
+uniform float u_skyDepth;
+uniform vec3  u_coreColour;   // the core: white, very bright (it blooms)
+uniform vec3  u_glowColour;   // round it: blue-white
+in vec2  v_at;
+in float v_core;
+in float v_length;
+in float v_bright;
+out vec4 o_color;
+
+void main()
+{
+    if (textureLod(u_depth, gl_FragCoord.xy * u_texel, 0.0).r < u_skyDepth || v_bright <= 0.0)
+        discard;
+    // How far from the piece (its ends rounded: where pieces meet at an angle they join cleanly).
+    float beyond = max(max(-v_at.y, v_at.y - v_length), 0.0);
+    float x = length(vec2(v_at.x, beyond));
+    float core = exp(-2.0 * (x / v_core) * (x / v_core));
+    float glow = exp(-x / (0.8 * v_core + 1.3));
+    o_color = vec4((u_coreColour * core + u_glowColour * glow) * v_bright, 0.0);
 }
 )GLSL";
 

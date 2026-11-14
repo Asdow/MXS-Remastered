@@ -46,6 +46,7 @@
 #include "postfx.h"
 #include "postfx_shaders.h"
 #include "replay.h"
+#include "thunder.h"
 #include "timeofday.h"
 
 namespace mxcam {
@@ -96,6 +97,7 @@ constexpr GLenum kBlendSrcAlpha             = 0x80CB;
 constexpr GLenum kBlendEquationRgb          = 0x8009;
 constexpr GLenum kBlendEquationAlpha        = 0x883D;
 constexpr GLenum kFuncAdd                   = 0x8006;
+constexpr GLenum kStreamDraw                = 0x88E0;
 constexpr GLenum kFuncMax                   = 0x8008;
 constexpr GLenum kFuncMin                   = 0x8007;
 constexpr GLenum kPixelPackBuffer         = 0x88EB;  // GL_PIXEL_PACK_BUFFER
@@ -508,6 +510,13 @@ struct Resources {
     bool    rainTried = false;
     Program splash;                                // where it lands (DrawSplashes)
     bool    splashTried = false;
+    Program roost, roostProbe;                     // the dirt your rear tire throws (Roost) and its colour
+    GLuint  roostVao = 0, roostVbo = 0, roostProbeVao = 0;
+    Target  roostDirt;                             // 1 x 1: the dirt's colour, learnt from the picture
+    bool    roostTried = false;
+    Program bolt;                                  // the lightning's bolt (DrawBolt)
+    GLuint  boltVao = 0, boltVbo = 0;
+    bool    boltTried = false;
 };
 Resources g_res;
 // The tire dirt's mask this frame (see BeginWheelMask).
@@ -3940,6 +3949,7 @@ void UpdateBikeFall()
 // What every bike's paths did this frame in the marks (for the trace: WheelTraceText).
 struct LobbyMarkStats {
     int    segments = 0, yours = 0, clear = 0, step = 0, outside = 0, pressed = 0;
+    bool   unchecked = false;           // this frame's paths weren't looked at: no ground to test them against
     double nearest[2] = { -1, -1 };  // m from each of your wheels' contacts to the nearest path's end (-1: none)
 };
 LobbyMarkStats g_lobbyStats;
@@ -4379,6 +4389,7 @@ bool UpdateMarks(double dt)
                     if (g_lobbyStats.nearest[i] < 0 || d < g_lobbyStats.nearest[i])
                         g_lobbyStats.nearest[i] = d;
                 }
+        g_lobbyStats.unchecked = cfg.marksEveryBike && !checkGround && !others.empty();
         if (cfg.marksEveryBike && checkGround) {
             g_gl.Uniform1f(stamp["u_fallback"], 2.0f);
             const double margin = 64.0;
@@ -4642,6 +4653,25 @@ struct OtherBike {
     bool   decided = false;     // which tire is the front is known
     int    against = 0;         // frames on end moving towards what's taken for its rear
     double seen = 0;
+    bool   fresh = false;       // found this frame (not just remembered)
+    Vec3   rear, frontAxle, rearAxle;  // its rear tire's centre, and both axles (this frame)
+    double rearRadius = 0;      // game units
+    Vec3   velocity, accel;     // its motion (game units / s, / s^2): for its roost
+    bool   haveVelocity = false;
+    // Where it was lately (its middle, and when): its motion is fitted over these. Another rider's
+    // place comes in steps (the network's): still for a few frames, then a jump. Frame to frame it
+    // read as standing still most of the time, and its jumps as too fast to be real.
+    static constexpr int kHistory = 24;
+    double historyTime[kHistory] = {};
+    Vec3   historyAt[kHistory];
+    int    historyCount = 0;
+    Vec3   accelFromVelocity;   // the velocity its acceleration is measured against, and when
+    double accelFromTime = -1;
+    double roostDust = 0, roostClod = 0;  // its roost's bits owed (fractions carried frame to frame)
+    // Its roost this frame, for the log: why none (0: thrown; 1 yours, 2 too far, 3 its motion not known
+    // yet, 4 standing with its front not known, 5 down on its side) and how it was moving.
+    int    roostWhy = -1;
+    double roostIntensity = 0, roostSpeed = 0, roostDrive = 0, roostUpAccel = 0, roostDistance = 0;
 };
 std::vector<OtherBike> g_otherBikes;
 std::unordered_map<unsigned long long, double> g_frontVotes;  // per wheel mesh: + seen at a moving bike's front, - its rear
@@ -4672,13 +4702,21 @@ struct ShownLight {
 };
 std::vector<ShownLight> g_shownLights;
 
-int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, int max, double now, double dt)
+// Every other bike found by its wheels this frame (lobby_wheels.h): its two tires paired a wheelbase
+// apart, which is the front, how it's moving - kept in g_otherBikes for the headlights on other bikes
+// and their roost. Once a frame, whichever asks first.
+double g_otherTrackedAt = -1e9;
+size_t g_otherWheelParts = 0, g_otherAxles = 0;
+int    g_otherBikesSeen = 0, g_otherBikesDecided = 0;
+
+void TrackOtherBikes(double now, double dt)
 {
+    if (now == g_otherTrackedAt)
+        return;
+    g_otherTrackedAt = now;
     static std::vector<lobby::WheelNow> wheels;
     lobby::CurrentWheels(g_frame.raw, wheels);
     const double u = g_unitsPerMetre;
-    const Vec3 worldUp = WorldUp();
-    const Vec3 camera = CameraPosition(g_frame.raw);
     // The tires, one per axle (a tire's meshes and its rim can each be a "wheel"): where the biggest
     // part is (the tire: a smaller part's centre is further off its axle, and comes and goes).
     struct Tire {
@@ -4742,10 +4780,6 @@ int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, 
         }
     std::sort(pairs.begin(), pairs.end(), [](const Pair& x, const Pair& y) { return x.score < y.score; });
 
-    // This frame's lights, before they're matched to the ones shown.
-    struct Found { Vec3 position, forward, up; };
-    static std::vector<Found> found;
-    found.clear();
     static std::vector<OtherBike> next;
     next.clear();
     std::vector<bool> taken(g_otherBikes.size(), false);
@@ -4776,6 +4810,66 @@ int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, 
             taken[match] = true;
             bike.decided = was.decided;
             bike.against = was.against;
+            bike.roostDust = was.roostDust;
+            bike.roostClod = was.roostClod;
+            // Its motion: a line fitted through where it was over the last third of a second (only the
+            // frames it had moved since, and every half second standing still), and its acceleration
+            // from how that changes over a sixth of one.
+            std::copy(was.historyTime, was.historyTime + OtherBike::kHistory, bike.historyTime);
+            std::copy(was.historyAt, was.historyAt + OtherBike::kHistory, bike.historyAt);
+            bike.historyCount = was.historyCount;
+            bike.velocity = was.velocity;
+            bike.accel = was.accel;
+            bike.haveVelocity = was.haveVelocity;
+            bike.accelFromVelocity = was.accelFromVelocity;
+            bike.accelFromTime = was.accelFromTime;
+            const int last = bike.historyCount - 1;
+            const bool moved = last < 0 || Length(mid - bike.historyAt[last]) > 0.002 * u || now - bike.historyTime[last] > 0.5;
+            if (moved && (last < 0 || now > bike.historyTime[last])) {
+                if (bike.historyCount == OtherBike::kHistory) {
+                    std::copy(bike.historyTime + 1, bike.historyTime + OtherBike::kHistory, bike.historyTime);
+                    std::copy(bike.historyAt + 1, bike.historyAt + OtherBike::kHistory, bike.historyAt);
+                    --bike.historyCount;
+                }
+                bike.historyTime[bike.historyCount] = now;
+                bike.historyAt[bike.historyCount] = mid;
+                ++bike.historyCount;
+            }
+            double sumT = 0, sumTT = 0;
+            Vec3 sumP{ 0, 0, 0 }, sumTP{ 0, 0, 0 };
+            int n = 0;
+            for (int k = 0; k < bike.historyCount; ++k) {
+                const double t = bike.historyTime[k] - now;
+                if (t < -0.35)
+                    continue;
+                sumT += t;
+                sumTT += t * t;
+                sumP = sumP + bike.historyAt[k];
+                sumTP = sumTP + bike.historyAt[k] * t;
+                ++n;
+            }
+            const double spread = n >= 2 ? sumTT - sumT * sumT / n : 0.0;
+            if (n >= 2 && spread > 1e-4) {
+                const Vec3 v = (sumTP - sumP * (sumT / n)) * (1.0 / spread);
+                if (Length(v) < 60.0 * u) {
+                    bike.velocity = v;
+                    bike.haveVelocity = true;
+                }
+            } else if (bike.historyCount > 0 && now - bike.historyTime[bike.historyCount - 1] > 0.35) {
+                bike.velocity = Vec3{ 0, 0, 0 };  // (nothing new for a third of a second: stopped)
+            }
+            if (bike.haveVelocity) {
+                if (bike.accelFromTime < 0 || now - bike.accelFromTime > 1.0) {
+                    bike.accelFromVelocity = bike.velocity;
+                    bike.accelFromTime = now;
+                } else if (now - bike.accelFromTime >= 0.16) {
+                    const Vec3 a = (bike.velocity - bike.accelFromVelocity) * (1.0 / (now - bike.accelFromTime));
+                    if (Length(a) < 40.0 * u)
+                        bike.accel = bike.accel + (a - bike.accel) * 0.6;
+                    bike.accelFromVelocity = bike.velocity;
+                    bike.accelFromTime = now;
+                }
+            }
             if (Length(tb.centre - was.front) < Length(ta.centre - was.front))
                 std::swap(front, rear);
             // Which way it's moving says which tire leads.
@@ -4819,27 +4913,58 @@ int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, 
         bike.mid = mid;
         bike.front = front->centre;
         bike.seen = now;
+        bike.fresh = true;
+        bike.rear = rear->centre;
+        bike.frontAxle = front->axle;
+        bike.rearAxle = rear->axle;
+        bike.rearRadius = rear->biggest * u;
         next.push_back(bike);
         ++bikesSeen;
-        if (!bike.decided)
+        if (bike.decided)
+            ++bikesDecided;
+    }
+    // Bikes not seen this frame are remembered a moment (a wheel out of view, a frame it wasn't drawn).
+    for (size_t k = 0; k < g_otherBikes.size(); ++k)
+        if (!taken[k] && now - g_otherBikes[k].seen < 1.0) {
+            next.push_back(g_otherBikes[k]);
+            next.back().fresh = false;
+        }
+    g_otherBikes.swap(next);
+    g_otherWheelParts = wheels.size();
+    g_otherAxles = tires.size();
+    g_otherBikesSeen = bikesSeen;
+    g_otherBikesDecided = bikesDecided;
+}
+
+int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, int max, double now, double dt)
+{
+    TrackOtherBikes(now, dt);
+    const double u = g_unitsPerMetre;
+    const Vec3 worldUp = WorldUp();
+    const Vec3 camera = CameraPosition(g_frame.raw);
+    // This frame's lights, before they're matched to the ones shown.
+    struct Found { Vec3 position, forward, up; };
+    static std::vector<Found> found;
+    found.clear();
+    for (const OtherBike& bike : g_otherBikes) {
+        if (!bike.fresh || !bike.decided)
             continue;
-        ++bikesDecided;
         // Yours has its own light.
-        if (g_rider.seen && Length(mid - g_rider.position) < 1.5 * u)
+        if (g_rider.seen && Length(bike.mid - g_rider.position) < 1.5 * u)
             continue;
-        const Vec3 forward = Normalize(front->centre - rear->centre);
-        Vec3 up = Normalize(Cross(rear->axle, forward));
+        const Vec3 forward = Normalize(bike.front - bike.rear);
+        Vec3 up = Normalize(Cross(bike.rearAxle, forward));
         if (Dot(up, worldUp) < 0.0)
             up = up * -1.0;
         if (Dot(up, worldUp) < 0.3)
             continue;  // (down on its side)
         Found f;
-        f.position = front->centre + up * (kPlateAboveAxle * u) - forward * (kPlateBehindAxle * u);
+        f.position = bike.front + up * (kPlateAboveAxle * u) - forward * (kPlateBehindAxle * u);
         if (Length(f.position - camera) / u > kOtherLightReach)
             continue;
         // Where the plate faces: turned with the bars, then level across.
         const Vec3 across = Normalize(Cross(forward, up));
-        Vec3 axle = front->axle - up * Dot(front->axle, up);
+        Vec3 axle = bike.frontAxle - up * Dot(bike.frontAxle, up);
         double steer = 0;
         if (Length(axle) > 1e-3) {
             axle = Normalize(axle);
@@ -4854,11 +4979,6 @@ int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, 
         f.up = Length(level) > 1e-3 ? Normalize(level) : up;
         found.push_back(f);
     }
-    // Bikes not seen this frame are remembered a moment (a wheel out of view, a frame it wasn't drawn).
-    for (size_t k = 0; k < g_otherBikes.size(); ++k)
-        if (!taken[k] && now - g_otherBikes[k].seen < 1.0)
-            next.push_back(g_otherBikes[k]);
-    g_otherBikes.swap(next);
 
     // Riders whose bikes weren't found by their wheels: from the rider.
     const size_t byWheels = found.size();
@@ -4963,13 +5083,13 @@ int OtherHeadlights(Vec3* positions, Vec3* forwards, Vec3* ups, double* powers, 
         ++n;
     }
     // For the log: what was found (when it changes, at most every few seconds).
-    const int counts[4] = { bikesSeen, bikesDecided, byRiders, n };
+    const int counts[4] = { g_otherBikesSeen, g_otherBikesDecided, byRiders, n };
     if (now - g_otherLogAt > 3.0 && std::memcmp(counts, g_otherLogged, sizeof counts) != 0) {
         g_otherLogAt = now;
         std::memcpy(g_otherLogged, counts, sizeof counts);
         Log("postfx: headlights on other bikes: %d wheel part(s) on %d axle(s): %d bike(s) found by their wheels (%d with "
             "their front known); %d rider(s) seen, %d lit from the rider; %d light(s) shown",
-            static_cast<int>(wheels.size()), static_cast<int>(tires.size()), bikesSeen, bikesDecided,
+            static_cast<int>(g_otherWheelParts), static_cast<int>(g_otherAxles), g_otherBikesSeen, g_otherBikesDecided,
             static_cast<int>(g_riderPoints.size()), byRiders, n);
     }
     return n;
@@ -5336,6 +5456,741 @@ void DrawRainfall(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec
     g_gl.BindVertexArray(g_res.vao);  // (the fullscreen triangle, for the passes after)
 }
 
+// ---- Roost: the dirt your rear tire throws (Config::roost; see shaders::kRoostVertex) ------------
+// Kicked up where your rear tire meets the ground, most when you're on the gas (your bike gaining
+// speed) and when it's sliding through a turn (pushed sideways hard), thrown out of the turn's
+// outside; a little at any speed. Fine dust that hangs in the air, spreads and drifts down, and dark
+// clods flying in arcs back to the ground. The dust's colour is the ground's near you as the picture
+// shows it (RoostProbe), so it matches the track, the sun, the time of day and the weather. Worked
+// out here (each bit's own motion), drawn into the HDR image after the composite.
+constexpr int    kRoostMax          = 4000;   // bits alive at once (dust and clods, every bike's)
+constexpr double kRoostDustRate     = 55.0;   // puffs a second, fully on
+constexpr double kRoostClodRate     = 120.0;  // clods a second, fully on
+constexpr double kRoostExposure     = 0.02;   // s: how long a clod's streak is (its motion in that time)
+struct RoostBit {
+    Vec3   pos, vel;          // world, game units (/ s)
+    double age = 0, life = 1, size0 = 0, size = 0, alpha0 = 0, seed = 0, ground = 0;
+    int    kind = 0;          // 0 dust, 1 a clod
+};
+std::vector<RoostBit> g_roost;
+double   g_roostDustCarry = 0, g_roostClodCarry = 0;
+Vec3     g_roostLastVel{ 0, 0, 0 }, g_roostAccel{ 0, 0, 0 }, g_roostLastEye{ 0, 0, 0 }, g_roostCamVel{ 0, 0, 0 };
+bool     g_roostHaveVel = false, g_roostHaveEye = false;
+double   g_roostIntensity = 0;  // 0..1.2, eased (for the log / trace)
+int      g_roostOthersNow = 0;  // other bikes throwing roost this frame (for the log)
+uint32_t g_roostRandom = 0x9E3779B9u;
+bool     g_roostLogged = false;
+
+double RoostRandom()
+{
+    g_roostRandom ^= g_roostRandom << 13;
+    g_roostRandom ^= g_roostRandom >> 17;
+    g_roostRandom ^= g_roostRandom << 5;
+    return (g_roostRandom & 0xFFFFFF) / 16777216.0;
+}
+double RoostRange(double a, double b) { return a + (b - a) * RoostRandom(); }
+
+bool BuildOwnProgram(Program& out, const char* vs, const char* fs, const char* name, const char* const* attribs, int count)
+{
+    std::string error;
+    for (const char* version : { "#version 150\n", "#version 130\n" }) {
+        const GLuint v = CompileShader(kVertexShader, version, vs, nullptr, error);
+        if (!v)
+            continue;
+        const GLuint f = CompileShader(kFragmentShader, version, fs, nullptr, error);
+        if (!f) {
+            g_gl.DeleteShader(v);
+            continue;
+        }
+        const GLuint program = g_gl.CreateProgram();
+        g_gl.AttachShader(program, v);
+        g_gl.AttachShader(program, f);
+        for (int i = 0; i < count; ++i)
+            g_gl.BindAttribLocation(program, static_cast<GLuint>(i), attribs[i]);
+        g_gl.LinkProgram(program);
+        g_gl.DeleteShader(v);
+        g_gl.DeleteShader(f);
+        GLint linked = 0;
+        g_gl.GetProgramiv(program, kLinkStatus, &linked);
+        if (!linked) {
+            g_gl.DeleteProgram(program);
+            continue;
+        }
+        out.id = program;
+        Log("postfx: %s ready (%s)", name, version[9] == '5' ? "GLSL 150" : "GLSL 130");
+        return true;
+    }
+    LogInfo(name, error);
+    return false;
+}
+
+bool MakeRoostResources()
+{
+    if (g_res.roostTried)
+        return g_res.roost.id != 0 && g_res.roostProbe.id != 0;
+    g_res.roostTried = true;
+    static const char* const kAttribs[] = { "a_pos", "a_data", "a_move" };
+    if (!BuildOwnProgram(g_res.roost, shaders::kRoostVertex, shaders::kRoostFragment, "roost", kAttribs, 3) ||
+        !BuildOwnProgram(g_res.roostProbe, shaders::kRoostProbeVertex, shaders::kRoostProbeFragment, "roost's dirt colour", nullptr, 0))
+        return false;
+    g_gl.GenVertexArrays(1, &g_res.roostVao);
+    g_gl.GenBuffers(1, &g_res.roostVbo);
+    g_gl.BindVertexArray(g_res.roostVao);
+    g_gl.BindBuffer(kArrayBuffer, g_res.roostVbo);
+    constexpr GLsizei stride = 11 * sizeof(float);
+    g_gl.VertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, nullptr);
+    g_gl.VertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(4 * sizeof(float)));
+    g_gl.VertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(8 * sizeof(float)));
+    g_gl.EnableVertexAttribArray(0);
+    g_gl.EnableVertexAttribArray(1);
+    g_gl.EnableVertexAttribArray(2);
+    g_gl.GenVertexArrays(1, &g_res.roostProbeVao);
+    g_gl.BindVertexArray(g_res.vao);
+    // The dirt's colour: a 1 x 1 target, starting as a dry track's tan.
+    if (!MakeTarget(g_res.roostDirt, 1, 1, kRgba16f, GL_RGBA, GL_FLOAT))
+        return false;
+    const float tan[4] = { 0.30f, 0.20f, 0.12f, 1.0f };
+    g_gl.BindTexture(GL_TEXTURE_2D, g_res.roostDirt.tex);
+    g_gl.TexImage2D(GL_TEXTURE_2D, 0, kRgba16f, 1, 1, 0, GL_RGBA, GL_FLOAT, tan);
+    return true;
+}
+
+// The dirt's colour this frame: the ground where the roost comes from, as the picture shows it.
+void RoostProbe(const double V[16], Vec3 forward, double dt)
+{
+    const double u = g_unitsPerMetre;
+    Program& p = g_res.roostProbe;
+    g_gl.UseProgram(p.id);
+    g_gl.BindVertexArray(g_res.roostProbeVao);
+    Bind(p, "u_scene", 0, g_res.hdr.tex);
+    Bind(p, "u_depth", 1, g_res.depth);
+    Bind(p, "u_terrainDepth", 2, g_res.terrainDepth);
+    g_gl.Uniform1f(p["u_haveTerrain"], g_frame.terrainSnapshot ? 1.0f : 0.0f);
+    g_gl.UniformMatrix4fv(p["u_invProj"], 1, GL_FALSE, g_m.invProj);
+    g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
+    // Behind your rear wheel (where the roost comes from), beside your front one, and the ground
+    // ahead of you low in the picture (first person: the wheels are out of view).
+    Vec3 places[2] = { g_wheels[0].contact - forward * (0.45 * u), g_wheels[1].contact + forward * (0.5 * u) };
+    static const char* const kProbe[6] = { "u_probe[0]", "u_probe[1]", "u_probe[2]", "u_probe[3]", "u_probe[4]", "u_probe[5]" };
+    for (int i = 0; i < 2; ++i) {
+        float uv[2] = { -1.0f, -1.0f };
+        if (g_wheels[i].on) {
+            const Vec3 e = TransformPoint(V, places[i]);
+            if (e.z < -0.1) {
+                double clip[4];
+                for (int r = 0; r < 4; ++r)
+                    clip[r] = g_m.proj[r] * e.x + g_m.proj[4 + r] * e.y + g_m.proj[8 + r] * e.z + g_m.proj[12 + r];
+                if (clip[3] > 1e-6) {
+                    uv[0] = static_cast<float>(clip[0] / clip[3] * 0.5 + 0.5);
+                    uv[1] = static_cast<float>(clip[1] / clip[3] * 0.5 + 0.5);
+                }
+            }
+        }
+        g_gl.Uniform2f(p[kProbe[i]], uv[0], uv[1]);
+    }
+    g_gl.Uniform2f(p[kProbe[2]], 0.5f, 0.12f);
+    g_gl.Uniform2f(p[kProbe[3]], 0.3f, 0.2f);
+    g_gl.Uniform2f(p[kProbe[4]], 0.7f, 0.2f);
+    g_gl.Uniform2f(p[kProbe[5]], 0.5f, 0.28f);
+    g_gl.Uniform1f(p["u_rate"], static_cast<float>(1.0 - std::exp(-Clamp(dt, 0.0, 0.25) / 0.4)));
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.roostDirt.fbo);
+    g_gl.Viewport(0, 0, 1, 1);
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
+    g_gl.DrawArrays(GL_TRIANGLES, 0, 3);
+    g_gl.Disable(GL_BLEND);
+}
+
+// One bike's roost this frame: how hard it's throwing, and its new bits from just behind its rear
+// tire's contact. forward: the way it points; velocity, accel: its motion (game units / s, / s^2);
+// dustCarry, clodCarry: its bits owed, carried from frame to frame.
+struct RoostThrow { double speed = 0, drive = 0, turn = 0, intensity = 0; };
+RoostThrow EmitRoost(Vec3 contact, Vec3 forward, Vec3 velocity, Vec3 accel, bool grounded, Vec3 up, double step,
+                     double& dustCarry, double& clodCarry)
+{
+    const Config& cfg = GetConfig();
+    const double u = g_unitsPerMetre;
+    RoostThrow r;
+    forward = forward - up * Dot(forward, up);
+    if (Length(forward) < 1e-6)
+        return r;
+    forward = Normalize(forward);
+    const Vec3 across = Normalize(Cross(forward, up));
+    r.speed = Length(velocity - up * Dot(velocity, up)) / u;  // m/s, along the ground
+    r.drive = Dot(accel, forward) / u;                        // m/s^2
+    const Vec3 lateral = accel - forward * Dot(accel, forward) - up * Dot(accel, up);
+    r.turn = Length(lateral) / u;
+    const Vec3 outside = r.turn > 0.5 ? Normalize(lateral) * -1.0 : Vec3{ 0, 0, 0 };
+    const auto Smooth = [](double a, double b, double x) { const double t = Clamp((x - a) / (b - a), 0.0, 1.0); return t * t * (3 - 2 * t); };
+    const double slide = Smooth(2.5, 9.0, r.turn) * Smooth(3.0, 8.0, r.speed);
+    double intensity = 0.0;
+    if (grounded)
+        intensity = (Smooth(4.0, 15.0, r.speed) * 0.12 + Smooth(0.8, 5.0, r.drive) * 0.9 + slide * 0.8) * Smooth(0.5, 2.5, r.speed);
+    intensity = Clamp(intensity, 0.0, 1.2);
+    r.intensity = intensity;
+
+    // The weather: in the rain wet mud and water, hardly any dust; the snow throws more.
+    const bool rain = cfg.weather == kWeatherRain, snow = cfg.weather == kWeatherSnow;
+    const double dustAmount = cfg.roost * cfg.roostDust * (rain ? 0.12 : snow ? 1.2 : 1.0);
+    const double clodAmount = cfg.roost * (rain ? 1.3 : 1.0);
+
+    // New bits, from just behind the rear tire's contact.
+    dustCarry += intensity * dustAmount * kRoostDustRate * step;
+    clodCarry += intensity * clodAmount * kRoostClodRate * step;
+    const double groundHeight = Dot(contact, up);
+    const auto Spawn = [&](int kind) {
+        if (static_cast<int>(g_roost.size()) >= kRoostMax)
+            return;
+        RoostBit b;
+        b.kind = kind;
+        b.seed = RoostRandom();
+        b.ground = groundHeight;
+        b.pos = contact - forward * (0.2 * u) + up * (0.05 * u) + across * (RoostRange(-0.08, 0.08) * u);
+        const double push = 0.5 + 0.5 * Clamp(intensity, 0.0, 1.0);
+        if (kind == 0) {
+            b.vel = forward * (-RoostRange(0.5, 2.5) * push * u) + up * (RoostRange(0.5, 1.6) * u) +
+                    outside * (slide * RoostRange(0.5, 2.0) * u) + across * (RoostRange(-0.5, 0.5) * u) + velocity * 0.12;
+            b.life = RoostRange(2.2, 3.8);
+            b.size0 = RoostRange(0.25, 0.45) * u;
+            b.alpha0 = RoostRange(0.10, 0.2);
+        } else {
+            b.vel = forward * (-RoostRange(2.0, 7.0) * push * u) + up * (RoostRange(1.5, 4.5) * u) +
+                    outside * (slide * RoostRange(1.0, 4.0) * u) + across * (RoostRange(-1.2, 1.2) * u) + velocity * 0.15;
+            b.life = 2.5;
+            b.size0 = RoostRange(0.012, 0.03) * u * (rain ? 1.4 : 1.0);
+            b.alpha0 = 0.95;
+        }
+        b.size = b.size0;
+        g_roost.push_back(b);
+    };
+    for (; dustCarry >= 1.0; dustCarry -= 1.0)
+        Spawn(0);
+    for (; clodCarry >= 1.0; clodCarry -= 1.0)
+        Spawn(1);
+    return r;
+}
+
+// Your bike's roost this frame (and, with Config::roostEveryBike, every other bike's found by its
+// wheels): new bits from the rear tires, every bit moved, then drawn.
+void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now, double dt, int h)
+{
+    const Config& cfg = GetConfig();
+    if (cfg.roost <= 0.0) {
+        g_roost.clear();
+        g_roostHaveVel = false;
+        return;
+    }
+    if (!MakeRoostResources())
+        return;
+    const double u = g_unitsPerMetre;
+    const double step = Clamp(dt, 0.0, 0.1);
+    const Wheel& rear = g_wheels[0];
+    const Wheel& front = g_wheels[1];
+    Vec3 forward = g_rider.heading;
+    if (rear.on && front.on && Length(front.axle - rear.axle) > 0.5 * u)
+        forward = Normalize(front.axle - rear.axle);
+    forward = Normalize(forward - up * Dot(forward, up));
+
+    // How hard you're accelerating and turning (the rider's own motion, eased).
+    const bool riding = g_rider.seen && rear.on;
+    if (riding && step > 1e-4) {
+        if (g_roostHaveVel) {
+            const Vec3 a = (g_rider.velocity - g_roostLastVel) * (1.0 / step);
+            if (Length(a) < 60.0 * u)
+                g_roostAccel = g_roostAccel + (a - g_roostAccel) * Clamp(step / 0.15, 0.0, 1.0);
+        }
+        g_roostLastVel = g_rider.velocity;
+        g_roostHaveVel = true;
+    } else if (!riding) {
+        g_roostHaveVel = false;
+        g_roostAccel = Vec3{ 0, 0, 0 };
+    }
+    if (g_roostHaveEye && step > 1e-4) {
+        const Vec3 moved = (eye - g_roostLastEye) * (1.0 / step);
+        if (Length(moved) < 80.0 * u)
+            g_roostCamVel = g_roostCamVel + (moved - g_roostCamVel) * Clamp(step * 12.0, 0.0, 1.0);
+    }
+    g_roostLastEye = eye;
+    g_roostHaveEye = true;
+
+    const RoostThrow yours = EmitRoost(rear.contact, forward, g_rider.velocity, g_roostAccel, riding && rear.grounded, up, step,
+                                       g_roostDustCarry, g_roostClodCarry);
+    g_roostIntensity = yours.intensity;
+    // Every other bike found by its wheels (TrackOtherBikes, as the headlights on other bikes): from its
+    // rear tire, by its own motion. On the ground unless it's falling freely (a jump).
+    if (cfg.roostEveryBike) {
+        TrackOtherBikes(now, dt);
+        for (OtherBike& b : g_otherBikes) {
+            if (!b.fresh)
+                continue;
+            b.roostIntensity = 0;
+            b.roostDistance = Length(b.mid - eye) / u;
+            b.roostSpeed = b.haveVelocity ? Length(b.velocity - up * Dot(b.velocity, up)) / u : 0.0;
+            b.roostUpAccel = Dot(b.accel, up) / u;
+            if (g_rider.seen && Length(b.mid - g_rider.position) < 1.5 * u) {
+                b.roostWhy = 1;  // (yours: above)
+                continue;
+            }
+            if (b.roostDistance > 120.0) {
+                b.roostWhy = 2;
+                continue;
+            }
+            if (!b.haveVelocity) {
+                b.roostWhy = 3;
+                continue;
+            }
+            // Which tire is its rear: moving, the one behind (no need to have told its front yet - another
+            // rider's bike, its place coming in network steps, often hadn't, and threw nothing); standing,
+            // as told.
+            Vec3 bikeForward, rearCentre;
+            if (b.roostSpeed > 1.0) {
+                bikeForward = Normalize(b.velocity - up * Dot(b.velocity, up));
+                rearCentre = Dot(b.front - b.rear, bikeForward) >= 0.0 ? b.rear : b.front;
+            } else if (b.decided) {
+                bikeForward = Normalize(b.front - b.rear);
+                rearCentre = b.rear;
+            } else {
+                b.roostWhy = 4;
+                continue;
+            }
+            Vec3 bikeUp = Normalize(Cross(b.rearAxle, bikeForward));
+            if (Dot(bikeUp, up) < 0.0)
+                bikeUp = bikeUp * -1.0;
+            if (Dot(bikeUp, up) < 0.3) {
+                b.roostWhy = 5;
+                continue;
+            }
+            const bool onGround = b.roostUpAccel > -6.0;
+            const RoostThrow thrown = EmitRoost(rearCentre - bikeUp * b.rearRadius, bikeForward, b.velocity, b.accel, onGround, up,
+                                                step, b.roostDust, b.roostClod);
+            b.roostWhy = 0;
+            b.roostIntensity = thrown.intensity;
+            b.roostDrive = thrown.drive;
+            if (thrown.intensity > 0.0)
+                ++g_roostOthersNow;
+        }
+    }
+
+    // Every bit moved: dust slows quickly, rises a touch and grows; clods fly and fall.
+    const double gravity = 9.81 * u;
+    for (size_t i = 0; i < g_roost.size();) {
+        RoostBit& b = g_roost[i];
+        b.age += step;
+        bool dead = b.age >= b.life;
+        if (b.kind == 0) {
+            b.vel = b.vel * std::exp(-step / 0.7) + up * (0.15 * u * step);
+            b.pos = b.pos + b.vel * step;
+            b.size = b.size0 + 1.1 * u * std::sqrt(b.age);
+            const double h0 = Dot(b.pos, up) - b.ground;
+            if (h0 < 0.3 * b.size)
+                b.pos = b.pos + up * (0.3 * b.size - h0);
+        } else {
+            b.vel = (b.vel - up * (gravity * step)) * std::exp(-step / 2.5);
+            b.pos = b.pos + b.vel * step;
+            dead = dead || Dot(b.pos, up) < b.ground - 0.03 * u;
+        }
+        if (dead) {
+            b = g_roost.back();
+            g_roost.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    if (!g_roostLogged && !g_roost.empty()) {
+        g_roostLogged = true;
+        Log("postfx: roost: rear tires are throwing dirt (yours: %.1f m/s, accelerating %.1f m/s^2, turning %.1f m/s^2)", yours.speed,
+            yours.drive, yours.turn);
+    }
+    if (riding)
+        RoostProbe(V, forward, dt);  // (all the while: the colour is ready when the dirt flies)
+    if (g_roost.empty()) {
+        g_gl.BindVertexArray(g_res.vao);
+        return;
+    }
+
+    // Drawn: each bit's 6 vertices, from the camera.
+    static std::vector<float> vertices;
+    vertices.clear();
+    vertices.reserve(g_roost.size() * 6 * 11);
+    for (const RoostBit& b : g_roost) {
+        const double t = b.age / b.life;
+        double alpha;
+        if (b.kind == 0)
+            alpha = b.alpha0 * Clamp(b.age / 0.08, 0.0, 1.0) * std::pow(1.0 - t, 1.6);
+        else
+            alpha = b.alpha0 * Clamp((1.0 - t) * 4.0, 0.0, 1.0);
+        const Vec3 rel = b.pos - eye;
+        const Vec3 move = (b.vel - g_roostCamVel) * kRoostExposure;
+        const float v[11] = { static_cast<float>(rel.x), static_cast<float>(rel.y), static_cast<float>(rel.z), static_cast<float>(b.size),
+                              static_cast<float>(alpha), static_cast<float>(b.kind), static_cast<float>(b.seed), static_cast<float>(t),
+                              static_cast<float>(move.x), static_cast<float>(move.y), static_cast<float>(move.z) };
+        for (int k = 0; k < 6; ++k)
+            vertices.insert(vertices.end(), v, v + 11);
+    }
+    Program& p = g_res.roost;
+    g_gl.UseProgram(p.id);
+    g_gl.BindVertexArray(g_res.roostVao);
+    g_gl.BindBuffer(kArrayBuffer, g_res.roostVbo);
+    g_gl.BufferData(kArrayBuffer, static_cast<ptrdiff_t>(vertices.size() * sizeof(float)), vertices.data(), kStreamDraw);
+    float rotation[9];
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r)
+            rotation[c * 3 + r] = static_cast<float>(V[c * 4 + r]);
+    g_gl.UniformMatrix3fv(p["u_viewRot"], 1, GL_FALSE, rotation);
+    g_gl.UniformMatrix4fv(p["u_proj"], 1, GL_FALSE, g_m.proj);
+    g_gl.UniformMatrix4fv(p["u_invProj"], 1, GL_FALSE, g_m.invProj);
+    g_gl.Uniform1f(p["u_pixel"], static_cast<float>(2.0 / (std::fmax(std::fabs(P[5]), 1e-3) * h)));
+    g_gl.Uniform1f(p["u_metre"], static_cast<float>(u));
+    g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
+    // Clods: dark, damp dirt (mud in the rain; in the snow, packed snow a little darker than it).
+    const bool rain = cfg.weather == kWeatherRain, snow = cfg.weather == kWeatherSnow;
+    if (rain)
+        g_gl.Uniform3f(p["u_clodShade"], 0.32f, 0.3f, 0.28f);
+    else if (snow)
+        g_gl.Uniform3f(p["u_clodShade"], 0.8f, 0.82f, 0.86f);
+    else
+        g_gl.Uniform3f(p["u_clodShade"], 0.42f, 0.38f, 0.35f);
+    g_gl.Uniform1f(p["u_dustBright"], snow ? 1.1f : 1.6f);
+    Bind(p, "u_depth", 0, g_res.depth);
+    Bind(p, "u_dirt", 1, g_res.roostDirt.tex);
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
+    g_gl.Viewport(0, 0, g_res.hdr.w, g_res.hdr.h);
+    g_gl.Disable(GL_CULL_FACE);
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);  // (premultiplied; the image's alpha kept)
+    g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
+    g_gl.DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_roost.size() * 6));
+    g_gl.Disable(GL_BLEND);
+    g_gl.BindVertexArray(g_res.vao);  // (the fullscreen triangle, for the passes after)
+}
+
+// For the log, after each of the lobby wheels' own lines (lobby_wheels.cpp LogLearning): what was made
+// of the other bikes' wheels since - their tire marks' paths and what became of them, the bikes paired
+// from them, and how many threw roost.
+struct OtherBikesReport {
+    long frames = 0, segments = 0, yours = 0, step = 0, outside = 0, pressed = 0, paired = 0, fronts = 0, roosting = 0, unchecked = 0;
+    int  mostPaired = 0, mostRoosting = 0;
+};
+OtherBikesReport g_otherReport;
+int g_otherReportsSeen = 0;
+
+void ReportOtherBikes()
+{
+    OtherBikesReport& r = g_otherReport;
+    ++r.frames;
+    r.segments += g_lobbyStats.segments;
+    r.yours += g_lobbyStats.yours;
+    r.step += g_lobbyStats.step;
+    r.outside += g_lobbyStats.outside;
+    r.pressed += g_lobbyStats.pressed;
+    r.unchecked += g_lobbyStats.unchecked ? 1 : 0;
+    // (Only counted when something asked for the other bikes this frame: their roost or headlights.)
+    int paired = 0, fronts = 0;
+    if (g_otherTrackedAt == g_applyNow)
+        for (const OtherBike& b : g_otherBikes)
+            if (b.fresh) {
+                ++paired;
+                fronts += b.decided ? 1 : 0;
+            }
+    r.paired += paired;
+    r.fronts += fronts;
+    r.roosting += g_roostOthersNow;
+    r.mostPaired = std::max(r.mostPaired, paired);
+    r.mostRoosting = std::max(r.mostRoosting, g_roostOthersNow);
+    const int reports = lobby::LearningReports();
+    if (reports == g_otherReportsSeen)
+        return;
+    g_otherReportsSeen = reports;
+    const double n = static_cast<double>(std::max(r.frames, 1L));
+    Log("other bikes: over %ld frames: a frame's tire paths from other wheels %.1f (%.1f taken for yours, %.1f too long a step, "
+        "%.1f off the ground seen, %.1f pressed; %ld frames with no ground to test them against); bikes paired from their wheels %.1f (at most %d, %.1f with their front known); "
+        "throwing roost %.1f (at most %d)",
+        r.frames, r.segments / n, r.yours / n, r.step / n, r.outside / n, r.pressed / n, r.unchecked, r.paired / n, r.mostPaired, r.fronts / n,
+        r.roosting / n, r.mostRoosting);
+    static const char* const kWhy[] = { "roost from it", "your own bike", "over 120 m away", "its motion not known yet",
+                                        "standing still, its front not known", "down on its side" };
+    int listed = 0;
+    for (const OtherBike& b : g_otherBikes) {
+        if (!b.fresh || listed >= 6)
+            continue;
+        ++listed;
+        Log("other bikes:   one %.0f m away, front %s, %.1f m/s, accelerating %.1f m/s^2, %.1f m/s^2 up: %s (strength %.2f)",
+            b.roostDistance, b.decided ? "known" : "not known", b.roostSpeed, b.roostDrive, b.roostUpAccel,
+            b.roostWhy >= 0 && b.roostWhy <= 5 ? kWhy[b.roostWhy] : "roost not asked", b.roostIntensity);
+    }
+    r = OtherBikesReport{};
+}
+
+// ---- WEATHER: lightning (Config::lightning; see shaders::kBoltVertex, thunder.h) ---------------
+// Now and then (how often: the setting) a strike somewhere around you, 0.5 to 6 km away: a bolt
+// from the cloud base down to the ground, branching, lit by a few return strokes in quick
+// succession (the flicker), each lighting the clouds round it and everything below. A third of
+// them stay in the cloud (only the flash). Its thunder comes as late as it was far (thunder.cpp).
+// Laid out in metres from the camera when it struck, in world directions (kilometres away, the
+// camera's own motion in the half second it lasts doesn't show); drawn as directions, at infinity.
+struct BoltPiece {
+    Vec3   from, to;
+    double width = 1;   // its core's half width against the main channel's
+    int    level = 0;   // 0 the main channel (lit by every stroke), 1 a branch, 2 a branch's
+};
+struct Strike {
+    bool   on = false;
+    double start = 0, metres = 0, closeness = 0, seen = 1;
+    Vec3   cloud{ 0, 0, 1 };  // world: toward the cloud it lit
+    bool   inCloud = false;
+    double strokes[5] = {}, strokeAmp[5] = {};
+    int    strokeCount = 0;
+    double length = 0;      // s
+    std::vector<BoltPiece> pieces;
+};
+Strike   g_strike;
+double   g_nextStrike = -1;  // now of the next (-1: lightning just turned on)
+uint32_t g_boltRandom = 0x2545F491u;
+int      g_strikesLogged = 0;
+
+double BoltRandom()
+{
+    g_boltRandom ^= g_boltRandom << 13;
+    g_boltRandom ^= g_boltRandom >> 17;
+    g_boltRandom ^= g_boltRandom << 5;
+    return (g_boltRandom & 0xFFFFFF) / 16777216.0;
+}
+double BoltRange(double a, double b) { return a + (b - a) * BoltRandom(); }
+
+// A jagged channel from a to b: each piece's middle pushed aside by a share of its length, again and
+// again (`depth` times), mostly across, a little along and up.
+void Jagged(Vec3 a, Vec3 b, int depth, double rough, Vec3 up, std::vector<Vec3>& out)
+{
+    if (depth <= 0) {
+        out.push_back(b);
+        return;
+    }
+    const Vec3 d = b - a;
+    const double l = Length(d);
+    Vec3 across = Cross(d, up);
+    if (Length(across) < 1e-6 * (l + 1.0))
+        across = Cross(d, Vec3{ 1, 0, 0 });
+    across = Normalize(across);
+    const Vec3 other = Normalize(Cross(across, d));
+    const Vec3 mid = (a + b) * 0.5 + across * ((BoltRandom() - 0.5) * rough * l) +
+                     other * ((BoltRandom() - 0.5) * 0.6 * rough * l);
+    Jagged(a, mid, depth - 1, rough, up, out);
+    Jagged(mid, b, depth - 1, rough, up, out);
+}
+
+void AddChannel(const std::vector<Vec3>& points, double width, int level)
+{
+    for (size_t i = 1; i < points.size(); ++i)
+        g_strike.pieces.push_back(BoltPiece{ points[i - 1], points[i], width, level });
+}
+
+// A branch off the channel at `from`, heading down and out.
+void Branch(Vec3 from, Vec3 up, double reach, double width, int level)
+{
+    const double turn = BoltRange(0.0, 6.2831853);
+    Vec3 side = Cross(up, Vec3{ 0.0, 0.0, 1.0 });
+    if (Length(side) < 0.1)
+        side = Cross(up, Vec3{ 1.0, 0.0, 0.0 });
+    side = Normalize(side);
+    const Vec3 side2 = Normalize(Cross(up, side));
+    const Vec3 out = side * std::cos(turn) + side2 * std::sin(turn);
+    const Vec3 to = from + Normalize(up * -1.0 + out * BoltRange(0.5, 1.6)) * reach;
+    std::vector<Vec3> points{ from };
+    Jagged(from, to, level == 1 ? 5 : 4, 0.42, up, points);
+    AddChannel(points, width, level);
+    if (level == 1)
+        for (size_t i = 2; i + 2 < points.size(); ++i)
+            if (BoltRandom() < 0.09)
+                Branch(points[i], up, reach * BoltRange(0.25, 0.5), width * 0.6, 2);
+}
+
+void NewStrike(double now, Vec3 up, Vec3 lookWorld, bool test)
+{
+    Strike& s = g_strike;
+    s = Strike{};
+    s.on = true;
+    s.start = now;
+    // Where: anywhere round you, but more often ahead (where it's seen); 0.5 to 6 km, most of them far.
+    Vec3 east = Cross(up, Vec3{ 0, 0, 1 });
+    if (Length(east) < 0.1)
+        east = Cross(up, Vec3{ 1, 0, 0 });
+    east = Normalize(east);
+    const Vec3 north = Normalize(Cross(east, up));
+    Vec3 ahead = lookWorld - up * Dot(lookWorld, up);
+    ahead = Length(ahead) > 1e-3 ? Normalize(ahead) : north;
+    const double aheadAngle = std::atan2(Dot(ahead, north), Dot(ahead, east));
+    const double angle = test ? aheadAngle + 0.15
+                       : BoltRandom() < 0.6 ? aheadAngle + BoltRange(-1.0, 1.0) : BoltRange(0.0, 6.2831853);
+    const Vec3 toward = east * std::cos(angle) + north * std::sin(angle);
+    const Vec3 right = Normalize(Cross(toward, up));
+    s.metres = test ? 1500.0 : 500.0 + 5500.0 * std::pow(BoltRandom(), 1.4);
+    s.closeness = Clamp(1.4 / (0.4 + s.metres / 1000.0), 0.15, 1.0);
+    s.inCloud = !test && BoltRandom() < 0.3;
+    const double base = BoltRange(1100.0, 1700.0);  // m: the cloud base over you
+    const Vec3 top = toward * s.metres + up * base + right * (s.metres * BoltRange(-0.08, 0.08));
+    // (The glow: round the channel's upper part and the cloud base over it - where it's seen lit.)
+    s.cloud = Normalize(top + up * (s.inCloud ? 300.0 : -0.35 * base));
+    // The return strokes: two to five, tens of milliseconds apart, the first the brightest.
+    s.strokeCount = test ? 3 : 2 + static_cast<int>(BoltRandom() * 3.99);
+    double at = 0.0;
+    for (int k = 0; k < s.strokeCount; ++k) {
+        s.strokes[k] = at;
+        s.strokeAmp[k] = k == 0 ? 1.0 : BoltRange(0.45, 0.9);
+        at += BoltRange(0.04, 0.14);
+    }
+    s.length = at + 0.6;
+    // Seen through the rain: a far one dimmer.
+    s.seen = Clamp(std::exp(-s.metres / 1000.0 / (3.0 + 5.0 * (1.0 - GetConfig().rainfall))), 0.25, 1.0);
+    if (!s.inCloud) {
+        const Vec3 ground = toward * (s.metres + BoltRange(-250.0, 250.0)) + right * (s.metres * BoltRange(-0.1, 0.1)) +
+                            up * -40.0;
+        std::vector<Vec3> points{ top };
+        Jagged(top, ground, 7, 0.48, up, points);
+        AddChannel(points, 1.0, 0);
+        for (size_t i = 3; i + 0.2 * points.size() < points.size(); ++i)
+            if (BoltRandom() < 0.1)
+                Branch(points[i], up, Length(points[i] - ground) * BoltRange(0.12, 0.4), 0.55, 1);
+    }
+    thunder::Strike(s.metres, s.metres / 343.0);
+    if (g_strikesLogged < 12) {
+        ++g_strikesLogged;
+        Log("lightning: a strike %.1f km away%s, %d strokes, %d pieces; thunder in %.1f s", s.metres / 1000.0,
+            s.inCloud ? " (in the cloud)" : "", s.strokeCount, static_cast<int>(s.pieces.size()), s.metres / 343.0);
+    }
+}
+
+// How bright its light is t seconds in (0..1+): each return stroke a flash (rising in a few
+// milliseconds, dying in tens), the channel glowing a little after the first. `firstOnly`: the
+// first stroke's alone (the branches: the strokes after it follow the main channel only).
+double StrokeLight(const Strike& s, double t, bool firstOnly)
+{
+    double light = 0.0;
+    for (int k = 0; k < (firstOnly ? 1 : s.strokeCount); ++k) {
+        const double x = t - s.strokes[k];
+        if (x < 0.0)
+            continue;
+        light += s.strokeAmp[k] * (x < 0.004 ? x / 0.004 : std::exp(-(x - 0.004) / 0.06));
+        light += 0.2 * s.strokeAmp[k] * std::exp(-x / 0.25);  // (the glow after it)
+    }
+    return light;
+}
+
+// Once a frame: the lightning now (starting strikes when due). Returns how bright its flash is.
+double UpdateLightning(double now, Vec3 up, const double V[16], bool on)
+{
+    const Config& cfg = GetConfig();
+    if (!on || cfg.lightning <= 0.0) {
+        g_strike.on = false;
+        g_nextStrike = -1;
+        return 0.0;
+    }
+    // (Tests: MXCAM_TEST_LIGHTNING - one strike, ahead, this many seconds in.)
+    static const char* const testAt = []() -> const char* {
+#ifdef _WIN32
+        static char value[32];
+        return GetEnvironmentVariableA("MXCAM_TEST_LIGHTNING", value, sizeof value) - 1u < sizeof value - 1u ? value : nullptr;
+#else
+        return getenv("MXCAM_TEST_LIGHTNING");
+#endif
+    }();
+    static double testStrike = -1;
+    if (g_nextStrike < 0) {
+        g_nextStrike = now + (testAt ? atof(testAt) : 2.0);
+        testStrike = testAt ? g_nextStrike : -1;
+    }
+    if (now >= g_nextStrike && !(g_strike.on && now - g_strike.start < g_strike.length)) {
+        NewStrike(now, up, EyeToWorld(V, Vec3{ 0, 0, -1 }), testAt && g_nextStrike == testStrike);
+        const double mean = 45.0 + (5.0 - 45.0) * std::sqrt(cfg.lightning);
+        g_nextStrike = now + mean * BoltRange(0.35, 1.65);
+    }
+    if (!g_strike.on)
+        return 0.0;
+    const double t = now - g_strike.start;
+    if (t > g_strike.length) {
+        g_strike.on = false;
+        return 0.0;
+    }
+    return StrokeLight(g_strike, t, false) * g_strike.closeness;
+}
+
+bool MakeBoltResources()
+{
+    if (g_res.boltTried)
+        return g_res.bolt.id != 0;
+    g_res.boltTried = true;
+    static const char* const kAttribs[] = { "a_from", "a_to" };
+    if (!BuildOwnProgram(g_res.bolt, shaders::kBoltVertex, shaders::kBoltFragment, "lightning", kAttribs, 2))
+        return false;
+    g_gl.GenVertexArrays(1, &g_res.boltVao);
+    g_gl.GenBuffers(1, &g_res.boltVbo);
+    g_gl.BindVertexArray(g_res.boltVao);
+    g_gl.BindBuffer(kArrayBuffer, g_res.boltVbo);
+    constexpr GLsizei stride = 8 * sizeof(float);
+    g_gl.VertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, nullptr);
+    g_gl.VertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(4 * sizeof(float)));
+    g_gl.EnableVertexAttribArray(0);
+    g_gl.EnableVertexAttribArray(1);
+    g_gl.BindVertexArray(g_res.vao);
+    return true;
+}
+
+// The bolt, into the HDR image (after the composite, before the rain falls in front of it).
+void DrawBolt(const double V[16], double now, int h)
+{
+    const Strike& s = g_strike;
+    if (!s.on || s.pieces.empty() || !MakeBoltResources())
+        return;
+    const double t = now - s.start;
+    const double all = StrokeLight(s, t, false), first = StrokeLight(s, t, true);
+    if (all < 0.01)
+        return;
+    // Its width on screen: a few pixels close by, about one far off (at 1080 lines; more lines, wider).
+    const double core = Clamp(1.5 * std::sqrt(1500.0 / s.metres), 0.8, 2.4) * Clamp(h / 1080.0, 0.7, 2.5);
+    static std::vector<float> vertices;
+    vertices.clear();
+    for (const BoltPiece& b : s.pieces) {
+        const double light = (b.level == 0 ? all : (0.6 * first + 0.4 * all) * (b.level == 1 ? 0.6 : 0.4)) * s.seen;
+        if (light < 0.01)
+            continue;
+        const Vec3 a = Normalize(b.from), c = Normalize(b.to);
+        const float v[8] = { static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.z),
+                             static_cast<float>(std::fmax(core * b.width, 0.55)), static_cast<float>(c.x),
+                             static_cast<float>(c.y), static_cast<float>(c.z), static_cast<float>(light) };
+        for (int k = 0; k < 6; ++k)
+            vertices.insert(vertices.end(), v, v + 8);
+    }
+    if (vertices.empty())
+        return;
+    Program& p = g_res.bolt;
+    g_gl.UseProgram(p.id);
+    g_gl.BindVertexArray(g_res.boltVao);
+    g_gl.BindBuffer(kArrayBuffer, g_res.boltVbo);
+    g_gl.BufferData(kArrayBuffer, static_cast<ptrdiff_t>(vertices.size() * sizeof(float)), vertices.data(), kStreamDraw);
+    float rotation[9];
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r)
+            rotation[c * 3 + r] = static_cast<float>(V[c * 4 + r]);
+    g_gl.UniformMatrix3fv(p["u_viewRot"], 1, GL_FALSE, rotation);
+    g_gl.UniformMatrix4fv(p["u_proj"], 1, GL_FALSE, g_m.proj);
+    g_gl.Uniform2f(p["u_screen"], static_cast<float>(g_res.hdr.w), static_cast<float>(g_res.hdr.h));
+    g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
+    g_gl.Uniform1f(p["u_skyDepth"], 0.999999f);
+    g_gl.Uniform3f(p["u_coreColour"], 9.0f, 9.0f, 10.0f);
+    g_gl.Uniform3f(p["u_glowColour"], 0.5f, 0.58f, 0.95f);
+    Bind(p, "u_depth", 0, g_res.depth);
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
+    g_gl.Viewport(0, 0, g_res.hdr.w, g_res.hdr.h);
+    g_gl.Disable(GL_CULL_FACE);
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+    g_gl.BlendEquationSeparate(kFuncMax, kFuncAdd);  // (the brighter of the two: pieces don't add up at their joints)
+    g_gl.DrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size() / 8));
+    g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
+    g_gl.Disable(GL_BLEND);
+    g_gl.BindVertexArray(g_res.vao);
+}
+
 void Render(int w, int h)
 {
     const Config& cfg = GetConfig();
@@ -5400,7 +6255,10 @@ void Render(int w, int h)
     // Rain: a darker grey, and the drops lit by it.
     const bool rainOn = cfg.weather == kWeatherRain;
     const Vec3 rainFog{ 0.36 * snowTint.x * snowLight, 0.38 * snowTint.y * snowLight, 0.41 * snowTint.z * snowLight };
-    const Vec3 dropColour{ 0.62 * snowTint.x * snowLight, 0.66 * snowTint.y * snowLight, 0.72 * snowTint.z * snowLight };
+    // Lightning: its flash now (the drops lit by it too).
+    const double flash = UpdateLightning(now, up, V, rainOn);
+    const Vec3 dropColour{ 0.62 * snowTint.x * snowLight + 0.9 * flash, 0.66 * snowTint.y * snowLight + 0.95 * flash,
+                           0.72 * snowTint.z * snowLight + 1.05 * flash };
     // (The bike shader's wet shine, proc_hooks PaintWet: in the game's own colours, before the
     // composite's grade - as bright as the weather's light over the exposure the grade adds.)
     {
@@ -5486,8 +6344,11 @@ void Render(int w, int h)
             headCount += OtherHeadlights(headPositions + headCount, headForwards + headCount, headUps + headCount,
                                          headPowers + headCount, kMaxHeadlights - headCount, now, dt);
         } else {
-            g_otherBikes.clear();
+            // (Only the lights: the bikes found by their wheels are kept for their roost too - cleared here
+            // every frame, they were never followed from one to the next and never threw any.)
             g_shownLights.clear();
+            if (!(cfg.roost > 0.0 && cfg.roostEveryBike))
+                g_otherBikes.clear();
         }
         const bool headlightOn = headCount > 0;
         g_rainHead.strength = 0.0;  // (the rain's: set below with the rest)
@@ -5678,10 +6539,24 @@ void Render(int w, int h)
         g_gl.Uniform1f(p["u_wet"], rainOn ? static_cast<float>(cfg.wetness) : 0.0f);
         g_gl.Uniform1f(p["u_puddles"], rainOn ? static_cast<float>(cfg.puddles) : 0.0f);
         g_gl.Uniform1f(p["u_reflect"], rainOn ? static_cast<float>(cfg.rainReflections) : 0.0f);
+        g_gl.Uniform1f(p["u_flash"], static_cast<float>(flash));
+        if (flash > 0.0) {
+            Vec(p, "u_flashDir", g_strike.cloud);
+            g_gl.Uniform1f(p["u_flashSpread"], static_cast<float>(Clamp(2.5 * g_strike.metres / 1000.0, 2.0, 18.0)));
+            g_gl.Uniform3f(p["u_flashColour"], 0.78f, 0.84f, 1.0f);
+        }
         Draw(g_res.hdr);
     }
+    g_roostOthersNow = 0;
+    if (depthOk)
+        Roost(V, P, eye, up, now, dt, h);  // (before the weather: the rain and snow fall in front of it)
+    else
+        g_roost.clear();
+    ReportOtherBikes();
     if (snowOn && cfg.snowfall > 0.0 && depthOk)
         DrawSnowfall(V, P, eye, up, flakeColour, now, dt, h);
+    if (rainOn && depthOk)
+        DrawBolt(V, now, h);  // (behind the rain)
     if (rainOn && cfg.rainfall > 0.0 && depthOk) {
         DrawSplashes(V, P, eye, up, dropColour, now, h);
         DrawRainfall(V, P, eye, up, dropColour, now, dt, h);
@@ -6746,7 +7621,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
 void TerrainPassDone()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0 && cfg.weather == kWeatherNone) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
+    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0 && cfg.weather == kWeatherNone && cfg.roost <= 0.0) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
         g_res.failed || !LoadGL())
         return;
     GLint drawFb = 0;

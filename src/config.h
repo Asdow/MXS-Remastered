@@ -149,6 +149,10 @@ struct Config {
                                           // the deepest ruts
     double rainReflections  = 0.8;        // 0..1 how strongly the puddles and wet surfaces reflect (the sky,
                                           // and what's on screen: bikes, trees, the track's banners)
+    double lightning        = 0.0;        // 0..1 how often lightning strikes in the rain (0: never): a bolt in
+                                          // the sky, the clouds and the ground lit by its flash (postfx)
+    double thunder          = 0.7;        // 0..1 how loud its thunder is (0: silent; thunder.h), heard as late
+                                          // as the strike was far
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
     double snowWind         = 0.2;        // 0..1 how hard the wind blows the falling snow
     bool   ultraGraphics    = false;      // more ground detail, further out, lit more strongly (postfx Dirt)
@@ -183,6 +187,11 @@ struct Config {
                                           // so the near lip covers the floor and the far side
                                           // shows at low angles (0: flat on the ground)
     double tireDirt         = 0.6;        // 0..1 mud caked on your tires
+    double roost            = 0.7;        // 0..1 the dirt your rear tire throws (dust and clods; most on the gas
+                                          // and sliding through turns); 0 = off (postfx Roost)
+    double roostDust        = 0.7;        // 0..1 how much fine dust there is in it (hangs in the air behind you)
+    bool   roostEveryBike   = true;       // roost from every bike around you too (found by their wheels:
+                                          // lobby_wheels.h), not just yours
     double motionBlur       = 0.0;        // 0..1 camera motion blur
     double depthOfField     = 0.0;        // 0..1
     double dofFocus         = 0.0;        // m; 0 = auto-focus on the middle of the screen

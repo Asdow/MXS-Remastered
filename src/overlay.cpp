@@ -1526,6 +1526,18 @@ const RowDef kRows[] = {
               "The cache size doesn't effect FPS, it only changes how much memory is used"),
     Slider(kTabGraphics, nullptr,           "Tire dirt",            &Config::tireDirt,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("Mud caked on your tires, in clumps that turn with the wheels, lit by the sun."),
+    Slider(kTabGraphics, nullptr,           "Roost",                &Config::roost,            0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("The dirt your rear tire throws: dark clods flying back in arcs and a sheet of dust "
+              "behind you, most when you're on the gas and sliding through turns, thrown out of the "
+              "turn. The dust takes the colour of the track around you (and the sun and shade on it); "
+              "mud in the rain, snow in the snow."),
+    Slider(kTabGraphics, nullptr,           "Roost dust",           &Config::roostDust,        0.0,   1.0,   0.01,   100.0,  0, "%", "None")
+        .Help("How much fine dust is in the roost: the cloud that hangs in the air behind you, spreads "
+              "and settles. None leaves only the clods."),
+    Toggle(kTabGraphics, nullptr,           "Roost on every bike",  &Config::roostEveryBike)
+        .Help("Roost from every bike around you in a lobby or a replay, not just yours: any model, found "
+              "by its wheels, kicking up the most when it's on the gas or sliding through a turn. Out to "
+              "about 120 m."),
     Toggle(kTabGraphics, nullptr,           "Marks & dirt on every bike", &Config::marksEveryBike)
         .Help("Tire marks and tire dirt on every bike around you in a lobby or a replay, not just yours: "
               "any model, found by its wheels turning. Their ruts are pressed where the ground under "
@@ -1677,6 +1689,14 @@ const RowDef kRows[] = {
     Slider(kTabWeather, nullptr,          "Reflections",               &Config::rainReflections,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How strongly the puddles and the wet ground reflect: the sky and what stands around them "
               "(bikes, riders, trees, banners). Lower costs a little less."),
+    Slider(kTabWeather, nullptr,          "Lightning",                 &Config::lightning,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("A thunderstorm: how often lightning strikes. A bolt comes down out of the clouds somewhere "
+              "around you, flickering, and its flash lights up the clouds, the track and the rain. Low: "
+              "a strike now and then; high: every few seconds."),
+    Slider(kTabWeather, nullptr,          "Thunder",                   &Config::thunder,          0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How loud the thunder is. It comes as late as the strike was far (about 3 seconds a "
+              "kilometre): a sharp crack for a strike close by, a long low rumble for a far one. Played "
+              "beside the game's own sound."),
     Slider(kTabWeather, "SNOW",           "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
@@ -2283,7 +2303,8 @@ const char* RowSection(int i)
 bool WeatherRowHidden(const RowDef& def, const Config& cfg)
 {
     const bool rainRow = def.number == &Config::rainfall || def.number == &Config::rainWind || def.number == &Config::wetness ||
-                         def.number == &Config::puddles || def.number == &Config::rainReflections;
+                         def.number == &Config::puddles || def.number == &Config::rainReflections ||
+                         def.number == &Config::lightning || def.number == &Config::thunder;
     const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
 }
@@ -2510,10 +2531,14 @@ bool RowInactive(const RowDef& def, const Config& cfg)
         if (def.number == &Config::headlightBeamDeg || def.number == &Config::headlightAimDeg ||
             def.flag == &Config::headlightEveryBike || def.option == &Config::headlightColor)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
+        if (def.number == &Config::roostDust || def.flag == &Config::roostEveryBike)
+            return cfg.roost <= 0.0;
         if (def.number == &Config::rainWind)
             return cfg.rainfall <= 0.0;
         if (def.number == &Config::rainReflections)
             return cfg.wetness <= 0.0 && cfg.puddles <= 0.0;
+        if (def.number == &Config::thunder)
+            return cfg.lightning <= 0.0;
         if (def.number == &Config::snowWind)
             return cfg.snowfall <= 0.0;
         if (def.number == &Config::dirtScale)
@@ -3210,8 +3235,11 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             else if (cfg.weather == kWeatherNone)
                 snprintf(readout, sizeof readout, "NO WEATHER   \xB7   CHOOSE RAIN OR SNOW");
             else if (cfg.weather == kWeatherRain)
-                snprintf(readout, sizeof readout, "RAIN ON   \xB7   RAINFALL %.0f%%   \xB7   WETNESS %.0f%%   \xB7   PUDDLES %.0f%%",
-                         cfg.rainfall * 100.0, cfg.wetness * 100.0, cfg.puddles * 100.0);
+                snprintf(readout, sizeof readout, cfg.lightning > 0.0
+                             ? "RAIN ON   \xB7   RAINFALL %.0f%%   \xB7   WETNESS %.0f%%   \xB7   LIGHTNING %.0f%%"
+                             : "RAIN ON   \xB7   RAINFALL %.0f%%   \xB7   WETNESS %.0f%%   \xB7   PUDDLES %.0f%%",
+                         cfg.rainfall * 100.0, cfg.wetness * 100.0,
+                         cfg.lightning > 0.0 ? cfg.lightning * 100.0 : cfg.puddles * 100.0);
             else
                 snprintf(readout, sizeof readout, "SNOW ON   \xB7   SNOWFALL %.0f%%   \xB7   WIND %.0f%%", cfg.snowfall * 100.0,
                          cfg.snowWind * 100.0);

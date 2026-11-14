@@ -651,18 +651,38 @@ void APIENTRY Hook_glTexParameterfv(GLenum target, GLenum pname, const GLfloat* 
 
 void APIENTRY Hook_glDepthMask(GLboolean flag)
 {
+    if (IsDumping())
+        DumpCall("glDepthMask(%s)", flag ? "on" : "OFF: see-through draws follow (dirt, dust, smoke)");
     NoteDepthMask(flag != GL_FALSE);
     real_glDepthMask(flag);
 }
 
+// (In the F10 dump: the switches that tell how a draw is blended and depth-tested.)
+const char* DumpedCapability(GLenum capability)
+{
+    switch (capability) {
+    case GL_BLEND: return "GL_BLEND";
+    case GL_DEPTH_TEST: return "GL_DEPTH_TEST";
+    case GL_CULL_FACE: return "GL_CULL_FACE";
+    case GL_ALPHA_TEST: return "GL_ALPHA_TEST";
+    default: return nullptr;
+    }
+}
+
 void APIENTRY Hook_glEnable(GLenum capability)
 {
+    if (IsDumping())
+        if (const char* name = DumpedCapability(capability))
+            DumpCall("glEnable(%s)", name);
     NoteCapability(capability, true);
     real_glEnable(capability);
 }
 
 void APIENTRY Hook_glDisable(GLenum capability)
 {
+    if (IsDumping())
+        if (const char* name = DumpedCapability(capability))
+            DumpCall("glDisable(%s)", name);
     NoteCapability(capability, false);
     real_glDisable(capability);
 }
