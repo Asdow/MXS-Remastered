@@ -506,6 +506,8 @@ struct Resources {
     Program rain;                                  // the rainfall (DrawRainfall; its vertex array is snowVao's kind)
     GLuint  rainVao = 0;
     bool    rainTried = false;
+    Program splash;                                // where it lands (DrawSplashes)
+    bool    splashTried = false;
 };
 Resources g_res;
 // The tire dirt's mask this frame (see BeginWheelMask).
@@ -5156,6 +5158,113 @@ bool MakeRainProgram()
     return false;
 }
 
+// Your headlight, for the drops and the splashes in its beam.
+void RainHeadlightUniforms(Program& p)
+{
+    g_gl.Uniform1f(p["u_headOn"], static_cast<float>(g_rainHead.strength));
+    if (g_rainHead.strength > 0.0) {
+        Vec(p, "u_headPos", g_rainHead.pos);
+        Vec(p, "u_headDir", g_rainHead.dir);
+        Vec(p, "u_headRight", g_rainHead.right);
+        Vec(p, "u_headUp", g_rainHead.up);
+        Vec(p, "u_headBeam", g_rainHead.beam);
+        g_gl.Uniform1f(p["u_headReach"], static_cast<float>(g_rainHead.reach));
+        Vec(p, "u_headColor", g_rainHead.colour);
+    }
+}
+
+// ---- WEATHER: the rain's splashes where it lands (see shaders::kSplashVertex) ----
+constexpr double kSplashBoxMetres = 24.0;    // the box of landing places that wraps round the camera
+constexpr int    kSplashesMax     = 9000;    // landing again and again, at 100%
+constexpr double kSplashMetres    = 0.05;    // a splash's half width (each 0.75 to 1.25 of it)
+constexpr double kSplashGuessMetres = 0.5;   // where the ground is first looked for: this far below the camera
+
+bool MakeSplashProgram()
+{
+    if (g_res.splashTried)
+        return g_res.splash.id != 0;
+    g_res.splashTried = true;
+    std::string error;
+    for (const char* version : { "#version 150\n", "#version 130\n" }) {
+        const GLuint vs = CompileShader(kVertexShader, version, shaders::kSplashVertex, nullptr, error);
+        if (!vs)
+            continue;
+        const GLuint fs = CompileShader(kFragmentShader, version, shaders::kSplashFragment, nullptr, error);
+        if (!fs) {
+            g_gl.DeleteShader(vs);
+            continue;
+        }
+        const GLuint program = g_gl.CreateProgram();
+        g_gl.AttachShader(program, vs);
+        g_gl.AttachShader(program, fs);
+        g_gl.LinkProgram(program);
+        g_gl.DeleteShader(vs);
+        g_gl.DeleteShader(fs);
+        GLint linked = 0;
+        g_gl.GetProgramiv(program, kLinkStatus, &linked);
+        if (!linked) {
+            g_gl.DeleteProgram(program);
+            continue;
+        }
+        g_res.splash.id = program;
+        Log("postfx: rain splashes ready (%s)", version[9] == '5' ? "GLSL 150" : "GLSL 130");
+        return true;
+    }
+    LogInfo("the rain's splashes couldn't be built (the rain still falls)", error);
+    return false;
+}
+
+// Into the HDR image, before the drops (which fall in front of them). colour: as the drops'.
+void DrawSplashes(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec3 colour, double now, int h)
+{
+    const Config& cfg = GetConfig();
+    const int splashes = static_cast<int>(kSplashesMax * cfg.rainfall);
+    if (splashes < 1 || !MakeRainProgram() || !MakeSplashProgram())  // (the rainfall's vertex array: no attributes)
+        return;
+    const double u = g_unitsPerMetre, box = kSplashBoxMetres * u;
+    const auto Wrap = [box](double v) { const double m = std::fmod(v, box); return m < 0 ? m + box : m; };
+    Vec3 east = Cross(up, Vec3{ 0, 0, 1 });
+    if (Length(east) < 0.1)
+        east = Cross(up, Vec3{ 1, 0, 0 });
+    east = Normalize(east);
+    const Vec3 north = Normalize(Cross(east, up));
+
+    Program& p = g_res.splash;
+    g_gl.UseProgram(p.id);
+    g_gl.BindVertexArray(g_res.rainVao);
+    float rotation[9];
+    for (int c = 0; c < 3; ++c)
+        for (int r = 0; r < 3; ++r)
+            rotation[c * 3 + r] = static_cast<float>(V[c * 4 + r]);
+    g_gl.UniformMatrix4fv(p["u_proj"], 1, GL_FALSE, g_m.proj);
+    g_gl.UniformMatrix4fv(p["u_invProj"], 1, GL_FALSE, g_m.invProj);
+    g_gl.UniformMatrix3fv(p["u_viewRot"], 1, GL_FALSE, rotation);
+    Vec(p, "u_up", up);
+    Vec(p, "u_east", east);
+    Vec(p, "u_north", north);
+    g_gl.Uniform2f(p["u_camPlane"], static_cast<float>(Wrap(Dot(eye, east))), static_cast<float>(Wrap(Dot(eye, north))));
+    g_gl.Uniform1f(p["u_box"], static_cast<float>(box));
+    g_gl.Uniform1f(p["u_time"], static_cast<float>(std::fmod(now, 1000.0)));
+    g_gl.Uniform1f(p["u_guess"], static_cast<float>(kSplashGuessMetres * u));
+    g_gl.Uniform1f(p["u_size"], static_cast<float>(kSplashMetres * u));
+    g_gl.Uniform1f(p["u_pixel"], static_cast<float>(2.0 / (std::fmax(std::fabs(P[5]), 1e-3) * h)));
+    g_gl.Uniform1f(p["u_metre"], static_cast<float>(u));
+    g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
+    Vec(p, "u_colour", colour);
+    RainHeadlightUniforms(p);
+    Bind(p, "u_depth", 0, g_res.depth);
+
+    g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
+    g_gl.Viewport(0, 0, g_res.hdr.w, g_res.hdr.h);
+    g_gl.Disable(GL_CULL_FACE);
+    g_gl.Enable(GL_BLEND);
+    g_gl.BlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);  // (premultiplied; the image's alpha kept)
+    g_gl.BlendEquationSeparate(kFuncAdd, kFuncAdd);
+    g_gl.DrawArrays(GL_TRIANGLES, 0, splashes * 6);
+    g_gl.Disable(GL_BLEND);
+    g_gl.BindVertexArray(g_res.vao);  // (the fullscreen triangle, for the passes after)
+}
+
 // Into the HDR image the composite just made, as the snowfall is. colour: a drop's, lit as the scene is.
 void DrawRainfall(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec3 colour, double now, double dt, int h)
 {
@@ -5213,16 +5322,7 @@ void DrawRainfall(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec
     g_gl.Uniform1f(p["u_metre"], static_cast<float>(u));
     g_gl.Uniform2f(p["u_texel"], g_m.texel[0], g_m.texel[1]);
     Vec(p, "u_colour", colour);
-    g_gl.Uniform1f(p["u_headOn"], static_cast<float>(g_rainHead.strength));
-    if (g_rainHead.strength > 0.0) {
-        Vec(p, "u_headPos", g_rainHead.pos);
-        Vec(p, "u_headDir", g_rainHead.dir);
-        Vec(p, "u_headRight", g_rainHead.right);
-        Vec(p, "u_headUp", g_rainHead.up);
-        Vec(p, "u_headBeam", g_rainHead.beam);
-        g_gl.Uniform1f(p["u_headReach"], static_cast<float>(g_rainHead.reach));
-        Vec(p, "u_headColor", g_rainHead.colour);
-    }
+    RainHeadlightUniforms(p);
     Bind(p, "u_depth", 0, g_res.depth);
 
     g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
@@ -5292,13 +5392,13 @@ void Render(int w, int h)
     const auto Wrap = [](double v) { const double m = std::fmod(v, 64.0); return m < 0 ? m + 64.0 : m; };
     const Vec3 camWrapped{ Wrap(eye.x), Wrap(eye.y), Wrap(eye.z) };
     // WEATHER: the light the snow is seen in (the time of day's, dim at night; a grey day's without it).
-    const bool snowOn = cfg.snow;
+    const bool snowOn = cfg.weather == kWeatherSnow;
     const double snowLight = tod ? std::fmax(sky.day, 0.03) * sky.exposure : 0.8;
     const Vec3 snowTint = tod ? sky.tint : Vec3{ 1.0, 1.0, 1.0 };
     const Vec3 snowFog{ 0.60 * snowTint.x * snowLight, 0.64 * snowTint.y * snowLight, 0.70 * snowTint.z * snowLight };
     const Vec3 flakeColour{ 0.86 * snowTint.x * snowLight, 0.89 * snowTint.y * snowLight, 0.94 * snowTint.z * snowLight };
     // Rain: a darker grey, and the drops lit by it.
-    const bool rainOn = cfg.rain;
+    const bool rainOn = cfg.weather == kWeatherRain;
     const Vec3 rainFog{ 0.36 * snowTint.x * snowLight, 0.38 * snowTint.y * snowLight, 0.41 * snowTint.z * snowLight };
     const Vec3 dropColour{ 0.62 * snowTint.x * snowLight, 0.66 * snowTint.y * snowLight, 0.72 * snowTint.z * snowLight };
     // (The bike shader's wet shine, proc_hooks PaintWet: in the game's own colours, before the
@@ -5582,8 +5682,10 @@ void Render(int w, int h)
     }
     if (snowOn && cfg.snowfall > 0.0 && depthOk)
         DrawSnowfall(V, P, eye, up, flakeColour, now, dt, h);
-    if (rainOn && cfg.rainfall > 0.0 && depthOk)
+    if (rainOn && cfg.rainfall > 0.0 && depthOk) {
+        DrawSplashes(V, P, eye, up, dropColour, now, h);
         DrawRainfall(V, P, eye, up, dropColour, now, dt, h);
+    }
     g_lastTerrainMask = g_frame.terrainSnapshot;
     const Target* current = &g_res.hdr;
     const auto Spare = [&current]() -> Target& { return current == &g_res.a ? g_res.b : g_res.a; };
@@ -6395,7 +6497,7 @@ bool FrameRenderedView(double rendered[16], double up[3])
 bool GetWetLook(WetLook& out)
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || !cfg.rain || !g_wetLook.valid || g_res.failed)
+    if (!cfg.shaders || cfg.weather != kWeatherRain || !g_wetLook.valid || g_res.failed)
         return false;
     out = g_wetLook;
     return true;
@@ -6412,7 +6514,7 @@ bool FrameRawView(double raw[16])
 bool WantsWheelMask()
 {
     const Config& cfg = GetConfig();
-    return cfg.shaders && cfg.tireDirt > 0.0 && g_frame.haveView && !g_res.failed && g_glState >= 0;
+    return cfg.shaders && TireCoat(cfg) > 0.0 && g_frame.haveView && !g_res.failed && g_glState >= 0;
 }
 
 int WheelMaskDraws(int i, float viewModels[][16], double axleLocals[][3], int max)
@@ -6644,7 +6746,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
 void TerrainPassDone()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0 && !cfg.snow && !cfg.rain) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
+    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0 && cfg.weather == kWeatherNone) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
         g_res.failed || !LoadGL())
         return;
     GLint drawFb = 0;
@@ -6963,7 +7065,7 @@ void MarksNewTrack()
 const char* TireStatusText()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.tireMarks <= 0.0 && cfg.tireDirt <= 0.0))
+    if (!cfg.shaders || (cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0))
         return "";
     return g_tireStatus;
 }

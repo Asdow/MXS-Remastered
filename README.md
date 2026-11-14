@@ -137,9 +137,18 @@ The HUD and menus are drawn after the effects, so they stay sharp and readable a
 
 ## Weather
 
-On the **WEATHER** tab (it needs the shaders on):
+On the **WEATHER** tab (it needs the shaders on), pick one weather with the **Weather** selector: **NONE**, **RAIN** or **SNOW**. Only the chosen weather's settings are shown under it.
 
-- **Snow**: turns snow on. The track turns white, with less snow on steep slopes and drifts across the ground, under a grey, overcast sky with soft light. Your ruts dig through it: pressed snow where a tire just rolled, grey slush deeper down and wet dirt at the bottom, with a lip of pushed-up snow along the edges. Only the ground gets snow, not the bikes or riders.
+**RAIN**: rain falls around you under a dark, overcast sky. The drops splash where they land, with a little crown of water and droplets on the ground (and on top of anything else they hit). The dirt soaks through and turns darker, puddles form on the track, and every bike, rider and their gear gets a wet shine.
+
+- **Rainfall**: how hard it rains. Drops streak past you as you ride, and they streak toward you when you ride into them. The rain also splashes on the ground, ripples the puddles and hazes the distance. At night, the drops and splashes in your headlight's beam light up. At 0% everything stays wet but nothing falls.
+- **Wind**: how hard the wind blows the rain sideways.
+- **Wetness**: how wet everything looks. It controls how dark the soaked dirt gets, the sheen on the ground toward the distance, and the shine and water beads on bikes, riders and gear.
+- **Puddles**: how much standing water there is: puddles on the flat parts of the track, and water in the deepest ruts.
+- **Reflections**: how strongly the puddles and the wet ground reflect the sky and whatever stands near them (bikes, riders, trees, banners). Puddles are darker seen from straight above and turn into mirrors toward the distance, like real water.
+
+**SNOW**: the track turns white, with less snow on steep slopes and drifts across the ground, under a grey, overcast sky with soft light. Your ruts dig through it: pressed snow where a tire just rolled, grey slush deeper down and wet dirt at the bottom, with a lip of pushed-up snow along the edges. The tires get packed with snow too, even with Tire dirt off. The rest of the bike and the riders stay clean.
+
 - **Snowfall**: how heavily it snows. Flakes fall all around you and fly past as you ride, and they haze the distance. At 0% the snow stays on the ground and nothing falls.
 - **Wind**: how hard the wind blows the falling snow sideways.
 

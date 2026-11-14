@@ -142,7 +142,7 @@ bool Enabled()
     const Config& cfg = GetConfig();
     // (Tire dirt watches them whatever else is on: the mud goes only on meshes seen turning like a
     // wheel - see PaintTireDirt.)
-    return cfg.tireMarks > 0.0 || cfg.tireDirt > 0.0 ||
+    return cfg.tireMarks > 0.0 || TireCoat(cfg) > 0.0 ||
            (cfg.headlightEveryBike && cfg.headlight > 0.0 && cfg.timeOfDay >= 0.0);
 }
 

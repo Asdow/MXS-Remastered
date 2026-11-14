@@ -382,13 +382,14 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Graphics",  L"MotionBlur",           c.motionBlur },
         { L"Graphics",  L"DepthOfField",         c.depthOfField },
         { L"Graphics",  L"DofFocus",             c.dofFocus },
-        { L"Weather",   L"Rain",                 c.rain ? 1.0 : 0.0 },
+        { L"Weather",   L"Weather",              static_cast<double>(c.weather) },
+        { L"Weather",   L"Rain",                 c.weather == kWeatherRain ? 1.0 : 0.0 },  // (for older versions)
         { L"Weather",   L"Rainfall",             c.rainfall },
         { L"Weather",   L"RainWind",             c.rainWind },
         { L"Weather",   L"Wetness",              c.wetness },
         { L"Weather",   L"Puddles",              c.puddles },
         { L"Weather",   L"Reflections",          c.rainReflections },
-        { L"Weather",   L"Snow",                 c.snow ? 1.0 : 0.0 },
+        { L"Weather",   L"Snow",                 c.weather == kWeatherSnow ? 1.0 : 0.0 },  // (for older versions)
         { L"Weather",   L"Snowfall",             c.snowfall },
         { L"Weather",   L"Wind",                 c.snowWind },
         { L"Other",     L"HideHud",              c.hideHud ? 1.0 : 0.0 },
@@ -582,13 +583,12 @@ void CopyTunables(const Config& from, Config& to)
     to.headlightEveryBike   = from.headlightEveryBike;
     to.headlightColor       = from.headlightColor;
     to.ultraGraphics        = from.ultraGraphics;
-    to.rain                 = from.rain;
+    to.weather              = from.weather;
     to.rainfall             = from.rainfall;
     to.rainWind             = from.rainWind;
     to.wetness              = from.wetness;
     to.puddles              = from.puddles;
     to.rainReflections      = from.rainReflections;
-    to.snow                 = from.snow;
     to.snowfall             = from.snowfall;
     to.snowWind             = from.snowWind;
     to.tireDirt             = from.tireDirt;
@@ -859,13 +859,18 @@ Config ParseConfig(const Config& base)
     c.headlightEveryBike = ReadInt(L"Graphics", L"HeadlightEveryBike", c.headlightEveryBike) != 0;
     c.headlightColor   = Clamp(ReadInt(L"Graphics", L"HeadlightColor", c.headlightColor), 0, 2);
     c.ultraGraphics    = ReadInt(L"Graphics", L"UltraGraphics", c.ultraGraphics) != 0;
-    c.rain             = ReadInt(L"Weather", L"Rain", c.rain) != 0;
+    // One weather at a time; an ini from before it was chosen this way: its Snow (any amount it was a
+    // slider for: on) or its Rain.
+    c.weather          = ReadInt(L"Weather", L"Weather", -1);
+    if (c.weather < 0)
+        c.weather = ReadDouble(L"Weather", L"Snow", 0.0) > 0.0 ? kWeatherSnow
+                  : ReadInt(L"Weather", L"Rain", 0) != 0   ? kWeatherRain : kWeatherNone;
+    c.weather          = Clamp(c.weather, 0, 2);
     c.rainfall         = Clamp(ReadDouble(L"Weather", L"Rainfall", c.rainfall), 0.0, 1.0);
     c.rainWind         = Clamp(ReadDouble(L"Weather", L"RainWind", c.rainWind), 0.0, 1.0);
     c.wetness          = Clamp(ReadDouble(L"Weather", L"Wetness", c.wetness), 0.0, 1.0);
     c.puddles          = Clamp(ReadDouble(L"Weather", L"Puddles", c.puddles), 0.0, 1.0);
     c.rainReflections  = Clamp(ReadDouble(L"Weather", L"Reflections", c.rainReflections), 0.0, 1.0);
-    c.snow             = ReadDouble(L"Weather", L"Snow", c.snow ? 1.0 : 0.0) > 0.0;  // (any amount it was a slider for: on)
     c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
     c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);

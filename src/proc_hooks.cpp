@@ -2005,9 +2005,18 @@ constexpr char kMudFragmentApply[] =
     "\t\tmx_cover = max(mx_cover, (1.0 - mx_rubber) * 0.3 * u_mx_mud * smoothstep(0.5, 0.75, mx_n));\n"
     "\t\tvec3 mx_mud = mix(vec3(0.24, 0.18, 0.13), vec3(0.37, 0.29, 0.21), mx_noise(mx_q * 0.45 + 3.0));\n"
     "\t\tif (u_mx_snow > 0.0) {\n"
-    "\t\t\tfloat mx_fleck = smoothstep(0.82, 0.88, mx_noise(mx_q * 3.3 + 11.0));\n"
-    "\t\t\tfloat mx_lump = smoothstep(0.88, 0.93, mx_noise(mx_q * 1.2 + 23.0));\n"
-    "\t\t\tmx_mud = mix(mx_mud, vec3(0.86, 0.88, 0.92), max(mx_fleck, mx_lump) * 0.85);\n"
+    // Snow: packed into the tread, a grey-white crust - thicker in places, thinner in others, with a
+    // fine grain of its own. The tire's own shape keeps it from being one flat coat: the knobs' sides
+    // and edges (where its normal map turns the surface away from the tire's own) shed it and show
+    // the dark rubber, outlining each knob; and the knobs' shading comes through it (lit by the
+    // normal-mapped light, as the rubber was). A dusting on the rim and spokes. No flecks.
+    "\t\t\tfloat mx_relief = 1.0 - clamp(dot(n, normalize(interp_normal)), 0.0, 1.0);\n"
+    "\t\t\tfloat mx_grain = mx_noise(mx_q * 4.0 + 17.0) * 0.6 + mx_noise(mx_q * 9.0 + 29.0) * 0.4;\n"
+    "\t\t\tfloat mx_thick = smoothstep(0.25, 0.75, mx_noise(mx_q * 0.8 + 5.0) * 0.6 + mx_n * 0.4);\n"
+    "\t\t\tfloat mx_tex = clamp(dot(mx_albedo.rgb, vec3(0.2126, 0.7152, 0.0722)) * 2.5, 0.0, 1.0);\n"
+    "\t\t\tmx_mud = vec3(0.60, 0.62, 0.66) * (0.7 + 0.15 * mx_thick + 0.25 * mx_grain + 0.15 * mx_tex);\n"
+    "\t\t\tmx_cover = mx_rubber * (0.4 + 0.42 * mx_thick) * (0.75 + 0.25 * mx_grain) * (1.0 - smoothstep(0.03, 0.2, mx_relief));\n"
+    "\t\t\tmx_cover = max(mx_cover, (1.0 - mx_rubber) * 0.25 * smoothstep(0.45, 0.75, mx_n));\n"
     "\t\t}\n"
     "\t\tcolor.rgb = mix(color.rgb, mx_mud * (u_ambient.rgb + u_diffuse.rgb * ndl), mx_cover);\n"
     "\t}\n";
@@ -3487,12 +3496,13 @@ void PaintTireDirt(const DrawCall& draw)
     // Every bike's tires (Config::marksEveryBike): every draw of a mesh the lobby's wheels found to be a
     // wheel (lobby_wheels.h), whoever's bike, whatever its model. The mud is worked out in the tire's
     // own model and its own texture's rubber, so nothing else about the wheel is needed.
-    if (cfg.shaders && cfg.tireDirt > 0.0 && cfg.marksEveryBike) {
+    const double coat = TireCoat(cfg);  // (the mud, or in the snow, packed snow)
+    if (cfg.shaders && coat > 0.0 && cfg.marksEveryBike) {
         const auto element = g_elementBuffers.find(g_vao);
         if (lobby::IsWheel(g_program, g_vao, element != g_elementBuffers.end() ? element->second : 0, draw))
-            want = static_cast<float>(cfg.tireDirt);
+            want = static_cast<float>(coat);
     }
-    if (want == 0.0f && cfg.shaders && cfg.tireDirt > 0.0 && !g_paintParts.empty() && postfx::FrameRawView(raw) && mv != g_programModelview.end() &&
+    if (want == 0.0f && cfg.shaders && coat > 0.0 && !g_paintParts.empty() && postfx::FrameRawView(raw) && mv != g_programModelview.end() &&
         mv->second.frame == g_frameNumber) {
         const DeferredCaster id = MakeCaster(draw, -1, -1);
         double invRaw[16];
@@ -3537,16 +3547,16 @@ void PaintTireDirt(const DrawCall& draw)
                             wheelMesh ? "" : ": not seen turning like a wheel");
                     }
                     if (wheelMesh) {
-                        want = static_cast<float>(cfg.tireDirt);
+                        want = static_cast<float>(coat);
                         break;
                     }
                 }
             }
         }
     }
-    // (WEATHER: with snow on, flecks of it in the mud. Kept with the mud's amount, so turning the snow
-    // on or off sends it again as well.)
-    const float snow = want > 0.0f && cfg.snow ? 1.0f : 0.0f;
+    // (WEATHER: with snow on, packed snow over the tire instead of the mud. Kept with the mud's amount,
+    // so turning the snow on or off sends it again as well.)
+    const float snow = want > 0.0f && cfg.weather == kWeatherSnow ? 1.0f : 0.0f;
     const float key = want + snow * 10.0f;
     float& set = g_mudSet[g_program];
     if (key != set) {

@@ -16,6 +16,8 @@ namespace mxcam {
 // re-press adds about 2 bytes a segment of boxes on top.
 constexpr unsigned long long kMarkSegBytes = 48;
 
+constexpr int kWeatherNone = 0, kWeatherRain = 1, kWeatherSnow = 2;
+
 struct Config {
     // [General]
     bool   enabled   = true;
@@ -133,10 +135,11 @@ struct Config {
     double headlightHeight  = -0.45;      // m: the same, up the bike (negative = below the eyes)
     double headlightAimDeg  = 0.0;        // where the beam's top edge is aimed, degrees above level (up: it
                                           // reaches further ahead; down: nearer)
-    // WEATHER (postfx: the composite pass and the snowfall pass)
-    bool   rain             = false;      // rain: drops falling around you, wet ground and bikes, puddles, a
-                                          // dark overcast sky (postfx: the composite, the rainfall pass; the
-                                          // bike shader's wet shine, proc_hooks PaintWet)
+    // WEATHER (postfx: the composite pass and the rainfall / snowfall passes). One at a time:
+    int    weather          = 0;          // kWeatherNone, kWeatherRain (drops falling around you and splashing
+                                          // on the ground, wet ground and bikes, puddles, a dark overcast sky;
+                                          // the bike shader's wet shine, proc_hooks PaintWet) or kWeatherSnow
+                                          // (snow on the ground, your ruts dig through it; an overcast sky)
     double rainfall         = 0.6;        // 0..1 how hard it rains (the drops around you, the ripples in the
                                           // puddles, the haze in the distance); 0: wet, nothing falling
     double rainWind         = 0.15;       // 0..1 how hard the wind blows the rain sideways
@@ -146,8 +149,6 @@ struct Config {
                                           // the deepest ruts
     double rainReflections  = 0.8;        // 0..1 how strongly the puddles and wet surfaces reflect (the sky,
                                           // and what's on screen: bikes, trees, the track's banners)
-    bool   snow             = false;      // snow on the ground (terrain only; your ruts dig through it to the
-                                          // dirt) and an overcast sky; off = no weather
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
     double snowWind         = 0.2;        // 0..1 how hard the wind blows the falling snow
     bool   ultraGraphics    = false;      // more ground detail, further out, lit more strongly (postfx Dirt)
@@ -219,6 +220,13 @@ void SetEnabled(bool enabled);
 
 // The shadow map's texels per side, from the Shadow resolution choice as it is now (a change in
 // the menu applies straight away, without reloading the ini).
+// How much your tires are coated (what the tire dirt's drawing does): the Tire dirt setting's mud, or
+// in the snow, packed snow all over them whatever that's set to.
+inline double TireCoat(const Config& c)
+{
+    return c.weather == kWeatherSnow ? 1.0 : c.tireDirt;
+}
+
 inline int ShadowMapSize(const Config& c)
 {
     return 2048 << (c.shadowResolution < 0 ? 0 : c.shadowResolution > 2 ? 2 : c.shadowResolution);

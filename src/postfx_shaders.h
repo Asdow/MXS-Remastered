@@ -1333,6 +1333,197 @@ void main()
 }
 )GLSL";
 
+// ---- Splashes (WEATHER): where the rain lands, drawn into the HDR image with the rainfall ----
+// Each of u_count slots is a drop landing again and again (6 vertices of a quad from gl_VertexID):
+// every so often at a new place in a box of u_box around you, across the ground (the box wraps round
+// the camera, so a splash stays where it landed as you ride past). What it lands on is found in the
+// scene's depth: from a first guess below the camera, the surface on screen straight through it,
+// then again at that surface's height, until the two agree - the ground, or the top of whatever
+// stands on it (a bike's seat, a banner). Nothing found (off screen, the sky, behind something
+// nearer): no splash this time. Then a little crown of water rises round the spot and falls back,
+// throwing a few droplets out, in a fifth of a second.
+constexpr const char* kSplashVertex = R"GLSL(
+uniform sampler2D u_depth;   // the scene's
+uniform mat4  u_proj, u_invProj;
+uniform mat3  u_viewRot;     // world -> view (rotation)
+uniform vec3  u_up, u_east, u_north;  // world: up, and two directions across the ground
+uniform vec2  u_camPlane;    // the camera along u_east / u_north, wrapped to the box
+uniform float u_box;         // the box's size, game units
+uniform float u_time;        // s
+uniform float u_guess;       // the first guess at the ground: this far below the camera, game units (less
+                             // than it really is: the ray through a point above the ground meets it beyond)
+uniform vec2  u_texel;       // 1 / the depth's size
+uniform float u_size;        // a splash's half width, game units
+uniform float u_pixel;       // game units per pixel at one unit away
+uniform float u_metre;
+uniform vec3  u_colour;      // lit as the weather lights the scene
+uniform float u_headOn;      // your headlight (as the rainfall's)
+uniform vec3  u_headPos, u_headDir, u_headRight, u_headUp;
+uniform vec3  u_headBeam;
+uniform float u_headReach;
+uniform vec3  u_headColor;
+out vec2  v_q;               // across the splash (-1..1), up it (0 at the ground, 1 at the top)
+out float v_life;            // 0..1 through its fifth of a second
+out float v_alpha;
+out float v_z;
+out vec3  v_light;
+out vec4  v_seed;
+
+uint Hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+float Random(uint s, uint k) { return float(Hash(s * 8u + k) & 0xffffffu) / 16777216.0; }
+
+vec3 SurfaceAt(vec2 uv, out bool sky)
+{
+    float d = textureLod(u_depth, uv, 0.0).r;
+    sky = d >= 0.999999;
+    vec4 p = u_invProj * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+    return p.xyz / p.w;
+}
+
+void main()
+{
+    int slot = gl_VertexID / 6, corner = gl_VertexID - slot * 6;
+    vec2 c = vec2((corner == 1 || corner == 2 || corner == 4) ? 1.0 : -1.0,
+                  (corner == 2 || corner == 4 || corner == 5) ? 1.0 : 0.0);
+    uint id = uint(slot);
+    float qy = c.y * 1.15 - 0.15;
+    v_q = vec2(c.x, qy);
+    v_alpha = 0.0;
+    v_life = 1.0;
+    v_z = 1.0;
+    v_light = u_colour;
+    v_seed = vec4(0.5);
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);  // (nothing: outside the screen)
+    float period = 0.4 + 0.4 * Random(id, 0u);
+    float t = u_time / period + Random(id, 1u);
+    float landing = floor(t);
+    float life = (t - landing) * period / (0.15 + 0.08 * Random(id, 2u));
+    if (life >= 1.0)
+        return;
+    uint k = Hash(id * 4099u + uint(landing) * 7919u);  // this landing's own
+    vec2 rel = (fract((vec2(Random(k, 0u), Random(k, 1u)) * u_box - u_camPlane) / u_box + 0.5) - 0.5) * u_box;
+    vec3 across = u_east * rel.x + u_north * rel.y;
+    mat3 toWorld = transpose(u_viewRot);
+    float h = -u_guess;
+    vec3 at = vec3(0.0);
+    vec2 atUv = vec2(0.0);
+    bool found = false;
+    for (int i = 0; i < 4; ++i) {
+        vec3 v = u_viewRot * (across + u_up * h);
+        if (v.z > -0.3 * u_metre)
+            return;
+        vec4 cl = u_proj * vec4(v, 1.0);
+        vec2 uv = cl.xy / cl.w * 0.5 + 0.5;
+        if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
+            return;
+        bool sky;
+        vec3 s = toWorld * SurfaceAt(uv, sky);  // from the camera, world directions
+        if (sky)
+            return;
+        float sh = dot(s, u_up);
+        if (i > 0 && length(s - u_up * sh - across) < 0.06 * u_metre + 0.01 * length(s)) {
+            at = s;
+            atUv = uv;
+            found = true;
+            break;
+        }
+        h = sh;
+    }
+    if (!found)
+        return;
+    // Only on what faces up (the ground, a seat, a roof): on a wall, the search matches anywhere up it.
+    {
+        bool skyX, skyY, skyC;
+        vec3 c0 = SurfaceAt(atUv, skyC);
+        vec3 nv = cross(SurfaceAt(atUv + vec2(2.0 * u_texel.x, 0.0), skyX) - c0, SurfaceAt(atUv + vec2(0.0, 2.0 * u_texel.y), skyY) - c0);
+        if (skyX || skyY || abs(dot(normalize(toWorld * nv), u_up)) < 0.75)
+            return;
+    }
+    vec3 va = u_viewRot * at;
+    float z = -va.z;
+    vec3 upV = u_viewRot * u_up;
+    vec3 right = cross(upV, normalize(-va));
+    float rl = length(right);
+    right = rl > 1e-4 ? right / rl : vec3(1.0, 0.0, 0.0);
+    float w = u_size * (0.75 + 0.5 * Random(k, 2u));
+    float shown = max(w, 1.0 * u_pixel * z);
+    v_alpha = (w / shown) * 0.85
+            * smoothstep(0.6 * u_metre, 1.5 * u_metre, z)
+            * (1.0 - smoothstep(0.35 * u_box, 0.5 * u_box, length(rel)));
+    v_life = life;
+    v_z = z;
+    v_seed = vec4(Random(k, 3u), Random(k, 4u), Random(k, 5u), Random(k, 6u));
+    vec3 v = va + right * (c.x * shown) + upV * (qy * shown * 1.1);
+    v_light = u_colour * 1.3;
+    if (u_headOn > 0.0) {
+        vec3 q = va - u_headPos;
+        float d = length(q), ahead = dot(q, u_headDir);
+        if (ahead > 0.0 && d < 70.0 * u_headReach) {
+            vec2 e = vec2(atan(dot(q, u_headRight), ahead) / u_headBeam.x,
+                          (atan(-dot(q, u_headUp), ahead) - u_headBeam.y) / u_headBeam.z);
+            float cone = smoothstep(1.0, 0.45, length(e)) + 0.3 * smoothstep(2.0, 0.8, length(e));
+            float reach = 1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach));
+            v_light += u_headColor * (cone * reach * u_headOn * 3.0);
+        }
+    }
+    v_z = -v.z;
+    gl_Position = u_proj * vec4(v, 1.0);
+}
+)GLSL";
+
+constexpr const char* kSplashFragment = R"GLSL(
+uniform sampler2D u_depth;   // the scene's
+uniform mat4  u_invProj;
+uniform vec2  u_texel;
+uniform float u_metre;
+in vec2  v_q;
+in float v_life;
+in float v_alpha;
+in float v_z;
+in vec3  v_light;
+in vec4  v_seed;
+out vec4 o_color;
+
+void main()
+{
+    if (v_alpha < 0.003)
+        discard;
+    float t = v_life;
+    // The hit: a flat flash on the surface, spreading and gone in the first third.
+    float flash = exp(-v_q.x * v_q.x / (0.03 + 0.3 * t) - v_q.y * v_q.y / 0.003) * (1.0 - smoothstep(0.0, 0.35, t));
+    // The crown: a thin sheet of water round the spot, flaring outward as it rises, then falling back.
+    float top = (0.1 + 0.55 * sqrt(t)) * (1.0 - t);
+    float flare = 0.1 + 0.4 * t + 0.8 * max(v_q.y, 0.0);
+    float wall = exp(-pow((abs(v_q.x) - flare) / 0.06, 2.0)) * smoothstep(top + 0.04, top - 0.03, v_q.y) *
+                 smoothstep(-0.08, 0.0, v_q.y);
+    // The droplets it throws: six, up and out in arcs, falling back.
+    float drops = 0.0;
+    for (int k = 0; k < 6; ++k) {
+        float r1 = fract(v_seed[k & 3] * 7.31 + float(k) * 0.618), r2 = fract(v_seed[(k + 1) & 3] * 3.17 + float(k) * 0.382);
+        float side = (k & 1) == 0 ? -1.0 : 1.0;
+        float angle = 0.35 + 1.0 * r1;                 // above the ground: 20 to 77 degrees
+        float speed = 1.3 + 1.2 * r2;
+        vec2 at = vec2(side * cos(angle), sin(angle)) * (speed * t) - vec2(0.0, 2.6 * t * t);
+        vec2 dq = v_q - vec2(at.x, max(at.y, 0.0) + 0.02);
+        drops += exp(-dot(dq, dq) / 0.0022) * step(-0.02, at.y);
+    }
+    float a = clamp(flash * 0.5 + wall * 0.4 + drops * 0.8, 0.0, 1.0) * pow(1.0 - t, 1.2) * v_alpha;
+    float d = texture(u_depth, gl_FragCoord.xy * u_texel).r;
+    if (d < 0.999999) {  // softly behind what's nearer (the splash's foot sits on the ground itself)
+        float n = d * 2.0 - 1.0;
+        float sceneZ = -(u_invProj[2][2] * n + u_invProj[3][2]) / (u_invProj[2][3] * n + u_invProj[3][3]);
+        a *= clamp((sceneZ - v_z + 0.12 * u_metre) / (0.06 * u_metre + 0.01 * v_z), 0.0, 1.0);
+    }
+    o_color = vec4(v_light * a, a);  // premultiplied
+}
+)GLSL";
+
 // ---- Snowfall (WEATHER): flakes around the camera, drawn into the HDR image after the composite ----
 // No buffers: each flake is 6 vertices of a quad, made from gl_VertexID. Every flake has its own
 // place in a box of u_box around the world (its corner a multiple of u_box), drifting with the wind

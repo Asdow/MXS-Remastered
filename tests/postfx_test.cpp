@@ -1358,6 +1358,8 @@ int main(int argc, char** argv)
         }
         Check(log.find("postfx: rainfall ready") != std::string::npos && log.find("rainfall couldn't be built") == std::string::npos,
               "the rainfall's shaders compile");
+        Check(log.find("postfx: rain splashes ready") != std::string::npos && log.find("splashes couldn't be built") == std::string::npos,
+              "the splashes' shaders compile");
         Check(log.find("carries the wet shine") != std::string::npos, "the bike shader carries the wet shine");
         Check(log.find("shader failed") == std::string::npos, "every effect's shader compiles with the rain in it");
     } else if (mode == "night") {
