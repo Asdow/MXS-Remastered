@@ -397,6 +397,7 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Weather",   L"Lightning",            c.lightning },
         { L"Weather",   L"LightningSound",       c.lightningSound },
         { L"Weather",   L"Snow",                 c.weather == kWeatherSnow ? 1.0 : 0.0 },  // (for older versions)
+        { L"Weather",   L"SnowAmount",           c.snowAmount },
         { L"Weather",   L"Snowfall",             c.snowfall },
         { L"Weather",   L"Wind",                 c.snowWind },
         { L"Weather",   L"SnowSound",            c.snowSound },
@@ -602,6 +603,7 @@ void CopyTunables(const Config& from, Config& to)
     to.screenDrops          = from.screenDrops;
     to.lightning            = from.lightning;
     to.lightningSound       = from.lightningSound;
+    to.snowAmount           = from.snowAmount;
     to.snowfall             = from.snowfall;
     to.snowWind             = from.snowWind;
     to.snowSound            = from.snowSound;
@@ -893,6 +895,7 @@ Config ParseConfig(const Config& base)
     c.screenDrops      = Clamp(ReadDouble(L"Weather", L"ScreenDrops", c.screenDrops), 0.0, 1.0);
     c.lightning        = Clamp(ReadDouble(L"Weather", L"Lightning", c.lightning), 0.0, 1.0);
     c.lightningSound   = Clamp(ReadDouble(L"Weather", L"LightningSound", c.lightningSound), 0.0, 1.0);
+    c.snowAmount       = Clamp(ReadDouble(L"Weather", L"SnowAmount", c.snowAmount), 0.0, 1.0);
     c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
     c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
     c.snowSound        = Clamp(ReadDouble(L"Weather", L"SnowSound", c.snowSound), 0.0, 1.0);

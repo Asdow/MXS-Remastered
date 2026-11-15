@@ -163,6 +163,7 @@ uniform sampler2D u_depth;
 uniform sampler2D u_terrainDepth;
 uniform sampler2D u_light;      // half resolution: AO, sun
 uniform sampler2D u_detail;     // tiling dirt detail: normal xy, height, albedo
+uniform sampler2D u_snowPuffs;  // tiling snow clumps: normal xy, height (MakeSnowPuffTexture)
 uniform vec2  u_halfTexel;
 uniform float u_depthOk;        // depth and projection known: depth-based effects possible
 uniform float u_lightOn;
@@ -177,9 +178,9 @@ uniform float u_ultra;          // Config::ultraGraphics: the ground's detail fu
 // pixel's offset from it, and a pattern's phase can't be taken from that: it jumped at every wrap,
 // the whole ground's texture changing under you every 20 m. Each pattern's phase at the camera's
 // true position comes from the CPU instead, in double precision, as its whole part and fraction.
-uniform float u_freq[14];
-uniform vec3  u_phaseI[14];
-uniform vec3  u_phaseF[14];
+uniform float u_freq[20];
+uniform vec3  u_phaseI[20];
+uniform vec3  u_phaseF[20];
 uniform float u_haveTerrain;
 uniform sampler2D u_markMap;    // tire marks on the ground (see postfx.cpp: TireMarks)
 uniform float u_marks;          // 0 = off
@@ -236,6 +237,7 @@ uniform vec3  u_headBeam;       // radians: the beam's half-width, the middle of
 uniform vec3  u_headColor;      // the light's colour (white or amber, Config::headlightAmber)
 uniform float u_headReach;      // how far it reaches (1 = level; more aimed up, less aimed down)
 uniform float u_snow;           // WEATHER: 0..1 snow on the ground and an overcast sky (0: no weather)
+uniform float u_snowAmount;     // how much of it lies on the ground (Config::snowAmount: 0.75 the snow as it was made)
 uniform float u_overcast;       // WEATHER: 0..1 how overcast the sky is (snow or rain)
 uniform float u_weatherHaze;    // 0..1 the haze the falling snow or rain makes in the distance
 uniform vec3  u_weatherFog;     // that haze's colour (as bright as the light of the time of day)
@@ -374,7 +376,9 @@ vec2 LightAt(vec2 uv, float z)
 // Which pattern (u_freq / u_phase*).
 const int kPatternDirt = 0, kPatternDirtFine = 1, kPatternClods = 2, kPatternPatches = 3, kPatternPatchesWide = 4,
           kPatternRutFloor = 5, kPatternRutClods = 6, kPatternRutCrumbs = 7, kPatternDrifts = 8, kPatternDriftsFine = 9,
-          kPatternSnow = 10, kPatternPuddles = 11, kPatternPuddlesFine = 12, kPatternRipples = 13;
+          kPatternSnow = 10, kPatternPuddles = 11, kPatternPuddlesFine = 12, kPatternRipples = 13,
+          kPatternSnowPuffs = 14, kPatternSnowClumps = 15, kPatternSnowGrain = 16, kPatternSnowWarp = 17,
+          kPatternSnowWaves = 18, kPatternSnowRipple = 19;
 
 // wp (the shader's world position: the wrapped camera plus the pixel's offset) times pattern k's
 // frequency: its fraction-carrying part, small and exact - the pixel's offset scaled, plus the
@@ -637,32 +641,54 @@ vec2 RutStatsAt(vec3 p)
     return MarkStatsNear(t) * (smoothstep(0.0, MarkBlend(), inNear) * u_marks);
 }
 
-// The snow's own relief, as a normal to light it by: ripples the wind laid across it (about every
-// 35 cm, wavering), soft lumps a couple of metres across and its fine grain (the detail texture, read
-// flat on the ground at two sizes). Faint, and gone into the distance, where it would only shimmer.
-vec3 SnowNormal(vec3 n, vec3 wp, vec3 dwx, vec3 dwy, float z)
+// Puffs of fresh snow (u_snowPuffs: round soft clumps of many sizes, overlapping), pattern k over the
+// ground (placed by PatternPos, as the dirt's are: from the wrapped camera they jumped every 64
+// units as you rode): its slopes (xy) and how deep in a crease between clumps this is (z).
+vec3 SnowPuffs(vec3 wp, vec3 dwx, vec3 dwy, int k, vec2 shift)
 {
-    vec3 ax = normalize(cross(u_up, vec3(0.0, 0.0, 1.0)));
-    vec3 az = cross(ax, u_up);
-    vec2 g = vec2(dot(wp, ax), dot(wp, az)) / u_metre;  // metres across the ground
-    vec2 gx = vec2(dot(dwx, ax), dot(dwx, az)) / u_metre, gy = vec2(dot(dwy, ax), dot(dwy, az)) / u_metre;
+    float s = u_freq[k];
+    vec4 t = textureGrad(u_snowPuffs, PatternPos(wp, k).xz + shift, dwx.xz * s, dwy.xz * s);
+    return vec3(t.rg * 2.0 - 1.0, 1.0 - smoothstep(0.12, 0.45, t.b));
+}
+
+// The snow's own relief, as a normal to light it by: ripples the wind laid across it (about every
+// 35 cm, wavering, faint), and its puffs at two sizes (clumps about 20 cm across, and finer ones up
+// close). crease: how deep in the creases between them this is; grain: its fine powdery grain up
+// close (-0.5..0.5). Faded flat into the distance, where it would only shimmer.
+vec3 SnowNormal(vec3 n, vec3 wp, vec3 dwx, vec3 dwy, float z, out float crease, out float grain)
+{
+    crease = 0.0;
+    grain = 0.0;
+    // (World x and z across the ground, as every ground pattern's .xz: placed by PatternPos.)
+    vec3 ax = vec3(1.0, 0.0, 0.0), az = vec3(0.0, 0.0, 1.0);
     float fade = 1.0 - smoothstep(15.0, 50.0, z / u_metre);
     if (fade <= 0.0)
         return n;
+    // The ripples: across (4, 3)/5, so the camera's whole part of their phase is a whole number of them.
     vec2 across = vec2(0.8, 0.6);
-    float warp = ValueNoise(vec3(g * 0.45, 0.0)) * 6.0;
-    float strength = 0.4 + 0.6 * ValueNoise(vec3(g * 0.18, 3.0));
-    vec2 slope = across * (cos(dot(g, across) * 18.0 + warp) * 0.05 * strength);
-    vec2 lumps = textureGrad(u_detail, g * 0.4, gx * 0.4, gy * 0.4).rg * 2.0 - 1.0;
-    vec2 grain = textureGrad(u_detail, g * 3.1, gx * 3.1, gy * 3.1).rg * 2.0 - 1.0;
-    slope += lumps * 0.16 + grain * 0.06 * (1.0 - smoothstep(4.0, 12.0, z / u_metre));
+    float warp = PatternNoise(wp, kPatternSnowWarp) * 6.0;
+    float strength = 0.4 + 0.6 * PatternNoise(wp, kPatternSnowWaves);
+    float ripple = dot(PatternPos(wp, kPatternSnowRipple).xz, vec2(4.0, 3.0));
+    vec2 slope = across * (cos(6.2831853 * ripple + warp) * 0.03 * strength);
+    float near = 1.0 - smoothstep(4.0, 14.0, z / u_metre);
+    // (Softer further out, where the same mounds over and over read as a pattern.)
+    float far = 1.0 - 0.6 * smoothstep(6.0, 25.0, z / u_metre);
+    vec3 big = SnowPuffs(wp, dwx, dwy, kPatternSnowPuffs, vec2(0.0));     // soft pillows ~half a metre across
+    vec3 small = SnowPuffs(wp, dwx, dwy, kPatternSnowClumps, vec2(0.37, 0.71));  // and smaller clumps on them, ~12 cm
+    slope += (big.xy * 0.33 + small.xy * 0.12 * near) * far;
+    crease = (big.z * 0.18 + small.z * 0.05 * near) * fade * far;
+    // Its powdery grain up close (the detail texture's fine tone, small: never dashes or glints).
+    float sg = u_freq[kPatternSnowGrain];
+    grain = (textureGrad(u_detail, PatternPos(wp, kPatternSnowGrain).xz, dwx.xz * sg, dwy.xz * sg).a - 0.5) *
+            (1.0 - smoothstep(3.0, 10.0, z / u_metre));
     slope *= fade;
     return normalize(n - ax * slope.x - az * slope.y);
 }
 
-// Snow on the ground (WEATHER): white, a little blue in it, thinner on steep slopes and in drifts
-// that come and go over the ground, its own ripples and lumps lit by the sun (the faces turned from
-// it a little bluer: the sky lights them). The ground's own shading (its baked light: the shadows of
+// Snow on the ground (WEATHER): a soft white, a little blue in it (not a glaring one: it was hard on
+// the eyes), thinner on steep slopes and in drifts that come and go over the ground, in puffs - its
+// clumps lit by the sun (the faces turned from it a little bluer: the sky lights them), the creases
+// between them shaded and bluer still. The ground's own shading (its baked light: the shadows of
 // trees) carries over gently. A rut through it is laid out by how deep it was dug: packed snow where
 // a tire only pressed it, grey slush deeper, where snow and dirt were churned together, and the wet
 // dirt itself at the bottom; along its edges, a lip of the snow it pushed aside. cover: how much of
@@ -671,22 +697,29 @@ vec3 Snow(vec3 c, vec3 wp, vec3 dwx, vec3 dwy, vec3 n, float z, float ground, ve
 {
     float upright = smoothstep(0.35, 0.8, dot(n, u_up));
     float drifts = PatternNoise(wp, kPatternDrifts) * 0.65 + PatternNoise(wp, kPatternDriftsFine) * 0.35;
-    float depth = u_snow * (0.45 + 0.55 * upright) * (0.7 + 0.6 * drifts);
+    // (By the amount, as the snow's first slider was: its depth, so less of it is a soft dusting that the
+    // dirt shows through - the steep faces and the hollows between the drifts first - and the dirt under
+    // it only as damp as there's snow. 75% is the snow as it's made; 100% a third deeper.)
+    float amount = u_snow * u_snowAmount / 0.75;
+    float depth = amount * (0.45 + 0.55 * upright) * (0.7 + 0.6 * drifts);
     float settled = smoothstep(0.25, 0.6, depth);
     // The game's own light on the ground, gently (its texture's blotches mostly left out).
-    float shading = clamp(pow(max(Luma(c), 1e-4) / 0.2, 0.3), 0.65, 1.2);
+    float shading = clamp(pow(max(Luma(c), 1e-4) / 0.2, 0.3), 0.65, 1.0);  // (never brighter than the snow itself)
     // The snow's own relief, lit as the ground is lit (against the ground's plain slope).
-    vec3 ns = SnowNormal(n, wp, dwx, dwy, z);
+    float crease, grain;
+    vec3 ns = SnowNormal(n, wp, dwx, dwy, z, crease, grain);
     float before = max(dot(n, u_lightWorld), 0.0) * 0.7 + 0.4;
     float after = max(dot(ns, u_lightWorld), 0.0) * 0.7 + 0.4;
-    float relief = clamp(after / before, 0.72, 1.28);
-    vec3 fresh = vec3(0.80, 0.84, 0.90) * (0.94 + 0.06 * PatternNoise(wp, kPatternSnow));
-    fresh *= mix(vec3(0.9, 0.95, 1.07), vec3(1.0), smoothstep(0.8, 1.05, relief));  // turned away: bluer
+    float relief = clamp(after / before, 0.6, 1.25);
+    vec3 fresh = vec3(0.64, 0.68, 0.74) * (0.94 + 0.06 * PatternNoise(wp, kPatternSnow));
+    fresh *= mix(vec3(0.88, 0.94, 1.08), vec3(1.0), smoothstep(0.8, 1.05, relief));  // turned away: bluer
+    fresh *= mix(vec3(1.0), vec3(0.8, 0.85, 0.93), crease);  // the creases between the puffs: shaded, bluer
+    fresh *= 1.0 + 0.09 * grain;
     vec3 snow = fresh * shading * relief;  // (no glints: grains a pixel wide or more read as white dashes, and shimmer)
     // The rut, by how deep it is.
     float m = rut.x, lip = clamp(rut.y - rut.x, 0.0, 1.0);
     float pressed = smoothstep(0.03, 0.2, m), slushy = smoothstep(0.15, 0.5, m), bare = smoothstep(0.45, 0.85, m);
-    vec3 wet = c * mix(1.0, 0.62, u_snow);  // the dirt under it, damp
+    vec3 wet = c * mix(1.0, 0.62, min(amount, 1.0));  // the dirt under it, damp
     vec3 slush = mix(vec3(Luma(snow)) * vec3(0.95, 0.96, 0.99) * 0.55, wet, 0.45);
     vec3 col = mix(snow, snow * vec3(0.88, 0.89, 0.9), pressed);  // pressed: duller, a little darker
     col = mix(col, slush, slushy);

@@ -310,7 +310,7 @@ void DrainErrors()
 // ===========================================================================
 // Saved GL state
 // ===========================================================================
-constexpr int kUnits = 8;  // texture units the passes use
+constexpr int kUnits = 9;  // texture units the passes use
 
 struct SavedState {
     GLint     program = 0, vao = 0, arrayBuffer = 0, activeTexture = 0, readFb = 0, drawFb = 0, readBuffer0 = 0;
@@ -470,6 +470,7 @@ struct Resources {
     GLuint  vao = 0, vbo = 0;
     Program programs[kProgramCount];
     GLuint  detail = 0;
+    GLuint  snowPuffs = 0;   // the snow's clumps (MakeSnowPuffTexture)
     int     width = 0, height = 0;
     GLuint  captureFbo = 0, color = 0, depth = 0;  // the window's image
     GLuint  terrainFbo = 0, terrainDepth = 0;      // depth when the terrain pass ended
@@ -781,6 +782,57 @@ std::vector<uint8_t> MakeDetailTexture(int n)
     return rgba;
 }
 
+// RGBA: fresh snow's clumps - its normal (x, y), its height, unused; tiling. Soft mounds of many
+// sizes, each rising smoothly from nothing at its edge (no rim) and added together where they overlap,
+// over a gentle unevenness: a rolling, lumpy surface of powder. (Each the top of a ball, and the
+// highest one taken where they met, it had a steep rim and a dip round every mound - the user saw a
+// field of craters in it.)
+std::vector<uint8_t> MakeSnowPuffTexture(int n)
+{
+    constexpr int kCells = 12;           // across the tile; two clumps in each
+    const double cell = static_cast<double>(n) / kCells;
+    struct Puff { double x, y, r; };
+    std::vector<Puff> puffs;
+    uint32_t seed = 0x5A0Bu;
+    const auto random = [&seed]() { seed = Hash(seed + 0x9E3779B9U); return (seed & 0xFFFFFF) / 16777215.0; };
+    for (int cy = 0; cy < kCells; ++cy)
+        for (int cx = 0; cx < kCells; ++cx)
+            for (int k = 0; k < 2; ++k)
+                puffs.push_back(Puff{ (cx + random()) * cell, (cy + random()) * cell, cell * (0.45 + 0.6 * random()) });
+    std::vector<double> height(static_cast<size_t>(n) * n);
+    double top = 0;
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            const double u = static_cast<double>(x) / n, v = static_cast<double>(y) / n;
+            double h = 0.12 * cell * (0.5 * ValueNoise(u * 24, v * 24, 24, 0x51u) + 0.5 * ValueNoise(u * 48, v * 48, 48, 0x52u));
+            for (const Puff& p : puffs) {
+                double dx = x + 0.5 - p.x, dy = y + 0.5 - p.y;
+                dx -= n * std::round(dx / n);  // (the tile wraps)
+                dy -= n * std::round(dy / n);
+                const double q = (dx * dx + dy * dy) / (p.r * p.r);
+                if (q < 1.0)
+                    h += 0.35 * p.r * (1.0 - q) * (1.0 - q);
+            }
+            height[static_cast<size_t>(y) * n + x] = h;
+            top = std::fmax(top, h);
+        }
+    }
+    std::vector<uint8_t> rgba(height.size() * 4);
+    const auto H = [&](int x, int y) { return height[static_cast<size_t>(((y % n) + n) % n) * n + ((x % n) + n) % n]; };
+    const auto Byte = [](double v) { return static_cast<uint8_t>(Clamp(v, 0.0, 1.0) * 255.0 + 0.5); };
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            const Vec3 normal = Normalize(Vec3{ -(H(x + 1, y) - H(x - 1, y)) * 0.5, -(H(x, y + 1) - H(x, y - 1)) * 0.5, 1.0 });
+            uint8_t* out = &rgba[(static_cast<size_t>(y) * n + x) * 4];
+            out[0] = Byte(normal.x * 0.5 + 0.5);
+            out[1] = Byte(normal.y * 0.5 + 0.5);
+            out[2] = Byte(H(x, y) / std::fmax(top, 1e-9));
+            out[3] = 255;
+        }
+    }
+    return rgba;
+}
+
 bool CreateDetailTexture()
 {
     const std::vector<uint8_t> pixels = MakeDetailTexture(kDetailSize);
@@ -794,9 +846,13 @@ bool CreateDetailTexture()
     g_gl.PixelStorei(GL_UNPACK_SKIP_ROWS, 0);
     g_gl.PixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
 
-    g_gl.GenTextures(1, &g_res.detail);
-    g_gl.BindTexture(GL_TEXTURE_2D, g_res.detail);
-    g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kDetailSize, kDetailSize, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    const std::vector<uint8_t> puffs = MakeSnowPuffTexture(kDetailSize);
+    for (int which = 0; which < 2; ++which) {
+    GLuint& tex = which == 0 ? g_res.detail : g_res.snowPuffs;
+    g_gl.GenTextures(1, &tex);
+    g_gl.BindTexture(GL_TEXTURE_2D, tex);
+    g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kDetailSize, kDetailSize, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                    which == 0 ? pixels.data() : puffs.data());
     g_gl.GenerateMipmap(GL_TEXTURE_2D);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -805,6 +861,7 @@ bool CreateDetailTexture()
     DrainErrors();
     g_gl.TexParameterf(GL_TEXTURE_2D, kTextureMaxAnisotropy, 8.0f);  // grazing angles; ignored if unsupported
     DrainErrors();
+    }
 
     g_gl.PixelStorei(GL_UNPACK_SKIP_PIXELS, skipPixels);
     g_gl.PixelStorei(GL_UNPACK_SKIP_ROWS, skipRows);
@@ -6337,6 +6394,7 @@ void Render(int w, int h)
         Bind(p, "u_terrainDepth", 2, g_res.terrainDepth);
         Bind(p, "u_light", 3, g_res.light.tex);
         Bind(p, "u_detail", 4, g_res.detail);
+        Bind(p, "u_snowPuffs", 8, g_res.snowPuffs);
         // Always on its own unit: a shadow sampler may not share one with an ordinary sampler.
         Bind(p, "u_shadowMap", 5, g_res.shadowMap);
         g_gl.Uniform1f(p["u_shadowMapOn"], shadowMapOn ? 1.0f : 0.0f);
@@ -6513,11 +6571,14 @@ void Render(int w, int h)
         // postfx_shaders.h, u_freq). Taken from the wrapped camera, the patterns jumped every 64 units.
         {
             const double ds = cfg.dirtScale > 0.0 ? cfg.dirtScale : 1.0, m = g_unitsPerMetre;
-            // (The last three: the rain's puddles, coarse and fine, and the grid of its rings in them.)
+            // (Then: the rain's puddles, coarse and fine, and the grid of its rings in them; and the snow's
+            // pillows, clumps and grain, and its wind ripples - their wavering, their strength, the ripples
+            // themselves: 18 radians a metre along (4, 3)/5, so 18 / (2 pi 5) of a turn a unit there.)
             const double freqs[] = { 0.6 / ds, 2.6 / ds, 0.16 / ds, 0.012 / ds, 0.0035 / ds, 5.2 / ds,
-                                     30.0 / m, 40.0 / m, 0.3 / m, 1.6 / m, 5.0 / m, 0.25 / m, 0.9 / m, 4.0 / m };
-            constexpr int kPatterns = 14;
-            static_assert(sizeof freqs / sizeof freqs[0] == kPatterns, "postfx_shaders.h: u_freq[14]");
+                                     30.0 / m, 40.0 / m, 0.3 / m, 1.6 / m, 5.0 / m, 0.25 / m, 0.9 / m, 4.0 / m,
+                                     0.14 / m, 0.6 / m, 3.3 / m, 0.45 / m, 0.18 / m, 18.0 / (6.283185307179586 * 5.0) / m };
+            constexpr int kPatterns = 20;
+            static_assert(sizeof freqs / sizeof freqs[0] == kPatterns, "postfx_shaders.h: u_freq[20]");
             static std::string kFreq[kPatterns], kWhole[kPatterns], kFraction[kPatterns];
             if (kFreq[0].empty()) {
                 for (int k = 0; k < kPatterns; ++k) {
@@ -6561,6 +6622,7 @@ void Render(int w, int h)
         const double fovY = 2.0 * std::atan(1.0 / std::fmax(std::fabs(P[5]), 1e-3));
         g_gl.Uniform1f(p["u_pixelAngle"], static_cast<float>(fovY / h));
         g_gl.Uniform1f(p["u_snow"], snowOn ? 1.0f : 0.0f);
+        g_gl.Uniform1f(p["u_snowAmount"], static_cast<float>(cfg.snowAmount));
         g_gl.Uniform1f(p["u_overcast"], snowOn || rainOn ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_weatherHaze"], static_cast<float>(std::fmax(snowOn ? cfg.snowfall : 0.0, rainOn ? 0.85 * cfg.rainfall : 0.0)));
         Vec(p, "u_weatherFog", rainOn ? rainFog : snowFog);

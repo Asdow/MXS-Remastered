@@ -305,6 +305,10 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
     else if (mode == "snow" || mode == "snowperf")
         settings = base + "[Weather]\nSnow=1\nSnowfall=1\nWind=0.3\n";
+    else if (mode == "snowground")  // the snow on the ground alone, nothing falling (frames to compare: MXCAM_TEST_CAM_X)
+        settings = base + "[Weather]\nSnow=1\nSnowfall=0\nWind=0\nSnowSound=0\nSnowTires=0\n" +
+                   (getenv("MXCAM_TEST_SNOW_AMOUNT") ? "SnowAmount=" + std::string(getenv("MXCAM_TEST_SNOW_AMOUNT")) + "\n"
+                                                     : std::string());
     else if (mode == "rain" || mode == "rainperf")
         settings = base + "[Weather]\nRain=1\nRainfall=1\nRainWind=0.3\nWetness=0.8\nPuddles=" +
                    std::string(getenv("MXCAM_TEST_PUDDLES") ? getenv("MXCAM_TEST_PUDDLES") : "0.8") + "\nReflections=1\n";

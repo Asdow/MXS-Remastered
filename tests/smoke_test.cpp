@@ -183,7 +183,9 @@ int main(int argc, char** argv)
     g_headHeight = custom ? 0.1 : 0.0;
     setvbuf(stdout, nullptr, _IONBF, 0);  // a crash still shows how far the checks got
 
-    SetEnvironmentVariableA("MXCAM_TEST_OPEN_MENU", "1");
+    // (MXCAM_SMOKE_HINT: the menu left closed, so the screenshot shows the startup hint instead.)
+    if (GetEnvironmentVariableA("MXCAM_SMOKE_HINT", nullptr, 0) == 0)
+        SetEnvironmentVariableA("MXCAM_TEST_OPEN_MENU", "1");
     HMODULE dll = LoadLibraryA(argv[1]);
     if (!dll) {
         printf("could not load %s (error %lu)\n", argv[1], GetLastError());

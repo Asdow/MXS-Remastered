@@ -42,7 +42,7 @@ Coming from a version that used `mxcam.ini` and `mxcam_sounds`? The mod renames 
 
 ## The menu
 
-Press **E** in game to open the menu. It has six tabs: **FIRST PERSON**, **GRAPHICS**, **WEATHER**, **REPLAY**, **KEYBINDS** and **OTHER**. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back.
+Press **E** in game to open the menu. It has six tabs: **FIRST PERSON**, **GRAPHICS**, **WEATHER**, **REPLAY**, **KEYBINDS** and **OTHER**. Hover over (or select) any setting to see what it does. Changes apply straight away. Press **SAVE** to keep them for next time, or **DEFAULTS** to put everything back. Drag the menu by its top edge (the dots) or by the logo to move it anywhere on screen; it stays there until the game closes.
 
 While you drag a **GRAPHICS** or **WEATHER** slider (or step it with the arrow keys), the menu fades out except for that slider, so you can see the whole picture change. You can turn this off on the **OTHER** tab.
 
@@ -152,8 +152,9 @@ On the **WEATHER** tab (it needs the shaders on), pick one weather with the **We
 - **Lightning**: turns the rain into a thunderstorm and sets how often lightning strikes (Off by default). Strikes come anywhere from half a kilometre to 6 km away, most often somewhere ahead of you. A branching bolt comes down out of the clouds and flickers as it strikes again two to five times. Its flash lights up the clouds around it, the track, the puddles and the falling rain. Some flashes stay inside the clouds. The bolt only shows against the sky, so hills and trees hide it.
 - **Lightning sound**: how loud each strike sounds: a real recorded strike (one of three, pitched a little differently each time), with its crack, boom and roll. It arrives as late as the strike was far away, about 3 seconds per kilometre. A far strike sounds deeper, duller and quieter. It plays alongside the game's own sound and goes quiet while the game is in the background.
 
-**SNOW**: the track turns white, with less snow on steep slopes and drifts across the ground, under a grey, overcast sky with soft light. Your ruts dig through it: pressed snow where a tire just rolled, grey slush deeper down and wet dirt at the bottom, with a lip of pushed-up snow along the edges. The tires get packed with snow too, even with Tire dirt off. The rest of the bike and the riders stay clean.
+**SNOW**: the track is covered in soft, fresh snow: a gentle white rather than a glaring one, gently rolling and lumpy, like fresh powder, with soft shade in its dips and a fine powdery grain up close. There is less of it on steep slopes and drifts across the ground, under a grey, overcast sky with soft light. Your ruts dig through it: pressed snow where a tire just rolled, grey slush deeper down and wet dirt at the bottom, with a lip of pushed-up snow along the edges. The tires get packed with snow too, even with Tire dirt off. The rest of the bike and the riders stay clean.
 
+- **Snow amount**: how much snow lies on the ground (75% by default). Lower, it thins to a dusting with the dirt showing through, first on the steep faces and between the drifts; at 0% the track is bare dirt. At 100% everything is white, the steep faces too.
 - **Snowfall**: how heavily it snows. Flakes fall all around you and fly past as you ride, and they haze the distance. At 0% the snow stays on the ground and nothing falls.
 - **Wind**: how hard the wind blows the falling snow sideways.
 - **Snow sound**: how loud the snowstorm sounds: a recording of a blizzard's wind all around you, gusting now and then. It gets louder the harder it snows and the harder the wind blows, and it's silent with both at 0%. It plays alongside the game's own sound, only while you're on the track, and goes quiet while the game is in the background.

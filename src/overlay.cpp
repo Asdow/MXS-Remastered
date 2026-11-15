@@ -1704,7 +1704,11 @@ const RowDef kRows[] = {
         .Help("How loud each lightning strike sounds: the crack and the boom of the bolt. It comes as late "
               "as the strike was far (about 3 seconds a kilometre); close by it's sharper and louder, far "
               "off deeper and softer. Played beside the game's own sound."),
-    Slider(kTabWeather, "SNOW",           "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+    Slider(kTabWeather, "SNOW",           "Snow amount",               &Config::snowAmount,       0.0,   1.0,   0.01,   100.0,  0, "%", "Bare")
+        .Help("How much snow lies on the ground. Lower, it thins to a dusting with the dirt showing "
+              "through, on the steep faces and between the drifts first; at 100% everything is white, "
+              "the steep faces too. At 0% the track is bare dirt."),
+    Slider(kTabWeather, nullptr,          "Snowfall",                  &Config::snowfall,         0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How heavily it snows: flakes falling all around you (they fly past as you ride), and "
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
     Slider(kTabWeather, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
@@ -1726,6 +1730,9 @@ constexpr int kFirstRowItem = 1;
 
 struct PanelState {
     bool   open         = false;
+    float  offsetX = 0, offsetY = 0;  // where it's been dragged to, from its usual place (kept while the game runs)
+    bool   moving       = false;      // being dragged by its top edge or its logo
+    float  grabX = 0, grabY = 0;      // the mouse against the offset when the drag began
     int    tab          = 0;
     int    selected     = kTabBarItem;  // (the tabs: their marker shows from the first time the menu opens)
     int    dragging     = -1;  // index into kRows of the slider being dragged with the mouse
@@ -2321,7 +2328,7 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
                          def.number == &Config::puddles || def.number == &Config::rainReflections ||
                          def.number == &Config::lightning || def.number == &Config::lightningSound ||
                          def.number == &Config::rainSound || def.number == &Config::screenDrops;
-    const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind || def.number == &Config::snowSound ||
+    const bool snowRow = def.number == &Config::snowAmount || def.number == &Config::snowfall || def.number == &Config::snowWind || def.number == &Config::snowSound ||
                          def.number == &Config::snowTires;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
 }
@@ -2627,6 +2634,8 @@ std::string ClipboardText() { return platform::ClipboardGet(); }
 
 // Where the panel is on screen (at the atlas's scale): its left, top, width and height.
 struct PanelPlace { float x = 0, y = 0, w = 0, h = 0; };
+int g_screenWidth = 0;  // this frame's (the panel is kept on it wherever it's dragged)
+
 PanelPlace PanelOnScreen(int screenHeight)
 {
     const float s = g_atlasScale;
@@ -2636,6 +2645,12 @@ PanelPlace PanelOnScreen(int screenHeight)
     p.h = S(kPanelH);
     p.x = S(32);
     p.y = std::fmax(S(16), std::round((screenHeight - p.h) * 0.5f));
+    // Where it's been dragged (g_panel.offset*), all of it kept on screen (as much as fits).
+    p.x = std::round(p.x + g_panel.offsetX);
+    p.y = std::round(p.y + g_panel.offsetY);
+    if (g_screenWidth > 0)
+        p.x = std::fmax(0.0f, std::fmin(p.x, static_cast<float>(g_screenWidth) - p.w));
+    p.y = std::fmax(0.0f, std::fmin(p.y, std::fmax(0.0f, static_cast<float>(screenHeight) - p.h)));
     return p;
 }
 
@@ -2694,6 +2709,29 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     const float boxY = topY + topH + S(24);
     const float buttonH = S(48), buttonsY = py + panelH - pad - buttonH;
     const float boxB = buttonsY - S(46), boxH = boxB - boxY;
+    // Dragged around by its top edge (the strip above the search and the logo) or by the logo itself:
+    // nothing there answers a click. Kept where it's left, on screen, until the game closes.
+    const float logoGrabW = g_logo.valid ? g_logo.w : S(220);
+    const bool onGrip = in.Inside(px, py, panelW, pad) ||
+                        in.Inside(boxR - logoGrabW, topY, logoGrabW, topH);
+    if (in.pressed && onGrip && !g_panel.moving) {
+        g_panel.moving = true;
+        g_panel.grabX = in.mx - g_panel.offsetX;
+        g_panel.grabY = in.my - g_panel.offsetY;
+    }
+    if (g_panel.moving) {
+        if (in.down && in.inside) {
+            // (Held to where it can still be seen: an offset past the screen's edge would only be clamped.)
+            const PanelPlace home = [&] { const float ox = g_panel.offsetX, oy = g_panel.offsetY;
+                                          g_panel.offsetX = g_panel.offsetY = 0;
+                                          const PanelPlace h = PanelOnScreen(screenHeight);
+                                          g_panel.offsetX = ox; g_panel.offsetY = oy; return h; }();
+            g_panel.offsetX = Clamp(in.mx - g_panel.grabX, -home.x, std::fmax(0.0f, screenWidth - home.w - home.x));
+            g_panel.offsetY = Clamp(in.my - g_panel.grabY, -home.y, std::fmax(0.0f, screenHeight - home.h - home.y));
+        } else {
+            g_panel.moving = false;
+        }
+    }
 
     // Keyboard-focus marker: a short red bar just left of the focused item.
     const auto Marker = [&](float left, float top, float height) { Rect(left, top, S(3), height, kAccentHot); };
@@ -2756,6 +2794,14 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                   sy, sy + sh, sideX, sideW, hot, false);
     }
 
+    // ---- The grip along its top edge: six dots, brighter under the mouse or while it's dragged ----
+    {
+        const uint32_t dot = g_panel.moving ? kAccentHot : (onGrip ? kLabel : Rgba(90, 90, 96, 1.0f));
+        const float d = std::fmax(2.0f, S(3)), gx = std::round(px + panelW * 0.5f), gy = std::round(py + pad * 0.5f);
+        for (int row = 0; row < 2; ++row)
+            for (int col = -1; col <= 1; ++col)
+                Disc(gx + col * S(9), gy + (row - 0.5f) * S(8), d * 0.5f + 0.5f, dot);
+    }
     // ---- The logo (top right, over the settings) ----
     float logoLeft = boxR;
     if (g_logo.valid) {
@@ -3560,13 +3606,65 @@ void DrawBatch(int width, int height)
 
 // ===========================================================================
 // The startup hint: every time the game starts, which key opens this menu (players kept asking).
-// Shown kHintHold seconds from the first frame, then faded out over kHintFade; gone for good once
-// the menu is opened. The key is the menu key as it is now, so a rebind shows on it at once.
+// A card in the middle of the screen with the screen's edges darkened round it (a vignette), shown
+// kHintHold seconds from the first frame - or until a click, or the menu opening - then gone: both
+// fade out (kHintLeave). The key is the menu key as it is
+// now, so a rebind shows on it at once.
 // ===========================================================================
-constexpr double kHintHold = 5.0;
-constexpr double kHintFade = 1.0;
-double g_hintStart = -1;
-bool   g_hintDone  = false;
+constexpr double kHintHold  = 5.0;
+constexpr double kHintLeave = 0.8;   // s the card and its vignette take to fade out
+double g_hintStart   = -1;
+double g_hintLeaveAt = -1;           // when it began to go (-1: not yet)
+bool   g_hintDone    = false;
+
+float smoothstep01(float t)
+{
+    t = Clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// How far the hint has gone (0: still up .. 1: gone).
+float HintLeaving(double now)
+{
+    return g_hintLeaveAt < 0 ? 0.0f : static_cast<float>(Clamp((now - g_hintLeaveAt) / kHintLeave, 0.0, 1.0));
+}
+
+// The hint's vignette: the screen's edges darkened, most in the corners (a fine ring of quads round the
+// middle, each corner its own shade). It fades in with the card, and out as the hint goes.
+void HintVignette(int width, int height, double now)
+{
+    const float leave = HintLeaving(now);
+    if (leave >= 1.0f)
+        return;
+    const float in = static_cast<float>(Clamp((now - g_hintStart) / 0.5, 0.0, 1.0));
+    const float out = 1.0f - smoothstep01(leave);
+    const float cx = width * 0.5f, cy = height * 0.5f, reach = std::sqrt(cx * cx + cy * cy);
+    constexpr int kAround = 96, kOut = 24;
+    const auto Dark = [&](int k) {
+        float v = smoothstep01((static_cast<float>(k) / kOut - 0.3f) / 0.75f);
+        return Rgba(0, 0, 0, v * v * 0.78f * in * out);
+    };
+    const auto At = [&](int i, int k, float& x, float& y) {
+        const float a = 6.2831853f * static_cast<float>(i) / kAround, r = reach * static_cast<float>(k) / kOut;
+        x = cx + std::cos(a) * r;
+        y = cy + std::sin(a) * r;
+    };
+    const float u = 4.0f / kAtlasSize;
+    for (int k = 0; k < kOut; ++k) {
+        const uint32_t inner = Dark(k), outer = Dark(k + 1);
+        if (((inner | outer) >> 24) == 0)
+            continue;  // (nothing darkened this near the middle)
+        for (int i = 0; i < kAround; ++i) {
+            float x0, y0, x1, y1, x2, y2, x3, y3;
+            At(i, k, x0, y0);
+            At(i + 1, k, x1, y1);
+            At(i + 1, k + 1, x2, y2);
+            At(i, k + 1, x3, y3);
+            const Vertex a{ x0, y0, u, u, inner }, b{ x1, y1, u, u, inner }, c{ x2, y2, u, u, outer }, d{ x3, y3, u, u, outer };
+            g_batch.insert(g_batch.end(), { a, b, c, a, c, d });
+        }
+    }
+}
 
 uint32_t Faded(uint32_t color, float a)
 {
@@ -3574,34 +3672,106 @@ uint32_t Faded(uint32_t color, float a)
     return (color & 0x00FFFFFFu) | (alpha << 24);
 }
 
+// A card in the middle of the screen: the logo (the light sweeping across it once, as in the menu),
+// a thin red line fading out to both sides, and "Press [key] to open the menu" with the key drawn as a
+// key cap. Near-black, a little lighter at the top, a faint red glow rising from its bottom, a thin
+// red outline and a soft shadow round it. It rises a little into place as it fades in.
 void BuildStartupHint(int width, int height, double now)
 {
     const float s = g_atlasScale;
     const auto S = [s](float v) { return std::round(v * s); };
     const double t = now - g_hintStart;
-    const float a = t < kHintHold ? 1.0f : static_cast<float>(1.0 - (t - kHintHold) / kHintFade);
-    const char* lead = "MXS Remastered:";
-    char rest[96];
-    snprintf(rest, sizeof rest, "Press \"%s\" to open menu", KeyName(GetConfig().menuKey));
-    // In the middle of the screen, in the menu's title font, the corners only a little rounded.
-    const float gap = S(14), padX = S(40), padY = S(24);
-    const float leadW = TextWidth(kFontTitle, lead, S(1)), restW = TextWidth(kFontTitle, rest, 0);
-    const float w = padX * 2 + leadW + gap + restW, h = padY * 2 + LineHeight(kFontTitle);
-    const float x = std::round((width - w) * 0.5f), y = std::round((height - h) * 0.5f), r = S(8);
-    RoundedRect(x - S(2), y - S(2), w + S(4), h + S(4), r + S(2), Faded(kBorder, a));
-    RoundedRect(x, y, w, h, r, Faded(kPanelColor, a));
-    Text(kFontTitle, x + padX, y + padY, lead, Faded(kAccentHot, a), S(1));
-    Text(kFontTitle, x + padX + leadW + gap, y + padY, rest, Faded(White(1.0f), a), 0);
+    const float in = static_cast<float>(Clamp(t / 0.4, 0.0, 1.0));
+    const float ease = 1.0f - (1.0f - in) * (1.0f - in) * (1.0f - in);
+    const float a = std::fmax(0.0f, 1.0f - HintLeaving(now) * 2.5f) * ease;  // (going: the card fades first)
+    if (a <= 0.0f)
+        return;
+    const char* before = "Press";
+    const char* after = "to open the menu";
+    const char* key = KeyName(GetConfig().menuKey);
+    // What's in it, and how big.
+    const float logoW = g_logo.valid ? g_logo.w : TextWidth(kFontTitle, "MXS Remastered", S(1));
+    const float logoH = g_logo.valid ? g_logo.h : LineHeight(kFontTitle);
+    const float textH = LineHeight(kFontLabel), keyTextH = LineHeight(kFontValue);
+    const float keyH = std::round(std::fmax(textH, keyTextH) + S(12));
+    const float keyW = std::round(TextWidth(kFontValue, key, S(1)) + S(24));
+    const float gap = S(10);
+    const float beforeW = TextWidth(kFontLabel, before, 0), afterW = TextWidth(kFontLabel, after, 0);
+    const float lineW = beforeW + gap + keyW + gap + afterW;
+    const float padX = S(40), padTop = S(28), padBottom = S(26), divGap = S(18);
+    const float w = std::round(std::fmax(logoW, lineW) + padX * 2);
+    const float h = std::round(padTop + logoH + divGap + 1 + divGap + keyH + padBottom);
+    const float rise = std::round((1.0f - ease) * S(16));
+    const float x = std::round((width - w) * 0.5f), y = std::round((height - h) * 0.5f) + rise, r = S(16);
+    // Its shadow: soft, a little below it.
+    for (int i = 5; i >= 1; --i) {
+        const float e = S(3.0f * i);
+        RoundedRect(x - e, y - e + S(8), w + 2 * e, h + 2 * e, r + e, Rgba(0, 0, 0, 0.09f * a));
+    }
+    // The card: its outline, its body, darker toward the bottom with a faint red glow rising there, and a
+    // thin light along its top edge.
+    RoundedRect(x - 1, y - 1, w + 2, h + 2, r + 1, Faded(Rgba(210, 24, 32, 0.9f), a));
+    RoundedRect(x, y, w, h, r, Faded(Rgba(26, 26, 30, 0.98f), a));
+    GlowRounded(x, y, w, h, r, GlowSpec{ x + w * 0.5f, y + h * 1.25f, w * 0.95f, h * 1.15f, 0, 0, 0, 0.55f * a });
+    GlowRounded(x, y, w, h, r, GlowSpec{ x + w * 0.5f, y + h + S(6), w * 0.5f, h * 0.75f, 200, 16, 24, 0.24f * a });
+    Rect(x + r, y + 1, w - 2 * r, 1, White(0.08f * a));
+    // The logo.
+    const float lx = std::round(x + (w - logoW) * 0.5f), ly = y + padTop;
+    if (g_logo.valid) {
+        Quad(lx, ly, lx + g_logo.w, ly + g_logo.h, g_logo.u0, g_logo.v0, g_logo.u1, g_logo.v1, White(a));
+        if (a > 0.99f)
+            LogoSweep(lx, ly, t < 3.0 ? t : t - 2.5);  // (the menu's own sweep, twice while it's up: at 0.8 s and 3.3 s)
+    } else {
+        Text(kFontTitle, lx, ly, "MXS Remastered", Faded(kAccentHot, a), S(1));
+    }
+    // The red line under it, fading out to both sides.
+    const float dy = ly + logoH + divGap, dx = x + padX, dw = w - 2 * padX;
+    GradientH(dx, dy, std::round(dw * 0.5f), 1, Rgba(210, 24, 32, 0.0f), Rgba(230, 40, 48, 0.85f * a));
+    GradientH(dx + std::round(dw * 0.5f), dy, dw - std::round(dw * 0.5f), 1, Rgba(230, 40, 48, 0.85f * a), Rgba(210, 24, 32, 0.0f));
+    // "Press [key] to open the menu", the key a key cap.
+    const float rowY = dy + 1 + divGap;
+    float px = std::round(x + (w - lineW) * 0.5f);
+    const float ty = rowY + std::round((keyH - textH) * 0.5f);
+    Text(kFontLabel, px, ty, before, Faded(kLabel, a), 0);
+    px += beforeW + gap;
+    RoundedRect(px, rowY + S(3), keyW, keyH, S(7), Rgba(0, 0, 0, 0.55f * a));  // (its depth: the side below it)
+    RoundedRect(px, rowY, keyW, keyH, S(7), Faded(Rgba(150, 150, 158, 0.9f), a));
+    RoundedRect(px + 1, rowY + 1, keyW - 2, keyH - 2, S(7) - 1, Faded(Rgba(44, 44, 50, 1.0f), a));
+    GradientV(px + S(4), rowY + 1, keyW - S(8), std::round(keyH * 0.45f), White(0.07f * a), White(0.0f));
+    Text(kFontValue, px + std::round((keyW - TextWidth(kFontValue, key, S(1))) * 0.5f),
+         rowY + std::round((keyH - keyTextH) * 0.5f), key, White(a), S(1));
+    px += keyW + gap;
+    Text(kFontLabel, px, ty, after, Faded(kLabel, a), 0);
 }
 
 // Draws the startup hint over this frame (the menu closed), while it lasts.
 void StartupHintFrame(HWND window, double now)
 {
+    // (For automated tests: held this many seconds in, for a screenshot.)
+    static const double testAt = [] {
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_HINT_AT", text, sizeof text) > 0 ? atof(text) : -1.0;
+    }();
+    static const double testLeave = [] {  // (and this far through going, 0..1)
+        char text[16] = "";
+        return GetEnvironmentVariableA("MXCAM_TEST_HINT_LEAVE", text, sizeof text) > 0 ? atof(text) : -1.0;
+    }();
+    if (testAt >= 0)
+        g_hintStart = now - testAt;
+    if (testLeave >= 0)
+        g_hintLeaveAt = now - testLeave * kHintLeave;
     if (g_hintDone)
         return;
     if (g_hintStart < 0)
         g_hintStart = now;
-    if (now - g_hintStart > kHintHold + kHintFade) {
+    if (g_hintLeaveAt < 0 && testAt < 0) {
+        // Its time up, or a click (in the game's window, after its first moment): going.
+        const bool clicked = window == GetForegroundWindow() &&
+                             ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) != 0;
+        if (now - g_hintStart >= kHintHold || (clicked && now - g_hintStart > 0.3))
+            g_hintLeaveAt = now;
+    }
+    if (HintLeaving(now) >= 1.0f) {
         g_hintDone = true;
         return;
     }
@@ -3616,6 +3786,7 @@ void StartupHintFrame(HWND window, double now)
         g_batch.clear();
         g_keepRanges.clear();
         g_clips.clear();
+        HintVignette(width, height, now);
         BuildStartupHint(width, height, now);
         DrawBatch(width, height);
     }
@@ -3977,6 +4148,17 @@ void OverlayFrame(HDC dc)
     }();
     if (testScroll >= 0 && g_panel.open)
         g_panel.scroll = g_panel.scrollTarget = testScroll;
+    // (For automated tests: the menu as if dragged this far, "x,y" pixels.)
+    static const bool testOffset = [] {
+        char text[32] = "";
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_OFFSET", text, sizeof text) <= 0)
+            return false;
+        char* comma = nullptr;
+        g_panel.offsetX = strtof(text, &comma);
+        g_panel.offsetY = comma && *comma == ',' ? strtof(comma + 1, nullptr) : 0.0f;
+        return true;
+    }();
+    (void)testOffset;
 
     if (!g_panel.open) {
         if (!window || !g_glAvailable)
@@ -3986,7 +4168,11 @@ void OverlayFrame(HDC dc)
             StartupHintFrame(window, now);  // (which key opens the menu, for a few seconds after the start)
             return;
         }
-        g_hintDone = true;  // (they've found it)
+        // (They've found it: the hint goes - its vignette fading under the menu as it opens.)
+        if (!g_hintDone && g_hintStart >= 0 && g_hintLeaveAt < 0)
+            g_hintLeaveAt = now;
+        else if (g_hintStart < 0)
+            g_hintDone = true;
         OpenPanel(window);
     } else if (g_panel.askRestart && focus && escape) {
         g_panel.askRestart = false;  // Esc on the notice: read, the menu stays open
@@ -4014,6 +4200,7 @@ void OverlayFrame(HDC dc)
     if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
         return;
     const int width = client.right, height = client.bottom;
+    g_screenWidth = width;
     Input in = ReadInput(window, focus, width, height, now);
     UpdateQuery();
     if (g_panel.listening >= 0) {
@@ -4061,6 +4248,15 @@ void OverlayFrame(HDC dc)
         g_keepRanges.clear();
         g_clips.clear();
         UpdateFade(now);
+        // The startup hint's vignette, while it fades (under the menu; not faded with the menu's own fade).
+        if (!g_hintDone) {
+            const size_t begin = g_batch.size();
+            HintVignette(width, height, now);
+            if (g_batch.size() > begin)
+                g_keepRanges.push_back({ begin, g_batch.size() });
+            if (HintLeaving(now) >= 1.0f)
+                g_hintDone = true;
+        }
         if (g_panel.askSticky || g_panel.askDefaults || g_panel.askRestart) {
             // The question takes every click and key; the menu behind it is shown, untouched.
             Input none;
