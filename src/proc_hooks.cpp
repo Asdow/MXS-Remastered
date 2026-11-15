@@ -2428,7 +2428,7 @@ void StartTrace(double seconds)
                      "sh_replay_skinned_drawn/indices_changed/repointed/no_bones,sh_replay_rigid_drawn/indices_changed/repointed/no_bones,"
                      "sh_real_body_along,marks_repressed,marks_repress_waiting,marks_others_cached,marks_ms,marks_window_still,"
                      "gpu_shadow_flush_ms,gpu_effects_ms,cpu_shadow_flush_ms,cpu_effects_ms,cpu_cast_now_ms,cpu_wheel_watch_ms,"
-                     "whip,game_step_ms,bike_rest,camera_rest\n");
+                     "sh_boxed_out/in,whip,game_step_ms,bike_rest,camera_rest\n");
     // Times are relative to the key press: the history before it is negative.
     const double now = camera::ContentTime();
     g_traceFrames = 0;
@@ -2580,6 +2580,51 @@ bool CanHoldBack(const DrawCall& draw, const GLfloat uploaded[16])
     const float dx = at[0] - you[0], dy = at[1] - you[1], dz = at[2] - you[2];
     const float reach = static_cast<float>(kWithRiderMetres * 3.2808);
     return dx * dx + dy * dy + dz * dz >= reach * reach;
+}
+
+DeferredCaster MakeCaster(const DrawCall& draw, GLint modelviewLoc, GLint projectionLoc);
+
+// Another rider's skinned draw, held back with a copy of its bones (CastShadow). anchorEye: where its
+// first bone is, in eye space. False: cast it as drawn.
+bool HoldBackRider(const DrawCall& draw, const float* anchorEye, const float lightModelview[16], unsigned cascades,
+                   GLint modelviewLoc, GLint projectionLoc)
+{
+    static const bool off = GetEnvironmentVariableA("MXCAM_TEST_NO_RIDERBATCH", nullptr, 0) > 0;  // (tests: the old way)
+    const SkinnedProgram* skin = FindSkinned(g_program);
+    if (off || !anchorEye || !skin || !GetConfig().shadowBatch)
+        return false;
+    const int n = skin->bones;
+    if (n < 1 || n > kMaxBones || skin->centres < n || skin->positions < n || skin->rotations < n || skin->centreLoc < 0 ||
+        skin->positionLoc < 0 || skin->rotationLoc < 0 || skin->countLoc < 0 || skin->positionEdited || skin->rotationEdited)
+        return false;
+    if (!StaticBuffers(draw) || !VertexArraySteady() || g_deferredCasters.size() >= 8192)
+        return false;
+    float you[3];
+    if (!postfx::OwnRiderEye(you))
+        return false;  // (yours not placed yet: nothing is told apart from it)
+    const float dx = anchorEye[0] - you[0], dy = anchorEye[1] - you[1], dz = anchorEye[2] - you[2];
+    const float reach = static_cast<float>(kWithRiderMetres * 3.2808);
+    if (dx * dx + dy * dy + dz * dz < reach * reach)
+        return false;
+    DeferredCaster c = MakeCaster(draw, modelviewLoc, projectionLoc);
+    std::copy(lightModelview, lightModelview + 16, c.lightModelview);
+    c.cascades = cascades;
+    CasterBones bones;
+    bones.count = n;
+    bones.transposed = skin->transposed;
+    std::copy(skin->centre, skin->centre + n * 3, bones.centre);
+    std::copy(skin->position, skin->position + n * 3, bones.position);
+    std::copy(skin->rotation, skin->rotation + n * 9, bones.rotation);
+    c.bones = static_cast<int>(g_casterBones.size());
+    g_casterBones.push_back(bones);
+    g_deferredCasters.push_back(c);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log("postfx: shadow map: other riders' bodies are held back with their bones and cast in one go (program %u, %d bones)",
+            g_program, n);
+    }
+    return true;
 }
 
 // The draw as it stands, to repeat later (light matrices filled in by the caller).
@@ -2752,8 +2797,11 @@ bool MeasureDraw(const DrawCall& draw, DrawBounds& b)
 
 // Whether the draw about to be made is far bigger than anything on a track, or all of it well
 // overhead (see DrawBounds): it isn't cast.
+const DrawBounds* g_castBox = nullptr;  // the draw TooBigToCast just measured (null: none), for ShadowMatrices
+
 bool TooBigToCast(const DrawCall& draw, const GLfloat uploaded[16])
 {
+    g_castBox = nullptr;
     const SkinnedProgram* skin = FindSkinned(g_program);
     if (skin && skin->bones != 0)
         return false;  // (a rider: its bones place it)
@@ -2795,6 +2843,7 @@ bool TooBigToCast(const DrawCall& draw, const GLfloat uploaded[16])
     }
     if (!b.valid)
         return false;
+    g_castBox = &b;
     // Its box in eye space (u_modelview as drawn), then across and up in the world.
     double view[16], up[3];
     if (!postfx::FrameRenderedView(view, up))
@@ -3020,7 +3069,8 @@ void CastShadow(const DrawCall& draw)
     }
     float lightModelview[16];
     unsigned cascades = 0;
-    if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, &cascades)) {
+    if (!postfx::ShadowMatrices(mv->second.uploaded, anchorEye, lightModelview, &cascades, g_castBox ? g_castBox->lo : nullptr,
+                                g_castBox ? g_castBox->hi : nullptr)) {
         postfx::NoteCast(3);
         if (nearYou)
             postfx::NoteNearCast(3);
@@ -3040,6 +3090,15 @@ void CastShadow(const DrawCall& draw)
             postfx::NoteCast(5);
             return;
         }
+    }
+    // Another rider's body (skinned: its bones change from draw to draw, so not held back above):
+    // held back too, with a copy of the bones it was drawn with, and drawn with them again in the
+    // batch, as the pieces of your rider the game leaves out are. Each cast one at a time switched
+    // to the shadow map and back (~15-20 us): a lobby's riders cost ~90 of those a frame. Never your
+    // own (within kWithRiderMetres of you: cast as drawn, below), nor a vertex array the game re-points.
+    if (HoldBackRider(draw, anchorEye, lightModelview, cascades, mv->second.location, projection->second.location)) {
+        postfx::NoteCast(5);
+        return;
     }
     postfx::NoteCast(1);
     if (!real_glDrawElements)

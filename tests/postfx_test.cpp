@@ -341,12 +341,12 @@ int main(int argc, char** argv)
                                 : mode == "headlightrainbow" ? "Headlight=1\nHeadlightBeamDeg=22\nHeadlightColor=2"
                                                           : "Headlight=1\nHeadlightBeamDeg=22");
     }
-    else if (mode == "shadowperf" || mode == "shadowperf0")  // timing: 800 objects cast shadow-map shadows
-        settings = base.replace(base.find("Shadows=0"), 9, mode == "shadowperf" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
+    else if (mode == "shadowperf" || mode == "shadowperf0" || mode == "shadowfar")  // timing: 800 objects cast shadow-map shadows
+        settings = base.replace(base.find("Shadows=0"), 9, mode != "shadowperf0" ? "Shadows=1\nShadowMap=1\nShadowBatch=1"
                                                                                 : "Shadows=1\nShadowMap=1\nShadowBatch=0");
     else if (mode == "tires" || tiresLate || mode == "tiresfeet" || mode == "tiresair" || mode == "tireshidden" || mode == "rearhidden" ||
              mode == "gatebox" || mode == "backshadow" || mode == "wheeldrift" || mode == "rival" || mode == "rivalroost" ||
-             mode == "rivalstep")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
+             mode == "rivalstep" || mode == "riderfar")  // your bike on spinning wheels (metres, feet, in the air, wheels not drawn)
         // (tires: the dirt at 0.75, a player's setting: patchy mud, not a tire covered in it)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : tiresLate ? "TireMarks=1\nTireDirt=0" : "TireMarks=1\nTireDirt=1");
     else if (mode == "roost")  // your bike speeding up: roost (and its marks and dirt)
@@ -381,7 +381,7 @@ int main(int argc, char** argv)
         settings += "[Learned]\nRearWheelOnBike=4.200,-1.950,-6.730\n";
     }
     if (mode == "rearhidden" || mode == "gatebox" || mode == "backshadow" || mode == "wheeldrift" || mode == "rival" || mode == "rivalroost" ||
-        mode == "rivalstep") {  // first person from the start: the wheels learnt in an earlier session
+        mode == "rivalstep" || mode == "riderfar") {  // first person from the start: the wheels learnt in an earlier session
         if (mode != "rival" && mode != "rivalroost" && mode != "rivalstep")  // (rival: no shadows, they'd darken the other bike's track like ruts)
             settings = settings.replace(settings.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1");
         settings += "[Learned]\nRearWheelOnBike=0.000,6.102,-0.820\nFrontWheelOnBike=0.000,6.102,-5.676\n"
@@ -594,6 +594,25 @@ int main(int argc, char** argv)
     const unsigned short cubeIndices[36] = { 0, 2, 1, 1, 2, 3,  4, 5, 6, 5, 7, 6,  0, 4, 2, 4, 6, 2,
                                              1, 3, 5, 5, 3, 7,  2, 6, 3, 3, 6, 7,  0, 1, 4, 4, 1, 5 };
     mesh(arrays[1], cube, sizeof cube, 3, cubeIndices, sizeof cubeIndices);
+    // (shadowfar: 2400 cubes in one world-space buffer, out to 300 units ahead and 150 to either side.)
+    constexpr int kFarBoxes = 2400;
+    GLuint farArray = 0;
+    if (mode == "shadowfar") {
+        std::vector<float> farVertices;
+        std::vector<unsigned short> farIndices;
+        for (int k = 0; k < kFarBoxes; ++k) {
+            const float bx = -150.0f + (k % 60) * 5.0f, bz = -5.0f - (k / 60) * 7.5f;
+            for (int v = 0; v < 8; ++v) {
+                farVertices.push_back(cube[v * 3] + bx);
+                farVertices.push_back(cube[v * 3 + 1]);
+                farVertices.push_back(cube[v * 3 + 2] + bz);
+            }
+            for (int i = 0; i < 36; ++i)
+                farIndices.push_back(static_cast<unsigned short>(cubeIndices[i] + k * 8));
+        }
+        gl.GenVertexArrays(1, &farArray);
+        mesh(farArray, farVertices.data(), farVertices.size() * sizeof(float), 3, farIndices.data(), farIndices.size() * 2);
+    }
     // A roof (stadium): the cube made 400 units across in its own vertices (a big model, not a
     // scaled matrix: that's how the HUD is told apart).
     float roofVertices[24];
@@ -757,7 +776,11 @@ int main(int argc, char** argv)
     const bool snowTiming = mode == "snowperf" || mode == "snowperf0" ||  // timing: snow at 100% / off,
                             mode == "dirtperf" || mode == "ultraperf" ||  // the dirt detail, without and with Ultra,
                             mode == "rainperf";                           // rain at 100%
-    const bool timing = mode == "shadowperf" || mode == "shadowperf0" || snowTiming;
+    // shadowfar: as shadowperf, plus 2400 boxes placed in world space (their vertices where they stand,
+    // drawn with the bare view, as the game draws much of a track's scenery), nearly all far outside the
+    // shadow distance: none of those may cost the shadow map anything.
+    const bool shadowFar = mode == "shadowfar";
+    const bool timing = mode == "shadowperf" || mode == "shadowperf0" || shadowFar || snowTiming;
     const bool hiddenWheels = mode == "tireshidden";
     // gatebox: the same bike, standing still for 3.4 s beside a box the game then stops drawing (like
     // the start gate): the box must not be taken for part of your bike.
@@ -769,6 +792,9 @@ int main(int argc, char** argv)
     // wheeldrift: both wheels in view, where they sit already learnt; after 1 s the rear one is drawn
     // 6 cm lower for good (a long bad moment). What's learnt must not creep after it.
     const bool wheelDrift = mode == "wheeldrift";
+    // riderfar: shadows on, your rider, and another 8 m behind yours: its body (skinned) is held back
+    // with its bones and cast in the batch - its shadow must be there as when cast one at a time.
+    const bool riderFar = mode == "riderfar";
     // rival: your bike (where its wheels sit learnt) with another bike 1 m beside it at your speed,
     // its wheels spinning too; after 1.5 s your rear wheel isn't drawn (as in first person). Your
     // tire marks must stay yours: none in the other bike's track.
@@ -781,7 +807,7 @@ int main(int argc, char** argv)
     const bool waterSpray = mode == "waterspray";
     const bool roostRun = mode == "roost" || snowRoll || waterSpray;
     const bool hideHud = mode == "hidehud";
-    int frames = roostRun ? 2000 : rivalStep ? 700 : rivalRoost ? 320 : timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 330 : headShadow ? 40 : stadiumSwap ? 40 : 12;
+    int frames = roostRun ? 2000 : rivalStep ? 700 : rivalRoost ? 320 : timing ? 160 : gateBox || wheelDrift || rival || riderFar ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 330 : headShadow ? 40 : stadiumSwap ? 40 : 12;
     // hidehud: the game's menu over the race, a draw of its own (another texture) right of the HUD.
     // Esc opens it (frames 100-199), Esc closes it; then it's opened and closed without Esc (frames
     // 230-299: a click in it). The HUD and the menu are sampled on the frames below.
@@ -911,6 +937,8 @@ int main(int argc, char** argv)
             // person the game doesn't draw it).
             const float bob = rearHidden ? 0.15f * u * std::sin(elapsed * 9.0f) : 0.0f;
             Rider(facingX, x0 + 0.85f * u, 0.9f * u + lift + bob, -4.5f * u, u, rearHidden && elapsed < 1.4f);
+            if (riderFar)  // (another rider, 8 m further from the camera, standing still)
+                Rider(facingX, 1.0f * u, 0.9f * u, -12.5f * u, u);
             if (gateBox && elapsed < 3.4f) {  // the box: 0.6 m beside the bike, standing on the ground
                 const float boxModel[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  x0, 0.0f, -4.5f * u + 0.6f * u, 1 };
                 float boxView[16];
@@ -1094,6 +1122,12 @@ int main(int argc, char** argv)
                 Mul(view, box, boxView);
                 gl.UniformMatrix4fv(oMv, 1, GL_FALSE, boxView);
                 p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, nullptr);
+            }
+            if (shadowFar) {  // (world space: the bare view, each cube its own draw)
+                gl.UniformMatrix4fv(oMv, 1, GL_FALSE, view);
+                gl.BindVertexArray(farArray);
+                for (int k = 0; k < kFarBoxes; ++k)
+                    p_glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, reinterpret_cast<const void*>(static_cast<uintptr_t>(k) * 72));
             }
         }
 
@@ -1285,7 +1319,7 @@ int main(int argc, char** argv)
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
             p_glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, rgbBefore.data());
         }
-        if (frameIndex == (hideHud || headShadow || rival || stadiumSwap || roostRun || (rearHidden && !gateBox) ? frames - 1 : 11)) {
+        if (frameIndex == (hideHud || headShadow || rival || stadiumSwap || roostRun || riderFar || (rearHidden && !gateBox) ? frames - 1 : 11)) {
             p_glFinish();
             p_glReadBuffer(GL_BACK);
             p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -1685,7 +1719,7 @@ int main(int argc, char** argv)
                timedMs / timedFrames, timedFrames);
     } else if (timing) {
         printf("    %s: %.3f ms per frame with 800 shadow casters (%d frames)\n",
-               mode == "shadowperf" ? "drawn together" : "one at a time", timedMs / timedFrames, timedFrames);
+               mode != "shadowperf0" ? "drawn together" : "one at a time", timedMs / timedFrames, timedFrames);
     } else if (mode == "tires" || mode == "tiresfeet" || mode == "tiresair") {
         const float u = mode == "tiresfeet" ? 3.2808f : 1.0f;
         // Where world points land on the screen (y from the top).

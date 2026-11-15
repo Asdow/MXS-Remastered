@@ -7025,6 +7025,7 @@ int   g_riderDrawsDropped = 0;     // this frame, for the trace: rider pieces no
 int   g_nearCasts[6] = {};         // this frame, for the trace: the draws around your rider (NoteNearCast)
 int   g_allCasts[8] = {};          // this frame, for the trace: every draw the shadow map was offered (NoteCast)
 int   g_castBands[4] = {};         // and the 3D ones by how far from the camera (NoteCastDistance)
+int   g_castBoxed[2] = {};         // this frame: casts judged by their own box - left out, taken (ShadowMatrices)
 int   g_replays[2][4] = {};        // this frame, for the trace: repeats into the shadow map (NoteReplay)
 int   g_realBodyDrawn = 0;         // this frame: pieces of your rider drawn along with one the game drew (NoteRealBodyDrawn)
 int   g_realBodyTraced = 0;        // (the last frame's, for the trace)
@@ -7589,7 +7590,8 @@ bool WantsShadowCasters()
            g_glState >= 0 && (!g_shadow.setup || g_shadow.usable);
 }
 
-bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades)
+bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades,
+                    const float* boxLo, const float* boxHi)
 {
     *cascades = 0;
     if (!g_shadow.setup)
@@ -7600,6 +7602,39 @@ bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float ligh
     for (int i = 0; i < 16; ++i)
         modelview[i] = uploaded[i];
     MatMul(g_shadow.toLight, modelview, toLight);
+
+    // Its own box measured (the scenery): into exactly the cascades it lands in. The sun's view is
+    // straight along its light, so what of it falls outside a cascade's square is nowhere in that
+    // cascade's map - leaving it out changes nothing there. (By its origin alone, with the slack an
+    // origin needs, nearly everything was drawn: in a lobby ~3000 draws a frame went into the map,
+    // most of them meshes placed in world space - origin at the track's - drawn into all four.)
+    static const bool noBox = GetEnvironmentVariableA("MXCAM_TEST_NO_BOXCULL", nullptr, 0) > 0;  // (tests: the old way, to compare)
+    if (boxLo && boxHi && !anchorEye && !noBox) {
+        double lo[3] = {}, hi[3] = {};
+        for (int corner = 0; corner < 8; ++corner) {
+            const Vec3 p = TransformPoint(toLight, Vec3{ (corner & 1) ? boxHi[0] : boxLo[0], (corner & 2) ? boxHi[1] : boxLo[1],
+                                                         (corner & 4) ? boxHi[2] : boxLo[2] });
+            const double v[3] = { p.x, p.y, p.z };
+            for (int r = 0; r < 3; ++r) {
+                lo[r] = corner ? std::fmin(lo[r], v[r]) : v[r];
+                hi[r] = corner ? std::fmax(hi[r], v[r]) : v[r];
+            }
+        }
+        if (lo[2] > g_shadow.depth || hi[2] < -g_shadow.depth)
+            return false;
+        const double margin = 1.0 * UnitsPerMetre();  // (a little over: never a texel short at a square's edge)
+        for (int c = 0; c < kCascades; ++c) {
+            const double h = g_shadow.cascadeHalf[c] + margin;
+            if (hi[0] >= g_shadow.cascadeX[c] - h && lo[0] <= g_shadow.cascadeX[c] + h && hi[1] >= g_shadow.cascadeY[c] - h &&
+                lo[1] <= g_shadow.cascadeY[c] + h)
+                *cascades |= 1u << c;
+        }
+        ++g_castBoxed[*cascades ? 1 : 0];
+        if (!*cascades)
+            return false;
+        ToFloat(toLight, lightModelview, 16);
+        return true;
+    }
 
     // Only what's near enough to throw a shadow inside the map. A mesh placed in world space (its
     // model matrix is the identity) can't be judged by its origin: it is always drawn.
@@ -8130,8 +8165,9 @@ const char* WheelTraceText()
     snprintf(text + n, sizeof text - n, ",%d,%d,%d,%.2f,%d", g_markRepressed, static_cast<int>(g_repress.size()),
              static_cast<int>(g_markCacheSize[2]), g_markMs, g_markFit ? 1 : 0);
     n = static_cast<int>(strlen(text));
-    snprintf(text + n, sizeof text - n, ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", g_gpuMs[0], g_gpuMs[1], g_cpuMs[0], g_cpuMs[1],
-             g_castNowMsTraced, g_lobbyMs);
+    snprintf(text + n, sizeof text - n, ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d/%d", g_gpuMs[0], g_gpuMs[1], g_cpuMs[0], g_cpuMs[1],
+             g_castNowMsTraced, g_lobbyMs, g_castBoxed[0], g_castBoxed[1]);
+    g_castBoxed[0] = g_castBoxed[1] = 0;
     for (auto& kind : g_replays)
         for (int& c : kind)
             c = 0;

@@ -58,7 +58,10 @@ bool WantsShadowCasters();
 // far away to matter.
 // The map is a grid of cascades (sharper near you, wider further out): cascades gets which of them
 // the object can reach (bit i: cascade i); draw it into each with UseShadowCascade.
-bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades);
+// boxLo / boxHi (optional): the draw's own box, in its model's space (measured from its vertices): it is
+// then taken into exactly the cascades that box reaches, not judged by its origin.
+bool ShadowMatrices(const float uploaded[16], const float* anchorEye, float lightModelview[16], unsigned* cascades,
+                    const float* boxLo = nullptr, const float* boxHi = nullptr);
 int  ShadowCascades();
 // Between BeginShadowDraw and EndShadowDraw: draw into cascade i from now (its tile of the map),
 // with this projection (uploaded in place of the object's own).
