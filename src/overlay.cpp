@@ -84,6 +84,8 @@ constexpr GLenum kClampToEdge             = 0x812F;
 constexpr GLenum kPixelUnpackBuffer       = 0x88EC;
 constexpr GLenum kPixelUnpackBufferBinding = 0x88EF;
 constexpr GLenum kFramebufferSrgb         = 0x8DB9;
+constexpr GLenum kReadFramebuffer         = 0x8CA8;
+constexpr GLenum kReadFramebufferBinding  = 0x8CAA;
 
 struct GLApi {
     decltype(&::glGetIntegerv)        GetIntegerv;
@@ -101,6 +103,7 @@ struct GLApi {
     decltype(&::glTexImage2D)         TexImage2D;
     decltype(&::glPixelStorei)        PixelStorei;
     decltype(&::glDrawArrays)         DrawArrays;
+    decltype(&::glCopyTexSubImage2D)  CopyTexSubImage2D;  // optional (the menu's opacity)
     decltype(&::wglGetCurrentContext) GetCurrentContext;
     GLuint (APIENTRY* CreateShader)(GLenum);
     void   (APIENTRY* ShaderSource)(GLuint, GLsizei, const char* const*, const GLint*);
@@ -189,6 +192,7 @@ bool LoadGL()
     ok = LoadFunction(g_gl.GenVertexArrays, "glGenVertexArrays") && ok;
     ok = LoadFunction(g_gl.BindVertexArray, "glBindVertexArray") && ok;
     LoadFunction(g_gl.BindFramebuffer, "glBindFramebuffer");
+    LoadFunction(g_gl.CopyTexSubImage2D, "glCopyTexSubImage2D");
     LoadFunction(g_gl.BindSampler, "glBindSampler");
     return ok;
 }
@@ -821,6 +825,8 @@ struct GpuResources {
     bool   failed  = false;
     GLuint program = 0, vao = 0, vbo = 0, texture = 0;
     GLint  screenUniform = -1, atlasUniform = -1;
+    GLuint backdrop = 0;                 // the game's picture under the menu (Config::menuOpacity)
+    int    backdropW = 0, backdropH = 0;
 };
 GpuResources g_gpu;
 
@@ -1642,6 +1648,10 @@ const RowDef kRows[] = {
     Toggle(kTabOther, "THIS MENU",      "Fade while adjusting",      &Config::fadeMenu)
         .Help("While you drag a GRAPHICS slider (or step it with the arrow keys) the menu fades out, "
               "all but that slider, so you can see the whole picture change."),
+    Slider(kTabOther, nullptr,          "Menu opacity",              &Config::menuOpacity,      0.2,   1.0,   0.01,   100.0,  0, "%")
+        .Help("How solid this menu is: all of it, the panel, its text and the help. Lower lets the game "
+              "show through. Drag the corner at the menu's bottom right to make it bigger or smaller, "
+              "and its top edge to move it."),
     Toggle(kTabSounds, "SOUND MODS",     "125 two-stroke",            &Config::soundPack125)
         .Help("A fuller engine sound for every bike that uses the game's stock 125 two-stroke engine. "
               "The stock sounds repeat one recorded engine cycle over and over; this one plays 16 "
@@ -1738,6 +1748,11 @@ struct PanelState {
     float  offsetX = 0, offsetY = 0;  // where it's been dragged to, from its usual place (kept while the game runs)
     bool   moving       = false;      // being dragged by its top edge or its logo
     float  grabX = 0, grabY = 0;      // the mouse against the offset when the drag began
+    float  zoom         = 1.0f;       // its size against the usual (its bottom right corner dragged; kept while the game runs)
+    bool   resizing     = false;      // its corner being dragged
+    float  resizeScale = 1, resizeW = 0, resizeH = 0, resizeX = 0, resizeY = 0;  // when that began: the size, the mouse
+    float  baseScale    = 1.0f;       // this window's usual scale, and the biggest the whole panel fits at
+    float  fitScale     = 1.0f;
     int    tab          = 0;
     int    selected     = kTabBarItem;  // (the tabs: their marker shows from the first time the menu opens)
     int    dragging     = -1;  // index into kRows of the slider being dragged with the mouse
@@ -1795,6 +1810,9 @@ PanelState g_panel;
 // Parts of the batch the fade leaves alone (the slider being adjusted, the cursor): [begin, end).
 struct KeepRange { size_t begin, end; };
 std::vector<KeepRange> g_keepRanges;
+// The menu's own part of the batch (g_batch[g_menuBegin, g_menuEnd): not the vignette under it, nor
+// the cursor or a question over it), drawn see-through as one (Config::menuOpacity; DrawBatch).
+size_t g_menuBegin = 0, g_menuEnd = 0, g_menuCursor = SIZE_MAX;
 constexpr float  kFadedOpacity = 0.06f;
 constexpr double kAdjustHold   = 0.6;  // s the menu stays faded after the last arrow key step
 
@@ -2738,6 +2756,30 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             g_panel.moving = false;
         }
     }
+    // Made bigger or smaller by its bottom right corner (the empty space under the buttons there).
+    const float cornerS = pad;
+    const bool onCorner = !g_panel.moving && in.Inside(px + panelW - cornerS, py + panelH - cornerS, cornerS, cornerS);
+    if (in.pressed && onCorner && !g_panel.resizing) {
+        g_panel.resizing = true;
+        g_panel.resizeScale = g_atlasScale;
+        g_panel.resizeW = panelW;
+        g_panel.resizeH = panelH;
+        g_panel.resizeX = in.mx;
+        g_panel.resizeY = in.my;
+    }
+    if (g_panel.resizing) {
+        if (in.down && in.inside) {
+            // (By how far the corner went, across and down alike.)
+            const float ratio = 0.5f * ((g_panel.resizeW + in.mx - g_panel.resizeX) / g_panel.resizeW +
+                                        (g_panel.resizeH + in.my - g_panel.resizeY) / g_panel.resizeH);
+            // (Never a size that would only be clamped: from about half the usual to as big as fits.)
+            g_panel.zoom = Clamp(g_panel.resizeScale * ratio, 0.45f, g_panel.fitScale) / std::fmax(g_panel.baseScale, 0.01f);
+            if (std::fabs(g_panel.zoom - 1.0f) < 0.025f)
+                g_panel.zoom = 1.0f;  // (back at its usual size: snapped to it)
+        } else {
+            g_panel.resizing = false;
+        }
+    }
 
     // Keyboard-focus marker: a short red bar just left of the focused item.
     const auto Marker = [&](float left, float top, float height) { Rect(left, top, S(3), height, kAccentHot); };
@@ -2807,6 +2849,15 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         for (int row = 0; row < 2; ++row)
             for (int col = -1; col <= 1; ++col)
                 Disc(gx + col * S(9), gy + (row - 0.5f) * S(8), d * 0.5f + 0.5f, dot);
+    }
+    // ---- The corner it's resized by (bottom right): three short diagonal lines ----
+    {
+        const uint32_t line = g_panel.resizing ? kAccentHot : (onCorner ? kLabel : Rgba(90, 90, 96, 1.0f));
+        const float w = std::fmax(1.5f, S(2)), cx = px + panelW - S(9), cy = py + panelH - S(9);
+        for (int k = 1; k <= 3; ++k) {
+            const float len = S(5) * k;
+            Segment(cx - len, cy, cx, cy - len, w, line);
+        }
     }
     // ---- The logo (top right, over the settings) ----
     float logoLeft = boxR;
@@ -3509,6 +3560,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     // Our own cursor (the system one is hidden over the game window while the panel is open).
     if (in.inside) {
         const size_t cursorBegin = g_batch.size();
+        g_menuCursor = cursorBegin;
         Disc(in.mx, in.my, S(6) + 1.5f, Rgba(0, 0, 0, 0.55f));
         Disc(in.mx, in.my, S(5), White(1.0f));
         g_keepRanges.push_back({ cursorBegin, g_batch.size() });
@@ -3549,7 +3601,8 @@ void UpdateFade(double now)
 // Everything drawn this frame but the kept parts, at the fade's opacity.
 void ApplyFade()
 {
-    if (g_panel.opacity >= 1.0f)
+    const float opacity = g_panel.opacity;
+    if (opacity >= 1.0f)
         return;
     size_t next = 0;  // the kept ranges are in batch order
     for (size_t v = 0; v < g_batch.size(); ++v) {
@@ -3558,7 +3611,7 @@ void ApplyFade()
         if (next < g_keepRanges.size() && v >= g_keepRanges[next].begin)
             continue;
         uint32_t& color = g_batch[v].color;
-        const uint32_t alpha = static_cast<uint32_t>((color >> 24) * g_panel.opacity + 0.5f);
+        const uint32_t alpha = static_cast<uint32_t>((color >> 24) * opacity + 0.5f);
         color = (color & 0x00FFFFFFu) | (alpha << 24);
     }
 }
@@ -3567,6 +3620,20 @@ void DrawBatch(int width, int height)
 {
     if (g_batch.empty())
         return;
+    // The menu's opacity: the game's picture under it copied first, the menu drawn solid, then that
+    // picture laid back over it at what's left (1 - opacity). So the whole menu fades as one: faded
+    // layer by layer, what's under its fills (the red of its edges) showed through them.
+    const float opacity = static_cast<float>(Clamp(EditConfig().menuOpacity, 0.2, 1.0));
+    const bool seeThrough = opacity < 0.999f && g_gl.CopyTexSubImage2D && g_menuEnd > g_menuBegin && g_menuEnd <= g_batch.size();
+    const size_t backdropAt = g_batch.size();
+    if (seeThrough) {
+        const uint32_t c = White(1.0f - opacity);
+        const float w = static_cast<float>(width), h = static_cast<float>(height);
+        // (The copy's rows run bottom up.)
+        const Vertex quad[6] = { { 0, 0, 0, 1, c }, { w, 0, 1, 1, c }, { w, h, 1, 0, c },
+                                 { 0, 0, 0, 1, c }, { w, h, 1, 0, c }, { 0, h, 0, 0, c } };
+        g_batch.insert(g_batch.end(), quad, quad + 6);
+    }
     if (g_gl.BindFramebuffer)
         g_gl.BindFramebuffer(kDrawFramebuffer, 0);
     g_gl.Viewport(0, 0, width, height);
@@ -3592,22 +3659,62 @@ void DrawBatch(int width, int height)
     g_gl.BindBuffer(kArrayBuffer, g_gpu.vbo);
     g_gl.BufferData(kArrayBuffer, static_cast<ptrdiff_t>(g_batch.size() * sizeof(Vertex)), g_batch.data(), kStreamDraw);
     // In order: what's outside the clip ranges as it is, each clip range inside its rectangle.
-    size_t at = 0;
     const auto Draw = [](size_t from, size_t to) {
         if (to > from)
             g_gl.DrawArrays(GL_TRIANGLES, static_cast<GLint>(from), static_cast<GLsizei>(to - from));
     };
-    for (const ClipRange& clip : g_clips) {
-        Draw(at, clip.begin);
-        g_gl.Enable(GL_SCISSOR_TEST);
-        const int x0 = static_cast<int>(std::floor(clip.x)), x1 = static_cast<int>(std::ceil(clip.x + clip.w));
-        const int y0 = static_cast<int>(std::floor(clip.y)), y1 = static_cast<int>(std::ceil(clip.y + clip.h));
-        g_gl.Scissor(x0, height - y1, x1 - x0 > 0 ? x1 - x0 : 0, y1 - y0 > 0 ? y1 - y0 : 0);
-        Draw(clip.begin, clip.end);
-        g_gl.Disable(GL_SCISSOR_TEST);
-        at = clip.end;
+    const auto DrawRange = [&](size_t from, size_t to) {
+        size_t at = from;
+        for (const ClipRange& clip : g_clips) {
+            const size_t begin = std::max(clip.begin, from), end = std::min(clip.end, to);
+            if (end <= begin)
+                continue;
+            Draw(at, begin);
+            g_gl.Enable(GL_SCISSOR_TEST);
+            const int x0 = static_cast<int>(std::floor(clip.x)), x1 = static_cast<int>(std::ceil(clip.x + clip.w));
+            const int y0 = static_cast<int>(std::floor(clip.y)), y1 = static_cast<int>(std::ceil(clip.y + clip.h));
+            g_gl.Scissor(x0, height - y1, x1 - x0 > 0 ? x1 - x0 : 0, y1 - y0 > 0 ? y1 - y0 : 0);
+            Draw(begin, end);
+            g_gl.Disable(GL_SCISSOR_TEST);
+            at = end;
+        }
+        Draw(at, to);
+    };
+    if (!seeThrough) {
+        DrawRange(0, g_batch.size());
+    } else {
+        DrawRange(0, g_menuBegin);
+        // The picture under the menu (the game's, and the vignette's), copied.
+        if (!g_gpu.backdrop)
+            g_gl.GenTextures(1, &g_gpu.backdrop);
+        g_gl.BindTexture(GL_TEXTURE_2D, g_gpu.backdrop);
+        if (g_gpu.backdropW != width || g_gpu.backdropH != height) {
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, kClampToEdge);
+            g_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, kClampToEdge);
+            g_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            g_gpu.backdropW = width;
+            g_gpu.backdropH = height;
+        }
+        GLint readFramebuffer = 0;
+        if (g_gl.BindFramebuffer) {
+            g_gl.GetIntegerv(kReadFramebufferBinding, &readFramebuffer);
+            g_gl.BindFramebuffer(kReadFramebuffer, 0);
+        }
+        g_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+        if (g_gl.BindFramebuffer)
+            g_gl.BindFramebuffer(kReadFramebuffer, static_cast<GLuint>(readFramebuffer));
+        g_gl.BindTexture(GL_TEXTURE_2D, g_gpu.texture);
+        DrawRange(g_menuBegin, g_menuEnd);
+        // That picture back over it, at what's left of the opacity.
+        g_gl.BindTexture(GL_TEXTURE_2D, g_gpu.backdrop);
+        Draw(backdropAt, backdropAt + 6);
+        g_gl.BindTexture(GL_TEXTURE_2D, g_gpu.texture);
+        DrawRange(g_menuEnd, backdropAt);
+        g_batch.resize(backdropAt);
     }
-    Draw(at, g_batch.size());
+    g_menuBegin = g_menuEnd = 0;
 }
 
 // ===========================================================================
@@ -4165,6 +4272,15 @@ void OverlayFrame(HDC dc)
         return true;
     }();
     (void)testOffset;
+    // (And resized to this much of its usual size.)
+    static const bool testZoom = [] {
+        char text[16] = "";
+        if (GetEnvironmentVariableA("MXCAM_TEST_MENU_ZOOM", text, sizeof text) <= 0)
+            return false;
+        g_panel.zoom = strtof(text, nullptr);
+        return true;
+    }();
+    (void)testZoom;
 
     if (!g_panel.open) {
         if (!window || !g_glAvailable)
@@ -4236,8 +4352,14 @@ void OverlayFrame(HDC dc)
     // held down so the whole panel fits top to bottom: the tallest tab grew past what 1080 holds at
     // 1.0 (a window 1074 high cut the buttons off), and rounding to a step never takes it back over.
     const float panelHeight = PanelHeightAtScale1();
-    float scale = std::round(Clamp(std::fmin(height / std::fmax(1080.0f, panelHeight), width / 1440.0f), 0.6f, 2.0f) * 20.0f) / 20.0f;
-    while (scale > 0.6f && scale * panelHeight > height)
+    const float baseScale = Clamp(std::fmin(height / std::fmax(1080.0f, panelHeight), width / 1440.0f), 0.6f, 2.0f);
+    // Its size dragged bigger or smaller (g_panel.zoom): from about half the usual up to as big as fits.
+    const float fitScale = std::fmax(0.45f, std::fmin(2.0f, std::fmin(height / panelHeight, width / 1440.0f)));
+    g_panel.baseScale = baseScale;
+    g_panel.fitScale = fitScale;
+    const float wanted = g_panel.zoom == 1.0f ? baseScale : Clamp(baseScale * g_panel.zoom, 0.45f, fitScale);
+    float scale = std::round(wanted * 20.0f) / 20.0f;
+    while (scale > (g_panel.zoom == 1.0f ? 0.6f : 0.45f) && scale * panelHeight > height)
         scale -= 0.05f;
     // For automated tests: drawn at this scale whatever the window (to see that a 4K screen's fits).
     static const float testScale = [] {
@@ -4249,7 +4371,15 @@ void OverlayFrame(HDC dc)
 
     SavedState saved;
     SaveState(saved);
+    // (Resized from its bottom right corner: its top left stays where it is.)
+    const float scaleBefore = g_atlasScale;
+    const PanelPlace placeBefore = PanelOnScreen(height);
     if (EnsureResources(scale)) {
+        if (g_panel.resizing && g_atlasScale != scaleBefore) {
+            const PanelPlace placeAfter = PanelOnScreen(height);
+            g_panel.offsetX += placeBefore.x - placeAfter.x;
+            g_panel.offsetY += placeBefore.y - placeAfter.y;
+        }
         g_batch.clear();
         g_keepRanges.clear();
         g_clips.clear();
@@ -4263,11 +4393,14 @@ void OverlayFrame(HDC dc)
             if (HintLeaving(now) >= 1.0f)
                 g_hintDone = true;
         }
+        g_menuBegin = g_batch.size();
+        g_menuCursor = SIZE_MAX;
         if (g_panel.askSticky || g_panel.askDefaults || g_panel.askRestart) {
             // The question takes every click and key; the menu behind it is shown, untouched.
             Input none;
             none.mx = none.my = -1;
             BuildPanel(width, height, none, now);
+            g_menuEnd = std::min(g_batch.size(), g_menuCursor);
             ApplyFade();
             if (g_panel.askRestart)
                 BuildRestartNotice(width, height, in, now);
@@ -4277,6 +4410,7 @@ void OverlayFrame(HDC dc)
                 BuildStickyQuestion(width, height, in, now);
         } else {
             BuildPanel(width, height, in, now);
+            g_menuEnd = std::min(g_batch.size(), g_menuCursor);
             ApplyFade();
         }
         DrawBatch(width, height);

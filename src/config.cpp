@@ -409,6 +409,7 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Other",     L"BrakeSqueal",          c.brakeSqueal },
         { L"Other",     L"DabSticky",            static_cast<double>(c.dabSticky) },
         { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
+        { L"Other",     L"MenuOpacity",          c.menuOpacity },
     };
 }
 
@@ -623,6 +624,7 @@ void CopyTunables(const Config& from, Config& to)
     to.brakeSqueal          = from.brakeSqueal;
     to.dabSticky            = from.dabSticky;
     to.fadeMenu             = from.fadeMenu;
+    to.menuOpacity          = from.menuOpacity;
 }
 
 void ResetTunables()
@@ -916,6 +918,7 @@ Config ParseConfig(const Config& base)
     c.brakeSqueal      = Clamp(ReadDouble(L"Other", L"BrakeSqueal", c.brakeSqueal), 0.0, 1.0);
     c.dabSticky        = Clamp(ReadInt(L"Other", L"DabSticky", c.dabSticky), 0, 2);
     c.fadeMenu         = ReadInt(L"Other", L"FadeMenu", c.fadeMenu) != 0;
+    c.menuOpacity      = Clamp(ReadDouble(L"Other", L"MenuOpacity", c.menuOpacity), 0.2, 1.0);
     c.fullscreenWindow = ReadInt(L"Other", L"FullscreenWindow", c.fullscreenWindow) != 0;
     c.dumpShaders      = ReadInt(L"Graphics", L"DumpShaders", c.dumpShaders) != 0;
 
