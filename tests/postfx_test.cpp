@@ -13,6 +13,7 @@
 //     night     TimeOfDay=0: dark ground, a night sky, the HUD untouched, the sun turned
 //     snow      WEATHER Snow=1, Snowfall=1: white ground (the object isn't), a grey sky, flakes falling
 //     roost     your bike (game feet) speeding up across the view: it throws roost (dust and clods)
+//     waterspray  the same in the rain with the roost off: it throws water (drops and spray)
 //     rain      WEATHER Rain=1 at 100%: a dark grey sky, drops falling, the ground darker (wet), puddles that
 //               reflect, and the object's shader carrying the wet shine (rainperf / snowperf0: timing)
 //     lightning the rain with Lightning=1: a strike ahead 0.1 s in (MXCAM_TEST_LIGHTNING; another time
@@ -348,6 +349,9 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : tiresLate ? "TireMarks=1\nTireDirt=0" : "TireMarks=1\nTireDirt=1");
     else if (mode == "roost")  // your bike speeding up: roost (and its marks and dirt)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1\nRoost=1\nRoostDust=1");
+    else if (mode == "waterspray")  // the same in the rain, the roost off: only the water the rear tire throws
+        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1\nRoost=0") +
+                   "[Weather]\nRain=1\nRainfall=0\nWetness=0.8\nPuddles=0.5\nRainSound=0\nWaterSpray=1\n";
     else if (mode == "snowroll")  // the same in the snow, with the tires' sound: never taken off the ground on the flat
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1\nRoost=1\nRoostDust=1") +
                    "[Weather]\nSnow=1\nSnowfall=0.5\nSnowSound=0\nSnowTires=1\n";
@@ -729,7 +733,8 @@ int main(int argc, char** argv)
     const bool rivalStep = mode == "rivalstep";
     const bool rival = mode == "rival" || rivalRoost || rivalStep;
     const bool snowRoll = mode == "snowroll";
-    const bool roostRun = mode == "roost" || snowRoll;
+    const bool waterSpray = mode == "waterspray";
+    const bool roostRun = mode == "roost" || snowRoll || waterSpray;
     const bool hideHud = mode == "hidehud";
     int frames = roostRun ? 2000 : rivalStep ? 700 : rivalRoost ? 320 : timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 330 : headShadow ? 40 : stadiumSwap ? 40 : 12;
     // hidehud: the game's menu over the race, a draw of its own (another texture) right of the HUD.
@@ -1386,7 +1391,10 @@ int main(int argc, char** argv)
         }
         Check(log.find("postfx: roost ready") != std::string::npos && log.find("postfx: roost's dirt colour ready") != std::string::npos,
               "the roost's shaders compile");
-        Check(log.find("roost: rear tires are throwing dirt") != std::string::npos, "speeding up, your rear tire throws roost");
+        if (waterSpray)
+            Check(log.find("roost: rear tires are throwing water") != std::string::npos, "speeding up in the rain, your rear tire throws water");
+        else
+            Check(log.find("roost: rear tires are throwing dirt") != std::string::npos, "speeding up, your rear tire throws roost");
         if (snowRoll) {
             size_t offs = 0, at = 0;
             while ((at = log.find("snow tires: OFF the ground", at)) != std::string::npos) {

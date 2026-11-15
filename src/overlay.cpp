@@ -1689,6 +1689,11 @@ const RowDef kRows[] = {
     Slider(kTabWeather, nullptr,          "Reflections",               &Config::rainReflections,  0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How strongly the puddles and the wet ground reflect: the sky and what stands around them "
               "(bikes, riders, trees, banners). Lower costs a little less."),
+    Slider(kTabWeather, nullptr,          "Water spray",               &Config::waterSpray,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("The water your rear tire throws off the wet track: muddy drops and spray fanning up and out "
+              "behind you, most when you're fast, on the gas or sliding through a turn, and more the wetter "
+              "the track (Wetness, Puddles). From every bike with Roost on every bike. Higher: a bigger, "
+              "thicker spray."),
     Slider(kTabWeather, nullptr,          "Rain sound",                &Config::rainSound,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("How loud the rain sounds: steady rain all around you, louder the harder it rains (silent "
               "with Rainfall off). Played beside the game's own sound, and quiet while the game is in the "
@@ -2327,7 +2332,8 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
     const bool rainRow = def.number == &Config::rainfall || def.number == &Config::rainWind || def.number == &Config::wetness ||
                          def.number == &Config::puddles || def.number == &Config::rainReflections ||
                          def.number == &Config::lightning || def.number == &Config::lightningSound ||
-                         def.number == &Config::rainSound || def.number == &Config::screenDrops;
+                         def.number == &Config::rainSound || def.number == &Config::screenDrops ||
+                         def.number == &Config::waterSpray;
     const bool snowRow = def.number == &Config::snowAmount || def.number == &Config::snowfall || def.number == &Config::snowWind || def.number == &Config::snowSound ||
                          def.number == &Config::snowTires;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
@@ -2559,7 +2565,7 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.roost <= 0.0;
         if (def.number == &Config::rainWind || def.number == &Config::rainSound || def.number == &Config::screenDrops)
             return cfg.rainfall <= 0.0;
-        if (def.number == &Config::rainReflections)
+        if (def.number == &Config::rainReflections || def.number == &Config::waterSpray)
             return cfg.wetness <= 0.0 && cfg.puddles <= 0.0;
         if (def.number == &Config::lightningSound)
             return cfg.lightning <= 0.0;

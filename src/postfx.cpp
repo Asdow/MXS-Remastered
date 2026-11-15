@@ -4729,6 +4729,7 @@ struct OtherBike {
     Vec3   accelFromVelocity;   // the velocity its acceleration is measured against, and when
     double accelFromTime = -1;
     double roostDust = 0, roostClod = 0;  // its roost's bits owed (fractions carried frame to frame)
+    double roostDrop = 0, roostMist = 0;  // (and its water spray's, in the rain)
     // Its roost this frame, for the log: why none (0: thrown; 1 yours, 2 too far, 3 its motion not known
     // yet, 4 standing with its front not known, 5 down on its side) and how it was moving.
     int    roostWhy = -1;
@@ -4873,6 +4874,8 @@ void TrackOtherBikes(double now, double dt)
             bike.against = was.against;
             bike.roostDust = was.roostDust;
             bike.roostClod = was.roostClod;
+            bike.roostDrop = was.roostDrop;
+            bike.roostMist = was.roostMist;
             // Its motion: a line fitted through where it was over the last third of a second (only the
             // frames it had moved since, and every half second standing still), and its acceleration
             // from how that changes over a sixth of one.
@@ -5528,13 +5531,15 @@ constexpr int    kRoostMax          = 9000;   // bits alive at once (dust and cl
 constexpr double kRoostDustRate     = 55.0;   // puffs a second, fully on
 constexpr double kRoostClodRate     = 120.0;  // clods a second, fully on
 constexpr double kRoostExposure     = 0.02;   // s: how long a clod's streak is (its motion in that time)
+constexpr double kRoostDropRate     = 750.0;  // water drops a second, fully on (the rain's Config::waterSpray)
+constexpr double kRoostMistRate     = 110.0;  // puffs of spray a second, fully on
 struct RoostBit {
     Vec3   pos, vel;          // world, game units (/ s)
     double age = 0, life = 1, size0 = 0, size = 0, alpha0 = 0, seed = 0, ground = 0;
-    int    kind = 0;          // 0 dust, 1 a clod
+    int    kind = 0;          // 0 dust, 1 a clod, 2 a water drop, 3 a puff of spray (the fine water)
 };
 std::vector<RoostBit> g_roost;
-double   g_roostDustCarry = 0, g_roostClodCarry = 0;
+double   g_roostDustCarry = 0, g_roostClodCarry = 0, g_roostDropCarry = 0, g_roostMistCarry = 0;
 Vec3     g_roostLastVel{ 0, 0, 0 }, g_roostAccel{ 0, 0, 0 }, g_roostLastEye{ 0, 0, 0 }, g_roostCamVel{ 0, 0, 0 };
 bool     g_roostHaveVel = false, g_roostHaveEye = false;
 double   g_roostIntensity = 0;  // 0..1.2, eased (for the log / trace)
@@ -5550,6 +5555,16 @@ double RoostRandom()
     return (g_roostRandom & 0xFFFFFF) / 16777216.0;
 }
 double RoostRange(double a, double b) { return a + (b - a) * RoostRandom(); }
+
+// How much water the rear tires throw (Config::waterSpray): in the rain, as much as the track is wet.
+double WaterSprayAmount(const Config& cfg)
+{
+    if (cfg.weather != kWeatherRain || cfg.waterSpray <= 0.0)
+        return 0.0;
+    return cfg.waterSpray * Clamp(std::fmax(cfg.wetness, cfg.puddles) * 1.4, 0.0, 1.0);
+}
+// Anything thrown off the rear tires at all: the roost, or the rain's water spray.
+bool RoostOn(const Config& cfg) { return cfg.roost > 0.0 || WaterSprayAmount(cfg) > 0.0; }
 
 bool BuildOwnProgram(Program& out, const char* vs, const char* fs, const char* name, const char* const* attribs, int count)
 {
@@ -5668,7 +5683,7 @@ void RoostProbe(const double V[16], Vec3 forward, double dt)
 // dustCarry, clodCarry: its bits owed, carried from frame to frame.
 struct RoostThrow { double speed = 0, drive = 0, turn = 0, intensity = 0; };
 RoostThrow EmitRoost(Vec3 contact, Vec3 forward, Vec3 velocity, Vec3 accel, bool grounded, Vec3 up, double step,
-                     double& dustCarry, double& clodCarry)
+                     double& dustCarry, double& clodCarry, double& dropCarry, double& mistCarry)
 {
     const Config& cfg = GetConfig();
     const double u = g_unitsPerMetre;
@@ -5733,15 +5748,66 @@ RoostThrow EmitRoost(Vec3 contact, Vec3 forward, Vec3 velocity, Vec3 accel, bool
         Spawn(0);
     for (; clodCarry >= 1.0; clodCarry -= 1.0)
         Spawn(1);
+
+    // The rain's water spray (Config::waterSpray): the wet tire flings the water it picks up, more the
+    // faster it turns - a steady spray at speed, a burst on the gas, a sheet out of a slide. Up and out
+    // to both sides in wings (fanned wider the faster), a little back; drops in arcs, and a fine spray
+    // around them that hangs a moment and falls.
+    const double water = WaterSprayAmount(cfg);
+    if (water <= 0.0) {
+        dropCarry = mistCarry = 0.0;
+        return r;
+    }
+    double wet = 0.0;
+    if (grounded)
+        wet = (Smooth(1.0, 14.0, r.speed) * 0.75 + Smooth(0.8, 5.0, r.drive) * 0.5 + slide * 0.6) * Smooth(0.6, 2.5, r.speed);
+    wet = Clamp(wet, 0.0, 1.3);
+    r.intensity = std::fmax(r.intensity, wet);
+    // (The slider: about as many as it says low down, and fuller and bigger toward 100%.)
+    const double big = 0.6 + 0.8 * water;
+    dropCarry += wet * water * big * kRoostDropRate * step;
+    mistCarry += wet * water * big * kRoostMistRate * step;
+    const double v = std::fmin(r.speed, 25.0);
+    const auto Water = [&](int kind) {
+        if (static_cast<int>(g_roost.size()) >= kRoostMax)
+            return;
+        RoostBit b;
+        b.kind = kind;
+        b.seed = RoostRandom();
+        b.ground = groundHeight;
+        const double side = RoostRandom() < 0.5 ? -1.0 : 1.0;
+        b.pos = contact - forward * (0.15 * u) + up * (0.08 * u) + across * (side * RoostRange(0.02, 0.12) * u);
+        const double lift = std::fmin(RoostRange(0.2, 0.55) * v + RoostRange(1.0, 2.8), 9.0) * (0.7 + 0.3 * Clamp(wet, 0.0, 1.0));
+        const double out = RoostRange(0.05, 0.45) * v + RoostRange(0.3, 1.2);
+        const double back = RoostRange(0.2, 1.5) + Clamp(r.drive, 0.0, 8.0) * RoostRange(0.1, 0.5);
+        b.vel = up * (lift * u) + across * (side * out * u) - forward * (back * u) + outside * (slide * RoostRange(1.0, 4.0) * u) +
+                velocity * RoostRange(0.05, 0.3);
+        if (kind == 2) {
+            b.life = 2.0;
+            b.size0 = RoostRange(0.006, 0.02) * u * (0.8 + 0.4 * water);
+            b.alpha0 = RoostRange(0.3, 0.6);
+        } else {
+            b.vel = b.vel * 0.75;
+            b.life = RoostRange(0.6, 1.2);
+            b.size0 = RoostRange(0.15, 0.35) * u * (0.8 + 0.5 * water);
+            b.alpha0 = RoostRange(0.12, 0.24) * (0.8 + 0.5 * water);
+        }
+        b.size = b.size0;
+        g_roost.push_back(b);
+    };
+    for (; dropCarry >= 1.0; dropCarry -= 1.0)
+        Water(2);
+    for (; mistCarry >= 1.0; mistCarry -= 1.0)
+        Water(3);
     return r;
 }
 
 // Your bike's roost this frame (and, with Config::roostEveryBike, every other bike's found by its
 // wheels): new bits from the rear tires, every bit moved, then drawn.
-void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now, double dt, int h)
+void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec3 waterLight, double now, double dt, int h)
 {
     const Config& cfg = GetConfig();
-    if (cfg.roost <= 0.0) {
+    if (!RoostOn(cfg)) {
         g_roost.clear();
         g_roostHaveVel = false;
         return;
@@ -5780,7 +5846,7 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
     g_roostHaveEye = true;
 
     const RoostThrow yours = EmitRoost(rear.contact, forward, g_rider.velocity, g_roostAccel, riding && rear.grounded, up, step,
-                                       g_roostDustCarry, g_roostClodCarry);
+                                       g_roostDustCarry, g_roostClodCarry, g_roostDropCarry, g_roostMistCarry);
     g_roostIntensity = yours.intensity;
     // Every other bike found by its wheels (TrackOtherBikes, as the headlights on other bikes): from its
     // rear tire, by its own motion. On the ground unless it's falling freely (a jump).
@@ -5828,7 +5894,7 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
             }
             const bool onGround = b.roostUpAccel > -6.0;
             const RoostThrow thrown = EmitRoost(rearCentre - bikeUp * b.rearRadius, bikeForward, b.velocity, b.accel, onGround, up,
-                                                step, b.roostDust, b.roostClod);
+                                                step, b.roostDust, b.roostClod, b.roostDrop, b.roostMist);
             b.roostWhy = 0;
             b.roostIntensity = thrown.intensity;
             b.roostDrive = thrown.drive;
@@ -5850,8 +5916,16 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
             const double h0 = Dot(b.pos, up) - b.ground;
             if (h0 < 0.3 * b.size)
                 b.pos = b.pos + up * (0.3 * b.size - h0);
+        } else if (b.kind == 3) {
+            // A puff of spray: slowed by the air quickly, spreading, falling (fine water, not dust).
+            b.vel = (b.vel - up * (0.6 * gravity * step)) * std::exp(-step / 0.45);
+            b.pos = b.pos + b.vel * step;
+            b.size = b.size0 + 0.7 * u * std::sqrt(b.age);
+            const double h0 = Dot(b.pos, up) - b.ground;
+            if (h0 < 0.3 * b.size)
+                b.pos = b.pos + up * (0.3 * b.size - h0);
         } else {
-            b.vel = (b.vel - up * (gravity * step)) * std::exp(-step / 2.5);
+            b.vel = (b.vel - up * (gravity * step)) * std::exp(-step / (b.kind == 2 ? 1.2 : 2.5));
             b.pos = b.pos + b.vel * step;
             dead = dead || Dot(b.pos, up) < b.ground - 0.03 * u;
         }
@@ -5864,8 +5938,8 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
     }
     if (!g_roostLogged && !g_roost.empty()) {
         g_roostLogged = true;
-        Log("postfx: roost: rear tires are throwing dirt (yours: %.1f m/s, accelerating %.1f m/s^2, turning %.1f m/s^2)", yours.speed,
-            yours.drive, yours.turn);
+        Log("postfx: roost: rear tires are throwing %s (yours: %.1f m/s, accelerating %.1f m/s^2, turning %.1f m/s^2)",
+            WaterSprayAmount(cfg) > 0.0 ? "water" : "dirt", yours.speed, yours.drive, yours.turn);
     }
     if (riding)
         RoostProbe(V, forward, dt);  // (all the while: the colour is ready when the dirt flies)
@@ -5883,10 +5957,12 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
         double alpha;
         if (b.kind == 0)
             alpha = b.alpha0 * Clamp(b.age / 0.08, 0.0, 1.0) * std::pow(1.0 - t, 1.6);
+        else if (b.kind == 3)
+            alpha = b.alpha0 * Clamp(b.age / 0.05, 0.0, 1.0) * (1.0 - t) * (1.0 - t);
         else
             alpha = b.alpha0 * Clamp((1.0 - t) * 4.0, 0.0, 1.0);
         const Vec3 rel = b.pos - eye;
-        const Vec3 move = (b.vel - g_roostCamVel) * kRoostExposure;
+        const Vec3 move = (b.vel - g_roostCamVel) * (b.kind == 2 ? 1.8 * kRoostExposure : kRoostExposure);  // (water: longer streaks)
         const float v[11] = { static_cast<float>(rel.x), static_cast<float>(rel.y), static_cast<float>(rel.z), static_cast<float>(b.size),
                               static_cast<float>(alpha), static_cast<float>(b.kind), static_cast<float>(b.seed), static_cast<float>(t),
                               static_cast<float>(move.x), static_cast<float>(move.y), static_cast<float>(move.z) };
@@ -5917,6 +5993,7 @@ void Roost(const double V[16], const double P[16], Vec3 eye, Vec3 up, double now
     else
         g_gl.Uniform3f(p["u_clodShade"], 0.42f, 0.38f, 0.35f);
     g_gl.Uniform1f(p["u_dustBright"], snow ? 1.1f : 1.6f);
+    Vec(p, "u_water", waterLight);  // (the spray: the light of the grey sky through it)
     Bind(p, "u_depth", 0, g_res.depth);
     Bind(p, "u_dirt", 1, g_res.roostDirt.tex);
     g_gl.BindFramebuffer(kDrawFramebuffer, g_res.hdr.fbo);
@@ -6435,7 +6512,7 @@ void Render(int w, int h)
             // (Only the lights: the bikes found by their wheels are kept for their roost too - cleared here
             // every frame, they were never followed from one to the next and never threw any.)
             g_shownLights.clear();
-            if (!(cfg.roost > 0.0 && cfg.roostEveryBike))
+            if (!(RoostOn(cfg) && cfg.roostEveryBike))
                 g_otherBikes.clear();
         }
         const bool headlightOn = headCount > 0;
@@ -6641,7 +6718,7 @@ void Render(int w, int h)
     }
     g_roostOthersNow = 0;
     if (depthOk)
-        Roost(V, P, eye, up, now, dt, h);  // (before the weather: the rain and snow fall in front of it)
+        Roost(V, P, eye, up, dropColour, now, dt, h);  // (before the weather: the rain and snow fall in front of it)
     else
         g_roost.clear();
     ReportOtherBikes();
@@ -7727,7 +7804,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
 void TerrainPassDone()
 {
     const Config& cfg = GetConfig();
-    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0 && cfg.weather == kWeatherNone && cfg.roost <= 0.0) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
+    if (!cfg.shaders || (cfg.dirtDetail <= 0.0 && cfg.tireMarks <= 0.0 && TireCoat(cfg) <= 0.0 && cfg.weather == kWeatherNone && !RoostOn(cfg)) || !g_frame.haveView || g_frame.terrainSnapshot || g_frame.applied ||
         g_res.failed || !LoadGL())
         return;
     GLint drawFb = 0;

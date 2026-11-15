@@ -1700,7 +1700,7 @@ void main()
     float r = a_pos.w;
     float shown = max(r, 0.7 * u_pixel * z);
     float a = a_data.x * (r / shown) * (r / shown);
-    if (a_data.y > 0.5) {
+    if (a_data.y > 0.5 && a_data.y < 2.5) {  // (a clod or a water drop: streaked)
         vec2 m = (u_viewRot * a_move).xy;
         float ml = length(m);
         vec2 along = ml > 1e-5 ? m / ml : vec2(0.0, 1.0);
@@ -1731,6 +1731,7 @@ uniform vec2  u_texel;
 uniform float u_metre;
 uniform vec3  u_clodShade;  // a clod's colour against the dirt's (darker; mud in the rain, snow in the snow)
 uniform float u_dustBright; // the dust's against the dirt's
+uniform vec3  u_water;      // the rain's light (the water spray: muddy water lit by the grey sky)
 in vec2  v_uv;
 in float v_alpha;
 in float v_kind;
@@ -1755,7 +1756,20 @@ void main()
     vec3 dirt = textureLod(u_dirt, vec2(0.5), 0.0).rgb;
     float a;
     vec3 col;
-    if (v_kind < 0.5) {
+    // Muddy water: the track's dirt, thinned and lit by the sky through it.
+    vec3 muddy = mix(dirt * 2.2, u_water * 0.8, 0.3);
+    if (v_kind > 2.5) {
+        // A puff of spray: fine water, soft and smooth (less billow than dust), paler than the mud.
+        vec2 q = v_uv * 1.3 + v_seed * 29.0;
+        float wisp = Noise(q) * 0.7 + Noise(q * 2.7 + 3.0) * 0.3;
+        a = smoothstep(1.0, 0.05, sqrt(d2)) * (0.45 + 0.7 * wisp);
+        col = muddy * mix(0.9, 1.15, wisp);
+    } else if (v_kind > 1.5) {
+        // A water drop: a soft round bead of muddy water, the sky glinting in it.
+        float r = sqrt(d2);
+        a = smoothstep(1.0, 0.45, r);
+        col = muddy * 1.1 + u_water * 0.5 * smoothstep(0.6, 0.0, length(v_uv - vec2(-0.25, 0.3)));
+    } else if (v_kind < 0.5) {
         // Dust: soft-edged, billowing (thicker and lighter in places, thin and wispy at its edges).
         vec2 q = v_uv * 1.7 + v_seed * 37.0;
         float billow = Noise(q) * 0.6 + Noise(q * 2.4 + 5.0) * 0.4;
@@ -1774,7 +1788,7 @@ void main()
     if (d < 0.999999) {
         float n = d * 2.0 - 1.0;
         float sceneZ = -(u_invProj[2][2] * n + u_invProj[3][2]) / (u_invProj[2][3] * n + u_invProj[3][3]);
-        a *= clamp((sceneZ - v_z) / max(v_kind < 0.5 ? 0.6 * v_size : 0.04 * u_metre, 0.02 * u_metre), 0.0, 1.0);
+        a *= clamp((sceneZ - v_z) / max((v_kind < 0.5 || v_kind > 2.5) ? 0.6 * v_size : 0.04 * u_metre, 0.02 * u_metre), 0.0, 1.0);
     }
     o_color = vec4(col * a, a);  // premultiplied
 }
