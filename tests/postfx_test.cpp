@@ -298,6 +298,8 @@ int main(int argc, char** argv)
         settings = "[Graphics]\nShaders=0\n";
     else if (mode == "neutral")
         settings = base;
+    else if (mode == "aoedge")  // ambient occlusion alone: the screen's edges no darker than just inside them
+        settings = base.replace(base.find("AmbientOcclusion=0"), 18, "AmbientOcclusion=1");
     else if (mode == "dirt" || mode == "dirtperf")
         settings = base.replace(base.find("DirtDetail=0"), 12, "DirtDetail=1");
     else if (mode == "dirtultra" || mode == "ultraperf")  // the same, with Ultra graphics
@@ -396,6 +398,17 @@ int main(int argc, char** argv)
                 ch = '\n';
         settings += "\n" + more + "\n";
     }
+    // MXCAM_TEST_INI_FILE: these settings instead of the mode's (a player's own ini, to see their picture).
+    if (const char* file = getenv("MXCAM_TEST_INI_FILE")) {
+        if (FILE* in = fopen(file, "rb")) {
+            settings.clear();
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                settings.append(buffer, got);
+            fclose(in);
+        }
+    }
     if (!settings.empty()) {
         FILE* out = nullptr;
         if (_wfopen_s(&out, ini.c_str(), L"wb") == 0 && out) {
@@ -421,7 +434,18 @@ int main(int argc, char** argv)
     LOAD(wglSwapBuffers)
 #undef LOAD
 
-    const int W = 960, H = 540;
+    // (MXCAM_TEST_SIZE="w,h": another window size, to look at a full-screen one's picture.)
+    const auto TestSize = [](int index, int fallback) {
+        char text[32] = "";
+        if (GetEnvironmentVariableA("MXCAM_TEST_SIZE", text, sizeof text) <= 0)
+            return fallback;
+        char* comma = nullptr;
+        const long w = strtol(text, &comma, 10);
+        const long h = comma && *comma == ',' ? strtol(comma + 1, nullptr, 10) : 0;
+        const long v = index == 0 ? w : h;
+        return v >= 64 && v <= 8192 ? static_cast<int>(v) : fallback;
+    };
+    const int W = TestSize(0, 960), H = TestSize(1, 540);
     WNDCLASSA wc = {};
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = DefWindowProcA;
@@ -474,7 +498,24 @@ int main(int argc, char** argv)
         "    vec2 p = u_meshoffset + a_corner * u_meshscale;\n"
         "    gl_Position = u_projection * u_modelview * vec4(p.x, u_heights, p.y, 1.0);\n"
         "}",
-        "void main() { gl_FragColor = vec4(0.45, 0.36, 0.27, 1.0); }", "a_corner");
+        // (MXCAM_TEST_GROUND="r,g,b" 0-255: the ground another colour, a real track's dirt or sand.)
+        [] {
+            static std::string source = "void main() { gl_FragColor = vec4(0.45, 0.36, 0.27, 1.0); }";
+            if (const char* ground = getenv("MXCAM_TEST_GROUND")) {
+                float rgb[3] = { 115, 92, 69 };
+                char* at = const_cast<char*>(ground);
+                for (int i = 0; i < 3 && *at; ++i) {
+                    rgb[i] = strtof(at, &at);
+                    if (*at == ',')
+                        ++at;
+                }
+                char text[160];
+                snprintf(text, sizeof text, "void main() { gl_FragColor = vec4(%.4f, %.4f, %.4f, 1.0); }", rgb[0] / 255.0f,
+                         rgb[1] / 255.0f, rgb[2] / 255.0f);
+                source = text;
+            }
+            return source.c_str();
+        }(), "a_corner");
     // Objects (and the HUD): a flat colour, lit by u_light_position so the sun is known.
     const GLuint object = Build(
         "attribute vec3 a_pos;\n"
@@ -613,8 +654,12 @@ int main(int argc, char** argv)
     if (mode == "backshadow")  // looking down at the bike from above, to see its shadow
         MakeView(0, 26.0f, 0, 58.0f, 0.0f, view);
     else  // (MXCAM_TEST_CAM_X moves it sideways: the ground's patterns must stay where the world has them)
-        MakeView(getenv("MXCAM_TEST_CAM_X") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_X"))) : 0.0f, 1.6f,
-                 getenv("MXCAM_TEST_CAM_Z") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_Z"))) : 0.0f, 12.0f, 0.0f, view);
+        // (MXCAM_TEST_CAM_Y / MXCAM_TEST_CAM_PITCH: higher and looking further down, over a wide stretch
+        // of ground: to see whether its detail repeats.)
+        MakeView(getenv("MXCAM_TEST_CAM_X") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_X"))) : 0.0f,
+                 getenv("MXCAM_TEST_CAM_Y") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_Y"))) : 1.6f,
+                 getenv("MXCAM_TEST_CAM_Z") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_Z"))) : 0.0f,
+                 getenv("MXCAM_TEST_CAM_PITCH") ? static_cast<float>(atof(getenv("MXCAM_TEST_CAM_PITCH"))) : 12.0f, 0.0f, view);
     // What the game sends (eye space, toward the sun). For the shadow check: from the right, so
     // the box's shadow falls on the ground to its left.
     // For the shadow map check: low, from behind, so a tower behind the camera (never on screen)

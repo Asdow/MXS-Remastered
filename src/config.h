@@ -219,6 +219,8 @@ struct Config {
                                           // (held), 2 = on (a press switches). The game writes its file only now and
                                           // then (not when the setting is changed), so it can say the old one.
     bool   fadeMenu         = true;       // fade this menu while a graphics setting is being adjusted
+    double dirtSlide        = 0.6;        // 0..1 how loud your tires sliding on the dirt sound as you brake
+                                          // (0: off; thunder.h, brake::Sliding)
     double menuOpacity      = 1.0;        // 0.2..1 how solid this menu is (all of it: panel, text, help)
     bool   fullscreenWindow = false;      // windowed mode: the window made borderless, covering its monitor
                                           // (a display choice: not part of the presets or DEFAULTS)

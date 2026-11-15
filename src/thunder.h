@@ -20,8 +20,11 @@ void Strike(double metres, double delay);
 // Config::snowSound, with the snowfall and its wind; 0 with no snow) and your tires in the snow
 // (tires 0..1: Config::snowTires, 0 with no snow; rolling 0..1: how much of it is heard now, by how
 // you're riding; bright 0..1: how bright it sounds, brighter riding faster). Starts the audio
-// output when any of them is turned up and stops it when none is.
-void Update(double strikes, double rain, double snow, double tires, double rolling, double bright);
+// output when any of them is turned up and stops it when none is. slide: your tires sliding on the
+// dirt under braking (Config::dirtSlide, as the slider sets it: 0..1; 0 off) and sliding (0..1: how hard
+// you're braking into a slide now).
+void Update(double strikes, double rain, double snow, double tires, double rolling, double bright, double slide = 0.0,
+            double sliding = 0.0);
 
 }  // namespace thunder
 }  // namespace mxcam

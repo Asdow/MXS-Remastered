@@ -19,5 +19,9 @@ void Update(bool haveSpeed, double speed);
 // Whether a brake is bound to a controller (gamepad::Poll must then run every frame).
 bool NeedsGamepad();
 
+// How hard your tires are sliding on the dirt under braking now, 0..1 (for Config::dirtSlide's sound,
+// thunder.h): the game's brakes held hard while you're moving and really slowing down. Read by Update.
+double Sliding();
+
 }  // namespace brake
 }  // namespace mxcam

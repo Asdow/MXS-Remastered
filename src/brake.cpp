@@ -387,7 +387,7 @@ void StopAudio()
 #endif
 
 // ---- When it squeals ------------------------------------------------------------------------------
-double g_lastNow = -1, g_lastSpeed = 0, g_decel = 0;
+double g_lastNow = -1, g_lastSpeed = 0, g_decel = 0, g_sliding = 0;
 bool   g_haveLast = false;
 
 double SmoothStep(double a, double b, double x)
@@ -412,11 +412,15 @@ void Update(bool haveSpeed, double speed)
     if (cfg.brakeSqueal <= 0.0) {
         g_target = 0.0f;
         StopAudio();
+    }
+    if (cfg.brakeSqueal <= 0.0 && cfg.dirtSlide <= 0.0) {  // (the brakes are read for either)
         g_haveLast = false;
+        g_sliding = 0.0;
         return;
     }
     ReadBindings(now);
-    StartAudio();
+    if (cfg.brakeSqueal > 0.0)
+        StartAudio();
     // The slider follows loudness as it's heard (a high ring stays loud at a low level): its square,
     // and 100% half of full scale. 1% is next to nothing, 10% quiet, 50% a moderate squeal.
     g_volume = static_cast<float>(0.5 * cfg.brakeSqueal * cfg.brakeSqueal);
@@ -434,17 +438,27 @@ void Update(bool haveSpeed, double speed)
     // Braking hard, moving, and really slowing down (not the brake held in the air, or standing),
     // with the game in front.
     const double brake = std::fmax(ValueOf(g_front), ValueOf(g_rear));
-    double target = 0.0;
-    if (haveSpeed && GameHasFocus())
+    double target = 0.0, sliding = 0.0;
+    if (haveSpeed && GameHasFocus()) {
         target = SmoothStep(0.35, 0.9, brake) * SmoothStep(1.5, 5.0, speed) * SmoothStep(1.0, 3.5, g_decel);
-    g_target = static_cast<float>(target);
+        // The dirt sliding under the tires: from a lighter brake than the squeal and lower speeds,
+        // louder the harder you brake and slow, a little louder faster.
+        sliding = SmoothStep(0.2, 0.75, brake) * SmoothStep(1.0, 4.0, speed) * SmoothStep(0.6, 3.0, g_decel) *
+                  (0.7 + 0.3 * SmoothStep(4.0, 15.0, speed));
+    }
+    if (cfg.brakeSqueal > 0.0)
+        g_target = static_cast<float>(target);
+    g_sliding = sliding;
 }
+
+double Sliding() { return g_sliding; }
 
 bool NeedsGamepad()
 {
     const auto Pad = [](const Binding& b) { return b.kind == Binding::XButton || b.kind == Binding::XAxis ||
                                                    b.kind == Binding::JoyButton || b.kind == Binding::JoyAxis; };
-    return GetConfig().brakeSqueal > 0.0 && (Pad(g_front) || Pad(g_rear) || g_checked < 0);
+    const Config& cfg = GetConfig();
+    return (cfg.brakeSqueal > 0.0 || cfg.dirtSlide > 0.0) && (Pad(g_front) || Pad(g_rear) || g_checked < 0);
 }
 
 }  // namespace brake

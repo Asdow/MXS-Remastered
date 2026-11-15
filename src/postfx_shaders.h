@@ -138,13 +138,19 @@ float SunShadow(vec3 p, vec3 n, float noise)
 
 void main()
 {
-    float d = textureLod(u_depth, v_uv, 0.0).r;
+    // At half resolution each pixel here reads exactly one of the depth's pixels (the bottom left of
+    // its 2 x 2), and its neighbours one full pixel away: its own centre falls on the line between two
+    // of the depth's rows, and which one was read came down to rounding. On rows where it and the one
+    // beside it read the same depth the ground looked tilted, its AO dark: evenly spaced lines across
+    // the screen at some sizes (1920 x 1080 among them, full screen).
+    vec2 uv = (floor(gl_FragCoord.xy) * 2.0 + 0.5) * u_texel;
+    float d = textureLod(u_depth, uv, 0.0).r;
     if (IsSky(d)) {
         o_color = vec4(1.0);
         return;
     }
-    vec3 p = ViewPos(v_uv, d);
-    vec3 n = NormalAt(u_depth, v_uv, p);
+    vec3 p = ViewPos(uv, d);
+    vec3 n = NormalAt(u_depth, uv, p);
     float noise = Noise(gl_FragCoord.xy);
     float ao = u_aoOn > 0.5 ? AmbientOcclusion(p, n, noise) : 1.0;
     float lit = 1.0;
@@ -403,19 +409,49 @@ float PatternNoise(vec3 wp, int k)
 // bump it gives in world space. (The texture repeats each unit of its coordinates: the fraction is
 // all its phase needs.) Nearly flat ground - most of a track - reads its top face only: the other
 // two weigh under 2% there, and a third of the reads is a third of the cost.
+// The detail texture read without its tiling showing: the same tile in a grid over the whole track
+// read as a pattern. A slow noise over the ground (a few tiles a cell, on the world's lattice like
+// PatternNoise) picks which part of the texture each place reads - two neighbouring picks, blended
+// where it changes over (the blend leaning on the texels themselves, so it follows the grains
+// rather than fading through them). Offsets only, never turned: the bumps' normals stay right.
+struct NoTile { vec2 a, b; float t; };
+NoTile NoTileAt(vec3 wp, int k)
+{
+    vec2 q = (PatternPos(wp, k).xz + u_phaseI[k].xz) * 0.31;
+    vec2 i = floor(q), f = fract(q);
+    f = f * f * (3.0 - 2.0 * f);
+    float layer = float(k) * 7.13;
+    float n = mix(mix(Hash13(vec3(i, layer)), Hash13(vec3(i + vec2(1.0, 0.0), layer)), f.x),
+                  mix(Hash13(vec3(i + vec2(0.0, 1.0), layer)), Hash13(vec3(i + vec2(1.0, 1.0), layer)), f.x), f.y);
+    float l = n * 8.0;
+    float ia = floor(l);
+    NoTile r;
+    r.a = sin(vec2(3.0, 7.0) * ia);
+    r.b = sin(vec2(3.0, 7.0) * (ia + 1.0));
+    r.t = fract(l);
+    return r;
+}
+vec4 ReadNoTile(vec2 uv, vec2 gx, vec2 gy, NoTile v)
+{
+    vec4 a = textureGrad(u_detail, uv + v.a, gx, gy);
+    vec4 b = textureGrad(u_detail, uv + v.b, gx, gy);
+    return mix(a, b, smoothstep(0.2, 0.8, v.t - 0.1 * dot(a.ba - b.ba, vec2(1.0))));
+}
+
 vec4 DetailTexel(vec3 wp, vec3 dwx, vec3 dwy, vec3 w, int k, vec2 shift, out vec3 bump)
 {
     float s = u_freq[k];
     vec3 q = PatternPos(wp, k);
+    NoTile v = NoTileAt(wp, k);
     if (w.y > 0.98) {
-        vec4 ty = textureGrad(u_detail, q.xz + shift, dwx.xz * s, dwy.xz * s);
+        vec4 ty = ReadNoTile(q.xz + shift, dwx.xz * s, dwy.xz * s, v);
         vec2 gy = ty.rg * 2.0 - 1.0;
         bump = vec3(gy.x, 0.0, gy.y);
         return ty;
     }
-    vec4 tx = textureGrad(u_detail, q.zy + shift, dwx.zy * s, dwy.zy * s);
-    vec4 ty = textureGrad(u_detail, q.xz + shift, dwx.xz * s, dwy.xz * s);
-    vec4 tz = textureGrad(u_detail, q.xy + shift, dwx.xy * s, dwy.xy * s);
+    vec4 tx = ReadNoTile(q.zy + shift, dwx.zy * s, dwy.zy * s, v);
+    vec4 ty = ReadNoTile(q.xz + shift, dwx.xz * s, dwy.xz * s, v);
+    vec4 tz = ReadNoTile(q.xy + shift, dwx.xy * s, dwy.xy * s, v);
     vec2 gx = tx.rg * 2.0 - 1.0, gy = ty.rg * 2.0 - 1.0, gz = tz.rg * 2.0 - 1.0;
     bump = vec3(0.0, gx.y, gx.x) * w.x + vec3(gy.x, 0.0, gy.y) * w.y + vec3(gz.x, gz.y, 0.0) * w.z;
     return tx * w.x + ty * w.y + tz * w.z;

@@ -407,6 +407,7 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Other",     L"HideCursor",           c.hideCursor ? 1.0 : 0.0 },
         { L"Other",     L"DabIndicator",         c.dabIndicator ? 1.0 : 0.0 },
         { L"Other",     L"BrakeSqueal",          c.brakeSqueal },
+        { L"Other",     L"DirtSlide",            c.dirtSlide },
         { L"Other",     L"DabSticky",            static_cast<double>(c.dabSticky) },
         { L"Other",     L"FadeMenu",             c.fadeMenu ? 1.0 : 0.0 },
         { L"Other",     L"MenuOpacity",          c.menuOpacity },
@@ -622,6 +623,7 @@ void CopyTunables(const Config& from, Config& to)
     to.hideCursor           = from.hideCursor;
     to.dabIndicator         = from.dabIndicator;
     to.brakeSqueal          = from.brakeSqueal;
+    to.dirtSlide            = from.dirtSlide;
     to.dabSticky            = from.dabSticky;
     to.fadeMenu             = from.fadeMenu;
     to.menuOpacity          = from.menuOpacity;
@@ -916,6 +918,7 @@ Config ParseConfig(const Config& base)
     c.hideCursor       = ReadInt(L"Other", L"HideCursor", c.hideCursor) != 0;
     c.dabIndicator     = ReadInt(L"Other", L"DabIndicator", c.dabIndicator) != 0;
     c.brakeSqueal      = Clamp(ReadDouble(L"Other", L"BrakeSqueal", c.brakeSqueal), 0.0, 1.0);
+    c.dirtSlide        = Clamp(ReadDouble(L"Other", L"DirtSlide", c.dirtSlide), 0.0, 1.0);
     c.dabSticky        = Clamp(ReadInt(L"Other", L"DabSticky", c.dabSticky), 0, 2);
     c.fadeMenu         = ReadInt(L"Other", L"FadeMenu", c.fadeMenu) != 0;
     c.menuOpacity      = Clamp(ReadDouble(L"Other", L"MenuOpacity", c.menuOpacity), 0.2, 1.0);

@@ -1676,6 +1676,11 @@ const RowDef kRows[] = {
         .Help("Your brakes squeal when you brake hard: the game's own brake controls pressed most of "
               "the way while you're moving and slowing down. Its loudness; heard right away, with "
               "any bike."),
+    Slider(kTabSounds, nullptr,        "Dirt slide",                &Config::dirtSlide,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Your tires sliding on the dirt as you brake hard: the game's own brake controls held while "
+              "you're moving and slowing down, on the ground. Each slide starts with the dirt's crunch and "
+              "goes on as long as you brake, never the same twice; louder the harder you brake. Its "
+              "loudness; heard right away. Not in the snow (it has its own tire sound)."),
 
     // ======== WEATHER ========
     Choice3(kTabWeather, "WEATHER",       "Weather",                   &Config::weather, "NONE", "RAIN", "SNOW")
@@ -3370,7 +3375,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
                      cfg.controllerLook ? gamepad::StatusText() : "CONTROLLER LOOK OFF");
         } else if (g_panel.tab == kTabSounds) {
             snprintf(readout, sizeof readout, "ENGINE SOUNDS ARE HEARD FROM THE NEXT TIME THE GAME STARTS   \xB7   "
-                     "THE BRAKE SQUEAL RIGHT AWAY");
+                     "THE BRAKE SOUNDS RIGHT AWAY");
         } else if (g_panel.tab == kTabOther) {
             const char* status = GameOverlayStatusText();
             snprintf(readout, sizeof readout, "%s", status[0] ? status : "THE GAME'S MENU (ESC) SHOWS A HIDDEN HUD, THE MOUSE A HIDDEN CURSOR");

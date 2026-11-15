@@ -29,6 +29,7 @@
 #include "rain_sound.h"
 #include "snow_sound.h"
 #include "snow_tires_sound.h"
+#include "slide_sounds.h"
 #include "log.h"
 
 #ifdef _WIN32
@@ -50,6 +51,7 @@ std::atomic<float> g_rainVolume{ 0.0f };  // the rain's (Config::rainSound and h
 std::atomic<float> g_snowVolume{ 0.0f };  // the snowstorm's (Config::snowSound, the snowfall and its wind)
 std::atomic<float> g_tiresVolume{ 0.0f }; // your tires in the snow (Config::snowTires, with how you're rolling)
 std::atomic<float> g_tiresBright{ 0.0f }; // and how bright (0..1: brighter riding faster)
+std::atomic<float> g_slideVolume{ 0.0f }; // your tires sliding on the dirt as you brake (Config::dirtSlide, how hard)
 std::atomic<bool>  g_stop{ false };
 std::mutex         g_pendingLock;
 struct Pending { double metres, delay; };
@@ -165,10 +167,94 @@ Loop g_snow{ kSnowLoop, static_cast<int>(sizeof kSnowLoop / sizeof kSnowLoop[0])
 Loop g_tires{ kSnowTiresLoop, static_cast<int>(sizeof kSnowTiresLoop / sizeof kSnowTiresLoop[0]), kSnowTiresRate, 0.0004 };
 
 // Every volume now, as set by Update.
-struct Levels { float strikes, rain, snow, tires, tiresBright; };
+struct Levels { float strikes, rain, snow, tires, tiresBright, slide; };
 Levels Now()
 {
-    return Levels{ g_volume.load(), g_rainVolume.load(), g_snowVolume.load(), g_tiresVolume.load(), g_tiresBright.load() };
+    return Levels{ g_volume.load(), g_rainVolume.load(), g_snowVolume.load(), g_tiresVolume.load(), g_tiresBright.load(),
+                   g_slideVolume.load() };
+}
+
+// ---- Your tires sliding on the dirt as you brake: the recorded slides (slide_sounds.h) ---------------
+// A slide starts with one of them from its start (the dirt's first crunch as the tire grabs); held,
+// the next one (never the same twice running, each a little higher or lower) comes in under the
+// last's end, from a little way into it (no new crunch) - so a long slide goes on as long as you
+// brake, never repeating. Let go, it fades out quickly; brake again, a new one starts with its crunch.
+struct SlideVoice {
+    bool             on = false;
+    const SlideClip* clip = nullptr;
+    double           at = 0, step = 0;    // where in it (its samples), and its samples a sample played
+    double           fade = 1, fadeStep = 0;
+
+    double Remaining() const { return clip ? (clip->count - at) / step / kRate : 0.0; }  // seconds
+    double BodyLeft() const { return clip ? (clip->bodyEnd - at) / step / kRate : 0.0; }  // seconds until it dies away
+    double Sample()
+    {
+        const int i = static_cast<int>(at);
+        if (!clip || i + 1 >= clip->count) {
+            on = false;
+            return 0.0;
+        }
+        const double f = at - i;
+        const double v = (clip->samples[i] * (1.0 - f) + clip->samples[i + 1] * f) / 32768.0;
+        at += step;
+        fade = std::fmin(fade + fadeStep, 1.0);
+        return v * fade;
+    }
+};
+SlideVoice g_slides[3];
+int        g_slideNewest = -1, g_lastSlide = -1;
+double     g_slideLevel = 0.0;   // following the volume (quick in, a little slower out)
+long long  g_slideQuiet = 1 << 30;  // samples since the volume was last up
+Rng        g_slideRng{ 0x2545F491u };
+
+void StartSlide(bool fresh)
+{
+    const int count = static_cast<int>(sizeof kSlides / sizeof kSlides[0]);
+    int pick = static_cast<int>(g_slideRng() * count) % count;
+    if (pick == g_lastSlide && count > 1)
+        pick = (pick + 1) % count;
+    g_lastSlide = pick;
+    int slot = 0;  // a free one, or the one with the least left
+    for (int k = 0; k < 3; ++k)
+        if (!g_slides[k].on) {
+            slot = k;
+            break;
+        } else if (g_slides[k].Remaining() < g_slides[slot].Remaining()) {
+            slot = k;
+        }
+    SlideVoice& s = g_slides[slot];
+    s = SlideVoice{};
+    s.on = true;
+    s.clip = &kSlides[pick];
+    s.step = static_cast<double>(kSlideRate) / kRate * g_slideRng.Range(0.9, 1.1);
+    // Fresh: from its start, at once (its crunch). Going on: from 0.12 s in, faded in over a tenth of a
+    // second as the last one dies away (each one's body ends a few tenths before its end: started at its
+    // very end, the slide dipped to nearly nothing between them).
+    s.at = fresh ? 0.0 : 0.12 * kSlideRate;
+    s.fade = fresh ? 1.0 : 0.0;
+    s.fadeStep = fresh ? 0.0 : 1.0 / (0.1 * kRate);
+    g_slideNewest = slot;
+}
+
+double SlideSample(double volume)
+{
+    const bool up = volume > 0.0005;
+    if (up) {
+        const SlideVoice* newest = g_slideNewest >= 0 ? &g_slides[g_slideNewest] : nullptr;
+        if (g_slideQuiet > kRate / 6 || !newest || !newest->on)
+            StartSlide(true);  // a new slide (or the last one ran out): from its crunch
+        else if (newest->BodyLeft() < 0.08)
+            StartSlide(false);  // held: the next one in as it dies away
+        g_slideQuiet = 0;
+    } else if (g_slideQuiet < (1 << 30)) {
+        ++g_slideQuiet;
+    }
+    g_slideLevel += (volume - g_slideLevel) * (volume > g_slideLevel ? 0.0009 : 0.00015);  // ~25 ms in, ~150 ms out
+    double s = 0.0;
+    for (SlideVoice& v : g_slides)
+        if (v.on)
+            s += v.Sample();
+    return s * g_slideLevel;
 }
 
 // The tires' brightness: a gentle low-pass over them (two poles), opening up as you ride faster -
@@ -209,7 +295,8 @@ void Fill(short* out, int count, const Levels& v)
         for (Clap& c : g_playing)
             if (c.on)
                 s += c.Sample();
-        s = s * v.strikes + g_rain.Sample(v.rain) + g_snow.Sample(v.snow) + Brightened(g_tires.Sample(v.tires), v.tiresBright);
+        s = s * v.strikes + g_rain.Sample(v.rain) + g_snow.Sample(v.snow) + Brightened(g_tires.Sample(v.tires), v.tiresBright) +
+            SlideSample(v.slide);
         // Soft-limited: a close strike on top of the rain stays whole, never clipping hard.
         s = Limit(s) * g_focus;
         out[i] = static_cast<short>(s * 32000.0);
@@ -244,7 +331,7 @@ DWORD WINAPI AudioThread(void*)
         headers[i].lpData = reinterpret_cast<LPSTR>(samples[i]);
         headers[i].dwBufferLength = sizeof samples[i];
         waveOutPrepareHeader(device, &headers[i], sizeof headers[i]);
-        Fill(samples[i], kBlock, Levels{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        Fill(samples[i], kBlock, Levels{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
         waveOutWrite(device, &headers[i], sizeof headers[i]);
     }
     while (!g_stop.load()) {
@@ -358,13 +445,14 @@ void Strike(double metres, double delay)
         g_pending[g_pendingCount++] = Pending{ metres, delay };
 }
 
-void Update(double strikes, double rain, double snow, double tires, double rolling, double bright)
+void Update(double strikes, double rain, double snow, double tires, double rolling, double bright, double slide, double sliding)
 {
-    if (strikes <= 0.0 && rain <= 0.0 && snow <= 0.0 && tires <= 0.0) {
+    if (strikes <= 0.0 && rain <= 0.0 && snow <= 0.0 && tires <= 0.0 && slide <= 0.0) {
         g_volume = 0.0f;
         g_rainVolume = 0.0f;
         g_snowVolume = 0.0f;
         g_tiresVolume = 0.0f;
+        g_slideVolume = 0.0f;
         if (Running()) {
             StopAudio();
             for (Clap& c : g_playing)
@@ -372,6 +460,9 @@ void Update(double strikes, double rain, double snow, double tires, double rolli
             g_rain.level = 0.0;
             g_snow.level = 0.0;
             g_tires.level = 0.0;
+            for (SlideVoice& s : g_slides)
+                s.on = false;
+            g_slideLevel = 0.0;
         }
         return;
     }
@@ -381,10 +472,18 @@ void Update(double strikes, double rain, double snow, double tires, double rolli
     g_snowVolume = static_cast<float>(snow * snow);
     g_tiresVolume = static_cast<float>(tires * tires * std::fmin(std::fmax(rolling, 0.0), 1.0));
     g_tiresBright = static_cast<float>(std::fmin(std::fmax(bright, 0.0), 1.0));
+    g_slideVolume = static_cast<float>(slide * slide * std::fmin(std::fmax(sliding, 0.0), 1.0));
     StartAudio();
 }
 
 #ifdef MXCAM_THUNDER_TEST
+// For the test: the mixer as the audio thread runs it, the dirt slide alone at `slide` (0..1, as
+// Update sets it), a block of `count` samples.
+void RenderSlideForTest(double slide, short* out, int count)
+{
+    Fill(out, count, Levels{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, static_cast<float>(slide) });
+}
+
 // For the test (tests/thunder_test.cpp): one strike `metres` away, rendered without a device.
 void RenderForTest(double metres, short* out, int count, uint32_t seed)
 {

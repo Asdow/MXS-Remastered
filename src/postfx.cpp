@@ -6355,6 +6355,93 @@ void DrawBolt(const double V[16], double now, int h)
     g_gl.BindVertexArray(g_res.vao);
 }
 
+// ---- With the trace (F11): the AO as it was worked out, to find what draws lines across it ----
+// MXS_REMASTERED_ao.bmp: the half-resolution lighting target (AO grey; red where the sun's shadow
+// is). MXS_REMASTERED_ao.txt: the sizes (the window's, the game's viewport, ours), the projection's
+// near and far, and down the middle column of the screen each row's stored depth (24-bit steps),
+// its step from the row before and the AO there.
+GLint g_gameViewport[4] = {};
+bool  g_aoDumpWanted = false;
+
+void DumpAo(int w, int h, bool lightOn)
+{
+    GLint readFbo = 0, packBuffer = 0;
+    g_gl.GetIntegerv(kReadFramebufferBinding, &readFbo);
+    g_gl.GetIntegerv(kPixelPackBufferBinding, &packBuffer);
+    g_gl.BindBuffer(kPixelPackBuffer, 0);
+    g_gl.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    const int lw = g_res.light.w, lh = g_res.light.h;
+    std::vector<unsigned char> light(static_cast<size_t>(lw) * lh * 2, 255);
+    if (lightOn) {
+        g_gl.BindFramebuffer(kReadFramebuffer, g_res.light.fbo);
+        g_gl.ReadPixels(0, 0, lw, lh, kRg, GL_UNSIGNED_BYTE, light.data());
+    }
+    std::vector<GLuint> depth(static_cast<size_t>(h), 0);
+    g_gl.BindFramebuffer(kReadFramebuffer, g_res.captureFbo);
+    g_gl.ReadPixels(w / 2, 0, 1, h, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, depth.data());
+    const GLenum error = g_gl.GetError();
+    g_gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
+    g_gl.BindFramebuffer(kReadFramebuffer, static_cast<GLuint>(readFbo));
+    g_gl.BindBuffer(kPixelPackBuffer, static_cast<GLuint>(packBuffer));
+
+    wchar_t path[1024];
+    swprintf_s(path, L"%sMXS_REMASTERED_ao.bmp", LogDirectory());
+    if (FILE* out = _wfsopen(path, L"wb", _SH_DENYWR)) {
+        const int stride = (lw * 3 + 3) & ~3;
+        std::vector<unsigned char> rgb(static_cast<size_t>(stride) * lh, 0);
+        for (int y = 0; y < lh; ++y)
+            for (int x = 0; x < lw; ++x) {
+                const unsigned char ao = light[(static_cast<size_t>(y) * lw + x) * 2];
+                const unsigned char sun = light[(static_cast<size_t>(y) * lw + x) * 2 + 1];
+                unsigned char* p = &rgb[static_cast<size_t>(y) * stride + x * 3];
+                p[0] = static_cast<unsigned char>(ao * sun / 255);
+                p[1] = static_cast<unsigned char>(ao * sun / 255);
+                p[2] = ao;
+            }
+        unsigned char header[54] = { 'B', 'M' };
+        const auto Put32 = [&](int at, uint32_t v) {
+            for (int k = 0; k < 4; ++k)
+                header[at + k] = static_cast<unsigned char>(v >> (8 * k));
+        };
+        Put32(2, static_cast<uint32_t>(54 + rgb.size()));
+        Put32(10, 54);
+        Put32(14, 40);
+        Put32(18, static_cast<uint32_t>(lw));
+        Put32(22, static_cast<uint32_t>(lh));
+        header[26] = 1;
+        header[28] = 24;
+        Put32(34, static_cast<uint32_t>(rgb.size()));
+        fwrite(header, 1, 54, out);
+        fwrite(rgb.data(), 1, rgb.size(), out);
+        fclose(out);
+    }
+    swprintf_s(path, L"%sMXS_REMASTERED_ao.txt", LogDirectory());
+    FILE* out = _wfsopen(path, L"w", _SH_DENYWR);
+    if (!out)
+        return;
+    RECT client{};
+    const HDC dc = g_gl.GetCurrentDC();
+    if (const HWND window = dc ? WindowFromDC(dc) : nullptr)
+        GetClientRect(window, &client);
+    const double p10 = g_m.proj[10], p14 = g_m.proj[14];
+    fprintf(out, "window client %ldx%ld, game viewport %d,%d %dx%d, effects %dx%d, light %dx%d, AO %s, depth read %s\n",
+            client.right, client.bottom, g_gameViewport[0], g_gameViewport[1], g_gameViewport[2], g_gameViewport[3], w, h, lw, lh,
+            lightOn ? "on" : "off", error == GL_NO_ERROR ? "ok" : "FAILED");
+    fprintf(out, "projection: near %.5f far %.2f (game units; %.3f a metre), fov %.2f deg vertical\n", p14 / (p10 - 1.0),
+            p14 / (p10 + 1.0), g_unitsPerMetre, 2.0 * std::atan(1.0 / std::fmax(std::fabs(static_cast<double>(g_m.proj[5])), 1e-6)) * 57.29578);
+    fprintf(out, "row (0 = bottom), depth (24-bit), step from the row below, AO (0-255) at the middle column\n");
+    for (int y = 0; y < h; ++y) {
+        const long long d = depth[static_cast<size_t>(y)] >> 8;
+        const long long below = y > 0 ? static_cast<long long>(depth[static_cast<size_t>(y - 1)] >> 8) : d;
+        const int ly = std::min(lh - 1, y * lh / std::max(h, 1));
+        const int ao = light[(static_cast<size_t>(ly) * lw + lw / 2) * 2];
+        fprintf(out, "%d,%lld,%lld,%d\n", y, d, d - below, ao);
+    }
+    fclose(out);
+    Log("postfx: wrote MXS_REMASTERED_ao.bmp and MXS_REMASTERED_ao.txt (window %ldx%ld, effects %dx%d, AO %s)", client.right,
+        client.bottom, w, h, lightOn ? "on" : "off");
+}
+
 void Render(int w, int h)
 {
     const Config& cfg = GetConfig();
@@ -6461,6 +6548,11 @@ void Render(int w, int h)
         g_gl.Uniform1f(p["u_shadowOn"], screenShadows ? 1.0f : 0.0f);
         g_gl.Uniform1f(p["u_shadowLength"], static_cast<float>(cfg.shadowLength));
         Draw(g_res.light);
+    }
+    static const bool testAoDump = GetEnvironmentVariableA("MXCAM_TEST_AO_DUMP", nullptr, 0) > 0;  // (tests: every frame)
+    if (g_aoDumpWanted || testAoDump) {
+        g_aoDumpWanted = false;
+        DumpAo(w, h, lightOn);
     }
 
     // ---- Composite -> linear HDR ----
@@ -7410,6 +7502,8 @@ void ApplyInner()
     g_effectsTimerOpen = true;
     SavedState saved;
     Save(saved);
+    for (int i = 0; i < 4; ++i)
+        g_gameViewport[i] = saved.viewport[i];
     DrawStandIns();       // (its program and vertex array are put back with the rest)
     PrepareState();
     if (EnsureResources(w, h)) {
@@ -7778,6 +7872,8 @@ void NoteGameLight(const float* value, int components)
     }
 }
 
+constexpr double kMovedSunMore = 1.3;  // how much more light flat ground may get from a higher moved sun
+
 bool OverrideLight(const float* value, int count, int components, float* out)
 {
     const Config& cfg = GetConfig();
@@ -7786,6 +7882,25 @@ bool OverrideLight(const float* value, int count, int components, float* out)
         return false;
     const timeofday::Sky sky = timeofday::Compute(cfg.timeOfDay, g_gameSun, WorldUp(), cfg.nightBrightness);
     const Vec3 eye = Normalize(WorldToEye(raw, sky.light * (cfg.invertLight ? -1.0 : 1.0)));
+    // A little brighter than the game's own sun at most (kMovedSunMore on flat ground): the game
+    // lights the ground by its light's direction and length (ambient + diffuse * dot(normal,
+    // light), the light not normalised), and a track's
+    // colours are made for its own sun. Moved higher than that (toward noon), flat ground caught far
+    // more light than it ever had - dirt turned orange, light sand blinding white. So the light is
+    // shortened to give flat ground at most 1.3 times what the game's sun gave it (the user's pick: a
+    // midday sun a touch brighter, not blinding); slopes still turn toward or away
+    // from the new sun, and a sun lower than the game's (morning, evening) is left as it is.
+    const Vec3 up = WorldUp();
+    const double gameHeight = Dot(Normalize(g_gameSun), up), newHeight = Dot(sky.light, up);
+    const double keep = !cfg.invertLight && newHeight > gameHeight && newHeight > 1e-3
+                            ? Clamp(kMovedSunMore * std::fmax(gameHeight, 0.05) / newHeight, 0.0, 1.0)
+                            : 1.0;
+    static double loggedKeep = -1.0;
+    if (std::fabs(keep - loggedKeep) > 0.02) {
+        loggedKeep = keep;
+        Log("postfx: the game's sun %.0f deg up, moved to %.0f deg (%.2fh): its light x%.2f (at most 1.3x the game's light on flat ground)",
+            std::asin(Clamp(gameHeight, -1.0, 1.0)) * 57.29578, std::asin(Clamp(newHeight, -1.0, 1.0)) * 57.29578, cfg.timeOfDay, keep);
+    }
     for (int i = 0; i < count; ++i) {
         const float* v = value + i * components;
         float* o = out + i * components;
@@ -7793,7 +7908,7 @@ bool OverrideLight(const float* value, int count, int components, float* out)
             o[k] = v[k];
         if (components == 4 && v[3] != 0.0f)
             continue;  // a point light
-        const double length = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+        const double length = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) * keep;
         o[0] = static_cast<float>(eye.x * length);
         o[1] = static_cast<float>(eye.y * length);
         o[2] = static_cast<float>(eye.z * length);
@@ -8176,7 +8291,7 @@ bool NearAnyRiderEye(const float eye[3], double metres)
 bool CameraAtYourHead() { return g_cameraAtHead; }
 void NoteCastNowMs(double ms) { g_castNowMs += ms; }
 void NoteLobbyMs(double ms) { g_lobbyMs = ms; }
-void RequestMarksDump() { g_markDumpWanted = true; }
+void RequestMarksDump() { g_markDumpWanted = true; g_aoDumpWanted = true; }
 
 bool OwnHipsEye(float out[3])
 {

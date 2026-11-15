@@ -4475,7 +4475,10 @@ bool EndShaderFrame()
         // (Your tires in the snow: heard from walking pace, nearly all of it by 5 m/s, only a little
         // louder and brighter beyond - never loud at speed. Nothing in the air, or standing still.)
         double speed = 0.0, rolling = 0.0;
-        if (snow && c.snowTires > 0.0 && postfx::TiresRolling(speed)) {
+        // (Asked once a frame - it keeps its own state - when either sound needs your tires on the ground.)
+        const bool wantGround = (snow && c.snowTires > 0.0) || (onTrack && c.dirtSlide > 0.0 && !snow);
+        const bool onGround = wantGround && postfx::TiresRolling(speed);
+        if (snow && c.snowTires > 0.0 && onGround) {
             const auto Smooth = [](double a, double b, double x) {
                 const double t = std::fmin(std::fmax((x - a) / (b - a), 0.0), 1.0);
                 return t * t * (3.0 - 2.0 * t);
@@ -4483,9 +4486,13 @@ bool EndShaderFrame()
             rolling = Smooth(0.3, 5.0, speed) * (0.8 + 0.2 * Smooth(5.0, 15.0, speed));
         }
         const double tiresBright = 0.5 * std::fmin(speed / 20.0, 1.0);
+        // (Your tires sliding on the dirt as you brake: on the ground only; not in the snow, its own
+        // tire sound is there.)
+        const double slide = onTrack && !snow ? c.dirtSlide : 0.0;
+        const double sliding = onGround ? brake::Sliding() : 0.0;
         thunder::Update(rain && c.lightning > 0.0 ? c.lightningSound : 0.0,
                         rain ? c.rainSound * std::sqrt(c.rainfall) : 0.0, snow ? c.snowSound * storm : 0.0,
-                        snow ? c.snowTires : 0.0, rolling, tiresBright);
+                        snow ? c.snowTires : 0.0, rolling, tiresBright, slide, sliding);
     }
 
     // No camera this frame (menu, effect off): don't carry a stale correction into the
