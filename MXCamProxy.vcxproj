@@ -123,6 +123,9 @@
     <ClInclude Include="src\brake.h" />
     <ClInclude Include="src\thunder.h" />
     <ClInclude Include="src\lightning_sounds.h" />
+    <ClInclude Include="src\rain_sound.h" />
+    <ClInclude Include="src\snow_sound.h" />
+    <ClInclude Include="src\snow_tires_sound.h" />
     <ClInclude Include="src\dab.h" />
     <ClInclude Include="src\gamepad.h" />
     <ClInclude Include="src\lobby_wheels.h" />

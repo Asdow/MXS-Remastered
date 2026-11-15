@@ -125,7 +125,7 @@ The mod also includes a free shader pack, built the same way as the camera: pure
 - **Ambient occlusion**: soft contact shadows in ruts, corners and under the bikes.
 - **Dirt detail**: fine, high-resolution grain, pebbles and clods on the track surface up close, only on the ground.
 - **Tire marks** and **tire dirt**: your tires dig ruts into the track behind you, and your tires get caked with mud.
-- **Roost**: your rear tire throws dirt. Dark clods fly back in arcs, and a sheet of fine dust hangs in the air behind you, spreads out and settles. It's strongest when you're on the gas and when you slide through a turn, and it's thrown toward the outside of the turn. The dust takes the colour of the track around you, including the sun and shade on it. In the rain it's mostly mud and in the snow it's white. **Roost dust** sets how much dust there is: at None you only get the clods. **Roost on every bike** (on by default) gives every bike around you in a lobby or a replay its own roost, found by its wheels, out to about 120 m.
+- **Roost**: your rear tire throws dirt. Dark clods fly back in arcs, and a sheet of fine dust hangs in the air behind you, spreads out and settles. It's strongest when you're on the gas and when you slide through a turn, and it's thrown toward the outside of the turn. The dust takes the colour of the track around you, including the sun and shade on it. In the rain it's mostly mud and in the snow it's white. **Roost dust** sets how much dust there is: at None you only get the clods, and toward 100% it grows into a thick, dense cloud. **Roost on every bike** (on by default) gives every bike around you in a lobby or a replay its own roost, found by its wheels, out to about 120 m.
 - **Sun rays**, **bloom**, **depth of field** (auto-focus), **motion blur** (your own bike stays sharp).
 - **Anti-aliasing** (FXAA), **sharpening**, **anisotropic and trilinear texture filtering**.
 - **Brightness**, **contrast**, **saturation**, **vignette**.
@@ -156,6 +156,8 @@ On the **WEATHER** tab (it needs the shaders on), pick one weather with the **We
 
 - **Snowfall**: how heavily it snows. Flakes fall all around you and fly past as you ride, and they haze the distance. At 0% the snow stays on the ground and nothing falls.
 - **Wind**: how hard the wind blows the falling snow sideways.
+- **Snow sound**: how loud the snowstorm sounds: a recording of a blizzard's wind all around you, gusting now and then. It gets louder the harder it snows and the harder the wind blows, and it's silent with both at 0%. It plays alongside the game's own sound, only while you're on the track, and goes quiet while the game is in the background.
+- **Tire sound**: how loud your tires sound in the snow: a soft, even hush, like brushing soft snow, made from the tone of a sled sliding over snow without its crunches. It comes in from walking pace and gets only a little louder and brighter at speed, and it goes silent when you stop or when your bike leaves the ground. It plays alongside the game's own sound and goes quiet while the game is in the background.
 
 ---
 

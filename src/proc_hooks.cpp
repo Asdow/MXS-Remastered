@@ -4469,8 +4469,23 @@ bool EndShaderFrame()
         const bool onTrack = sceneSeen && nowTime - lastScene < std::chrono::milliseconds(500);
         const Config& c = GetConfig();
         const bool rain = onTrack && c.shaders && c.weather == kWeatherRain;
+        const bool snow = onTrack && c.shaders && c.weather == kWeatherSnow;
+        // (The snowstorm: louder the harder it snows and blows; silent with neither.)
+        const double storm = std::sqrt(std::fmin(0.6 * c.snowfall + 0.6 * c.snowWind, 1.0));
+        // (Your tires in the snow: heard from walking pace, nearly all of it by 5 m/s, only a little
+        // louder and brighter beyond - never loud at speed. Nothing in the air, or standing still.)
+        double speed = 0.0, rolling = 0.0;
+        if (snow && c.snowTires > 0.0 && postfx::TiresRolling(speed)) {
+            const auto Smooth = [](double a, double b, double x) {
+                const double t = std::fmin(std::fmax((x - a) / (b - a), 0.0), 1.0);
+                return t * t * (3.0 - 2.0 * t);
+            };
+            rolling = Smooth(0.3, 5.0, speed) * (0.8 + 0.2 * Smooth(5.0, 15.0, speed));
+        }
+        const double tiresBright = 0.5 * std::fmin(speed / 20.0, 1.0);
         thunder::Update(rain && c.lightning > 0.0 ? c.lightningSound : 0.0,
-                        rain ? c.rainSound * std::sqrt(c.rainfall) : 0.0);
+                        rain ? c.rainSound * std::sqrt(c.rainfall) : 0.0, snow ? c.snowSound * storm : 0.0,
+                        snow ? c.snowTires : 0.0, rolling, tiresBright);
     }
 
     // No camera this frame (menu, effect off): don't carry a stale correction into the

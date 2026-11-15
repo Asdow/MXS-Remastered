@@ -240,5 +240,10 @@ const char* StatusText();
 // hasn't been seen lately.
 bool RiderSpeed(double& speed);
 
+// Your bike rolling on the ground (a tire on it: not in the air), and its speed along the ground
+// (m/s): for the sound of your tires in the snow (thunder.h). False when your rider hasn't been
+// seen lately.
+bool TiresRolling(double& speed);
+
 }  // namespace postfx
 }  // namespace mxcam

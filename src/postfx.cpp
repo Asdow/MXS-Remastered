@@ -3955,12 +3955,14 @@ struct LobbyMarkStats {
     double nearest[2] = { -1, -1 };  // m from each of your wheels' contacts to the nearest path's end (-1: none)
 };
 LobbyMarkStats g_lobbyStats;
+double g_marksRanAt = -1e9;  // when UpdateMarks last ran (your bike's fitted fall, g_bikeFallG, is fresh)
 
 bool UpdateMarks(double dt)
 {
     const Config& cfg = GetConfig();
     if (cfg.tireMarks <= 0.0 || !g_frame.haveView || !EnsureMarks())
         return false;
+    g_marksRanAt = Seconds();
     const auto started = std::chrono::steady_clock::now();
     g_markTime += dt;  // the clock the fits' samples are stamped with
     Program& p = Use(kStamp);
@@ -5465,7 +5467,7 @@ void DrawRainfall(const double V[16], const double P[16], Vec3 eye, Vec3 up, Vec
 // clods flying in arcs back to the ground. The dust's colour is the ground's near you as the picture
 // shows it (RoostProbe), so it matches the track, the sun, the time of day and the weather. Worked
 // out here (each bit's own motion), drawn into the HDR image after the composite.
-constexpr int    kRoostMax          = 4000;   // bits alive at once (dust and clods, every bike's)
+constexpr int    kRoostMax          = 9000;   // bits alive at once (dust and clods, every bike's)
 constexpr double kRoostDustRate     = 55.0;   // puffs a second, fully on
 constexpr double kRoostClodRate     = 120.0;  // clods a second, fully on
 constexpr double kRoostExposure     = 0.02;   // s: how long a clod's streak is (its motion in that time)
@@ -5634,7 +5636,11 @@ RoostThrow EmitRoost(Vec3 contact, Vec3 forward, Vec3 velocity, Vec3 accel, bool
 
     // The weather: in the rain wet mud and water, hardly any dust; the snow throws more.
     const bool rain = cfg.weather == kWeatherRain, snow = cfg.weather == kWeatherSnow;
-    const double dustAmount = cfg.roost * cfg.roostDust * (rain ? 0.12 : snow ? 1.2 : 1.0);
+    // Roost dust's slider: about as it was low down, and up to four times as many puffs at 100% (a
+    // thick cloud), each thicker and bigger toward the top of it.
+    const double dustScale = cfg.roostDust + 3.0 * cfg.roostDust * cfg.roostDust * cfg.roostDust;
+    const double heavy = Clamp((cfg.roostDust - 0.5) / 0.5, 0.0, 1.0);
+    const double dustAmount = cfg.roost * dustScale * (rain ? 0.12 : snow ? 1.2 : 1.0);
     const double clodAmount = cfg.roost * (rain ? 1.3 : 1.0);
 
     // New bits, from just behind the rear tire's contact.
@@ -5654,8 +5660,8 @@ RoostThrow EmitRoost(Vec3 contact, Vec3 forward, Vec3 velocity, Vec3 accel, bool
             b.vel = forward * (-RoostRange(0.5, 2.5) * push * u) + up * (RoostRange(0.5, 1.6) * u) +
                     outside * (slide * RoostRange(0.5, 2.0) * u) + across * (RoostRange(-0.5, 0.5) * u) + velocity * 0.12;
             b.life = RoostRange(2.2, 3.8);
-            b.size0 = RoostRange(0.25, 0.45) * u;
-            b.alpha0 = RoostRange(0.10, 0.2);
+            b.size0 = RoostRange(0.25, 0.45) * u * (1.0 + 0.35 * heavy);
+            b.alpha0 = RoostRange(0.10, 0.2) * (1.0 + 0.6 * heavy);
         } else {
             b.vel = forward * (-RoostRange(2.0, 7.0) * push * u) + up * (RoostRange(1.5, 4.5) * u) +
                     outside * (slide * RoostRange(1.0, 4.0) * u) + across * (RoostRange(-1.2, 1.2) * u) + velocity * 0.15;
@@ -8149,6 +8155,85 @@ bool RiderSpeed(double& speed)
         return false;
     speed = Length(g_rider.velocity) / g_unitsPerMetre;
     return true;
+}
+
+// The snow tires' sound's own idea of the air: only a free fall - your bike's body's fitted fall when
+// it's tracked (the custom camera's tracker), else a parabola fitted through your rider's own height
+// over the last 0.15 s (each new position once: the game sends the same one for two frames now and
+// then). Your rider's frame-to-frame acceleration (UpdateAir's) is far too jumpy for this - +0.5 g
+// for a frame in the middle of a flight, -2 g on a rough straight - which switched the sound on in
+// the air and off on the ground. Off once the fit has read a free fall for 50 ms. Back on at once on a
+// landing's hard push up (over 1.2 g: every landing in the log went far past it within 20 ms), or once
+// it has read no fall for 150 ms: in the air your rider bobs about three times a second, which reads
+// as -3 g to +0.6 g and was over -0.45 g for up to 100 ms at a time - each of those switched it back
+// on in the middle of a flight. Nothing of the tire marks' own
+// answer (it asks also whether a tire sits clear of the ground near it, which a turn or a berm can
+// seem to say, and it holds on). Each switch is logged with the half second of readings before it.
+struct TireAir { bool air = false; double fallFor = 0, calmFor = 0, last = -1; bool havePos = false; Vec3 lastPos; };
+TireAir g_tireAir;
+MotionFit g_tireAirFit;
+struct TireAirSample { double t, fallG; bool bikeFit; };
+TireAirSample g_tireAirLog[96];
+int g_tireAirLogNext = 0, g_tireAirLogged = 0;
+
+void LogTireAir(bool air, double now, double speed)
+{
+    if (g_tireAirLogged >= 120)
+        return;
+    ++g_tireAirLogged;
+    char text[1600];
+    int n = snprintf(text, sizeof text, "snow tires: %s at %.1f m/s; fall (g) over the last 0.5 s, oldest first:",
+                     air ? "OFF the ground" : "back ON the ground", speed);
+    const int count = static_cast<int>(sizeof g_tireAirLog / sizeof g_tireAirLog[0]);
+    for (int k = 0; k < count && n < static_cast<int>(sizeof text) - 24; ++k) {
+        const TireAirSample& s = g_tireAirLog[(g_tireAirLogNext + k) % count];
+        if (s.t <= 0 || now - s.t > 0.5)
+            continue;
+        n += snprintf(text + n, sizeof text - n, " %+.0fms:%.2f%s", (s.t - now) * 1000.0, s.fallG, s.bikeFit ? "" : "r");
+    }
+    Log("%s", text);
+}
+
+bool TiresRolling(double& speed)
+{
+    const double now = Seconds();
+    TireAir& a = g_tireAir;
+    const double dt = a.last >= 0 ? Clamp(now - a.last, 0.0, 0.1) : 0.0;
+    a.last = now;
+    if (!g_rider.seen || g_riderTime < 0 || now - g_riderTime > 0.5) {
+        a = TireAir{};
+        a.last = now;
+        g_tireAirFit.Reset();
+        return false;
+    }
+    const Vec3 up = WorldUp();
+    if (!a.havePos || Length(g_rider.position - a.lastPos) > 1e-5 * g_unitsPerMetre) {
+        if (a.havePos && Length(g_rider.position - a.lastPos) > 3.0 * g_unitsPerMetre)
+            g_tireAirFit.Reset();  // a respawn or a cut: not a motion
+        g_tireAirFit.Add(now, g_rider.position);
+        a.lastPos = g_rider.position;
+        a.havePos = true;
+    }
+    double fallG = 0.0;
+    const bool bikeFit = now - g_marksRanAt < 0.5 && g_bikeHave;
+    Vec3 fitVel, fitAcc;
+    if (bikeFit)
+        fallG = g_bikeFallG;
+    else if (g_tireAirFit.Estimate(0.15, fitVel, fitAcc))
+        fallG = Clamp(Dot(fitAcc, up) / (kGravity * g_unitsPerMetre), -6.0, 6.0);
+    speed = Length(g_rider.velocity - up * Dot(g_rider.velocity, up)) / g_unitsPerMetre;
+    g_tireAirLog[g_tireAirLogNext] = TireAirSample{ now, fallG, bikeFit };
+    g_tireAirLogNext = (g_tireAirLogNext + 1) % static_cast<int>(sizeof g_tireAirLog / sizeof g_tireAirLog[0]);
+    a.fallFor = fallG < -0.7 ? a.fallFor + dt : 0.0;
+    a.calmFor = fallG > -0.3 ? a.calmFor + dt : 0.0;
+    if (!a.air && a.fallFor >= 0.05) {
+        a.air = true;
+        LogTireAir(true, now, speed);
+    } else if (a.air && (a.calmFor >= 0.15 || fallG > 1.2)) {
+        a.air = false;
+        LogTireAir(false, now, speed);
+    }
+    return !a.air;
 }
 
 const char* StatusText()

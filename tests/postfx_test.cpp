@@ -344,6 +344,9 @@ int main(int argc, char** argv)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, mode == "tires" ? "TireMarks=1\nTireDirt=0.75" : tiresLate ? "TireMarks=1\nTireDirt=0" : "TireMarks=1\nTireDirt=1");
     else if (mode == "roost")  // your bike speeding up: roost (and its marks and dirt)
         settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1\nRoost=1\nRoostDust=1");
+    else if (mode == "snowroll")  // the same in the snow, with the tires' sound: never taken off the ground on the flat
+        settings = base.replace(base.find("TireMarks=0\nTireDirt=0"), 22, "TireMarks=1\nTireDirt=1\nRoost=1\nRoostDust=1") +
+                   "[Weather]\nSnow=1\nSnowfall=0.5\nSnowSound=0\nSnowTires=1\n";
     else if (mode == "longshadow")  // shadow distance far out (150 m, 8192): a tall tower far behind still casts
         settings = base.replace(base.find("Shadows=0"), 9, "Shadows=1\nShadowMap=1\nShadowDistanceM=150\nShadowResolution=2");
     else if (mode == "longsharp")  // 150 m at the lowest resolution: near you the shadows must stay sharp (cascades)
@@ -721,7 +724,8 @@ int main(int argc, char** argv)
     // only every 4th frame, the way another rider's come in network steps: its wheels must still be learnt.
     const bool rivalStep = mode == "rivalstep";
     const bool rival = mode == "rival" || rivalRoost || rivalStep;
-    const bool roostRun = mode == "roost";
+    const bool snowRoll = mode == "snowroll";
+    const bool roostRun = mode == "roost" || snowRoll;
     const bool hideHud = mode == "hidehud";
     int frames = roostRun ? 2000 : rivalStep ? 700 : rivalRoost ? 320 : timing ? 160 : gateBox || wheelDrift || rival ? 260 : hiddenWheels || rearHidden ? 200 : hideHud ? 330 : headShadow ? 40 : stadiumSwap ? 40 : 12;
     // hidehud: the game's menu over the race, a draw of its own (another texture) right of the HUD.
@@ -1322,7 +1326,7 @@ int main(int argc, char** argv)
         printf("    lens flare %d %d %d, beside it %d %d %d\n", flarePixel.r, flarePixel.g, flarePixel.b, beside.r, beside.g, beside.b);
         if (timeOfDay)
             Check(Near(flarePixel, beside, 6), "the game's lens flare is hidden under a time of day of our own");
-        else
+        else if (!roostRun)  // (the roost's dust cloud can drift in front of it there, dimming it)
             Check(flarePixel.r > beside.r + 40 || flarePixel.r == 255, "the game's lens flare is drawn as usual");
     }
 
@@ -1379,6 +1383,15 @@ int main(int argc, char** argv)
         Check(log.find("postfx: roost ready") != std::string::npos && log.find("postfx: roost's dirt colour ready") != std::string::npos,
               "the roost's shaders compile");
         Check(log.find("roost: rear tires are throwing dirt") != std::string::npos, "speeding up, your rear tire throws roost");
+        if (snowRoll) {
+            size_t offs = 0, at = 0;
+            while ((at = log.find("snow tires: OFF the ground", at)) != std::string::npos) {
+                ++offs;
+                ++at;
+            }
+            printf("    snow tires: taken off the ground %zu time(s)\n", offs);
+            Check(offs == 0, "rolling on the flat, the snow tires' sound is never cut as if in the air");
+        }
     } else if (mode == "lightning") {
         // The bolt: white-hot pixels against the sky; the flash: the sky lit round it.
         int bolt = 0, skySum = 0, skyCount = 0;

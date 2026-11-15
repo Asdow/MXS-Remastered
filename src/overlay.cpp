@@ -1432,11 +1432,6 @@ const RowDef kRows[] = {
         .Help("Turns every effect on this tab on or off (its key is on the KEYBINDS tab). Off is the game "
               "exactly as it looks without the mod.")
         .Col(0),
-    Toggle(kTabGraphics, nullptr,           "Better dirt",          &Config::ultraGraphics)
-        .Help("More detail in the ground: the dirt's grain and clods reach five times further out, its "
-              "bumps catch the sun more strongly, and the track gets patches of lighter, drier and darker, "
-              "richer dirt across it, like real ground. Builds on Dirt detail (GROUND & TIRES). Made to "
-              "cost about what Dirt detail alone always did."),
     Slider(kTabGraphics, "TIME OF DAY",     "Time of day",          &Config::timeOfDay,        -1.0,  24.0,  0.25,   1.0,    0, "", "Game")
         .Clock()
         .Help("Sets the hour: the sun moves across the sky, sunsets turn the light orange, and at "
@@ -1505,10 +1500,15 @@ const RowDef kRows[] = {
     Slider(kTabGraphics, nullptr,           "Texture LOD bias",     &Config::textureLodBias,   -2.0,  0.0,   0.05,   1.0,    2, "")
         .Help("Below 0 uses sharper texture detail further away. Too low shimmers in motion; "
               "-0.5 is a good start with 16x anisotropic."),
-    Slider(kTabGraphics, "GROUND & TIRES",  "Dirt detail",          &Config::dirtDetail,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
-        .Help("Adds fine high-resolution grain, pebbles and clods to the track surface up close, "
-              "lit by the sun. Only on the ground, never on bikes or riders.")
+    Toggle(kTabGraphics, "GROUND & TIRES",  "Better dirt",          &Config::ultraGraphics)
+        .Help("More detail in the ground: the dirt's grain and clods reach five times further out, its "
+              "bumps catch the sun more strongly, and the track gets patches of lighter, drier and darker, "
+              "richer dirt across it, like real ground. Builds on Dirt detail (below). Made to cost about "
+              "what Dirt detail alone always did.")
         .Col(2),
+    Slider(kTabGraphics, nullptr,           "Dirt detail",          &Config::dirtDetail,       0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Adds fine high-resolution grain, pebbles and clods to the track surface up close, "
+              "lit by the sun. Only on the ground, never on bikes or riders."),
     Slider(kTabGraphics, nullptr,           "Detail size",          &Config::dirtScale,        0.5,   2.0,   0.05,   1.0,    2, "x")
         .Help("How big the dirt detail's grains and pebbles are."),
     Slider(kTabGraphics, nullptr,           "Tire marks",           &Config::tireMarks,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
@@ -1533,7 +1533,7 @@ const RowDef kRows[] = {
               "mud in the rain, snow in the snow."),
     Slider(kTabGraphics, nullptr,           "Roost dust",           &Config::roostDust,        0.0,   1.0,   0.01,   100.0,  0, "%", "None")
         .Help("How much fine dust is in the roost: the cloud that hangs in the air behind you, spreads "
-              "and settles. None leaves only the clods."),
+              "and settles. None leaves only the clods; toward 100% it grows into a thick, dense cloud."),
     Toggle(kTabGraphics, nullptr,           "Roost on every bike",  &Config::roostEveryBike)
         .Help("Roost from every bike around you in a lobby or a replay, not just yours: any model, found "
               "by its wheels, kicking up the most when it's on the gas or sliding through a turn. Out to "
@@ -1709,6 +1709,14 @@ const RowDef kRows[] = {
               "the haze they make in the distance. Off keeps the snow on the ground and nothing falling."),
     Slider(kTabWeather, nullptr,          "Wind",                      &Config::snowWind,         0.0,   1.0,   0.01,   100.0,  0, "%", "Calm")
         .Help("How hard the wind blows the falling snow sideways."),
+    Slider(kTabWeather, nullptr,          "Snow sound",                &Config::snowSound,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How loud the snowstorm sounds: a blizzard's wind all around you, gusting, louder the "
+              "harder it snows and the harder the wind blows (silent with both off). Played beside the "
+              "game's own sound, and quiet while the game is in the background."),
+    Slider(kTabWeather, nullptr,          "Tire sound",                &Config::snowTires,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("How loud your tires sound in the snow: a soft hush, like brushing soft snow, as they roll through it, "
+              "a little louder and brighter at speed, silent standing still and in the air. Played "
+              "beside the game's own sound, and quiet while the game is in the background."),
 };
 constexpr int kRowCount = static_cast<int>(sizeof kRows / sizeof kRows[0]);
 
@@ -2313,7 +2321,8 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
                          def.number == &Config::puddles || def.number == &Config::rainReflections ||
                          def.number == &Config::lightning || def.number == &Config::lightningSound ||
                          def.number == &Config::rainSound || def.number == &Config::screenDrops;
-    const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind;
+    const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind || def.number == &Config::snowSound ||
+                         def.number == &Config::snowTires;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
 }
 
@@ -2549,6 +2558,8 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.lightning <= 0.0;
         if (def.number == &Config::snowWind)
             return cfg.snowfall <= 0.0;
+        if (def.number == &Config::snowSound)
+            return cfg.snowfall <= 0.0 && cfg.snowWind <= 0.0;
         if (def.number == &Config::dirtScale)
             return cfg.dirtDetail <= 0;
         if (def.number == &Config::markCacheSegs)

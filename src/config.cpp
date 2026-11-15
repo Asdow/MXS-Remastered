@@ -399,6 +399,8 @@ std::vector<TunableValue> Tunables(const Config& c)
         { L"Weather",   L"Snow",                 c.weather == kWeatherSnow ? 1.0 : 0.0 },  // (for older versions)
         { L"Weather",   L"Snowfall",             c.snowfall },
         { L"Weather",   L"Wind",                 c.snowWind },
+        { L"Weather",   L"SnowSound",            c.snowSound },
+        { L"Weather",   L"SnowTires",            c.snowTires },
         { L"Other",     L"HideHud",              c.hideHud ? 1.0 : 0.0 },
         { L"Other",     L"HideCursor",           c.hideCursor ? 1.0 : 0.0 },
         { L"Other",     L"DabIndicator",         c.dabIndicator ? 1.0 : 0.0 },
@@ -602,6 +604,8 @@ void CopyTunables(const Config& from, Config& to)
     to.lightningSound       = from.lightningSound;
     to.snowfall             = from.snowfall;
     to.snowWind             = from.snowWind;
+    to.snowSound            = from.snowSound;
+    to.snowTires            = from.snowTires;
     to.tireDirt             = from.tireDirt;
     to.roost                = from.roost;
     to.roostDust            = from.roostDust;
@@ -891,6 +895,8 @@ Config ParseConfig(const Config& base)
     c.lightningSound   = Clamp(ReadDouble(L"Weather", L"LightningSound", c.lightningSound), 0.0, 1.0);
     c.snowfall         = Clamp(ReadDouble(L"Weather", L"Snowfall", c.snowfall), 0.0, 1.0);
     c.snowWind         = Clamp(ReadDouble(L"Weather", L"Wind", c.snowWind), 0.0, 1.0);
+    c.snowSound        = Clamp(ReadDouble(L"Weather", L"SnowSound", c.snowSound), 0.0, 1.0);
+    c.snowTires        = Clamp(ReadDouble(L"Weather", L"SnowTires", c.snowTires), 0.0, 1.0);
     c.tireDirt         = ReadDouble(L"Graphics", L"TireDirt", c.tireDirt);
     c.roost            = Clamp(ReadDouble(L"Graphics", L"Roost", c.roost), 0.0, 1.0);
     c.roostDust        = Clamp(ReadDouble(L"Graphics", L"RoostDust", c.roostDust), 0.0, 1.0);

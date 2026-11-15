@@ -1,7 +1,9 @@
 // thunder.cpp - see thunder.h.
 //
-//   The weather's sound: the rain (a recording of steady rain, looped: rain_sound.h) and the
-//   lightning's strikes. A strike: recordings of real ones (lightning_sounds.h - three, cut from
+//   The weather's sound: the rain (a recording of steady rain, looped: rain_sound.h), the snow's
+//   storm (a recording of a blizzard's wind, looped: snow_sound.h), your tires through the snow (a
+//   soft, even hush made from a sled's slide over snow, looped: snow_tires_sound.h - louder and
+//   brighter the faster you ride) and the lightning's strikes. A strike: recordings of real ones (lightning_sounds.h - three, cut from
 //   "Thunder Sound Effect No Copyright.mp3" at their cracks), one played for each strike as late as it
 //   was far, a little different each time (pitch; and far off deeper, duller, quieter). Mixed as they
 //   play, a few at once if they overlap, on a thread of its own.
@@ -25,6 +27,8 @@
 #include "hooks.h"
 #include "lightning_sounds.h"
 #include "rain_sound.h"
+#include "snow_sound.h"
+#include "snow_tires_sound.h"
 #include "log.h"
 
 #ifdef _WIN32
@@ -36,13 +40,16 @@ namespace thunder {
 namespace {
 
 constexpr int    kRate    = 44100;
-constexpr int    kBlock   = 1024;  // samples a buffer (~23 ms)
-constexpr int    kBuffers = 4;     // queued (~93 ms ahead)
+constexpr int    kBlock   = 512;   // samples a buffer (~12 ms)
+constexpr int    kBuffers = 4;     // queued (~46 ms ahead: the tires' sound follows landings quickly)
 constexpr int    kMaxPlaying = 6;
 constexpr double kTwoPi   = 6.283185307179586;
 
 std::atomic<float> g_volume{ 0.0f };      // the strikes' (Config::lightningSound, as heard)
 std::atomic<float> g_rainVolume{ 0.0f };  // the rain's (Config::rainSound and how hard it rains)
+std::atomic<float> g_snowVolume{ 0.0f };  // the snowstorm's (Config::snowSound, the snowfall and its wind)
+std::atomic<float> g_tiresVolume{ 0.0f }; // your tires in the snow (Config::snowTires, with how you're rolling)
+std::atomic<float> g_tiresBright{ 0.0f }; // and how bright (0..1: brighter riding faster)
 std::atomic<bool>  g_stop{ false };
 std::mutex         g_pendingLock;
 struct Pending { double metres, delay; };
@@ -129,29 +136,55 @@ double Limit(double s)
 Clap g_playing[kMaxPlaying];
 double g_focus = 1.0;
 
-// ---- The rain: the recording's steady rain, looped (rain_sound.h; its end blends into its start) --
-struct RainLoop {
+// ---- A looped recording: the rain's (rain_sound.h), the snowstorm's (snow_sound.h) or the snow
+// under your tires (snow_tires_sound.h); each one's end blends into its start ---------------------
+struct Loop {
+    const int16_t* samples;
+    int    count;
+    int    rate;
+    double ease = 0.00004;  // how fast its level follows its volume (a pole a sample: ~0.6 s; the tires' ~60 ms, a soft fade)
     double at = 0;
-    double level = 0;  // following its volume (in and out over a second or so, never a click)
+    double level = 0;  // following its volume (in and out smoothly, never a click)
 
-    double Sample(double to)
+    double Sample(double to, double pitch = 1.0)
     {
-        level += (to - level) * 0.00004;
+        level += (to - level) * ease;
         if (level < 1e-5 && to <= 0.0)
             return 0.0;
-        constexpr int n = static_cast<int>(sizeof kRainLoop / sizeof kRainLoop[0]);
         const int i = static_cast<int>(at);
         const double f = at - i;
-        const double v = (kRainLoop[i] * (1.0 - f) + kRainLoop[i + 1 < n ? i + 1 : 0] * f) / 32768.0;
-        at += static_cast<double>(kRainRate) / kRate;
-        if (at >= n)
-            at -= n;
+        const double v = (samples[i] * (1.0 - f) + samples[i + 1 < count ? i + 1 : 0] * f) / 32768.0;
+        at += static_cast<double>(rate) / kRate * pitch;
+        if (at >= count)
+            at -= count;
         return v * level;
     }
 };
-RainLoop g_rain;
+Loop g_rain{ kRainLoop, static_cast<int>(sizeof kRainLoop / sizeof kRainLoop[0]), kRainRate };
+Loop g_snow{ kSnowLoop, static_cast<int>(sizeof kSnowLoop / sizeof kSnowLoop[0]), kSnowRate };
+Loop g_tires{ kSnowTiresLoop, static_cast<int>(sizeof kSnowTiresLoop / sizeof kSnowTiresLoop[0]), kSnowTiresRate, 0.0004 };
 
-void Fill(short* out, int count, float volume, float rainVolume)
+// Every volume now, as set by Update.
+struct Levels { float strikes, rain, snow, tires, tiresBright; };
+Levels Now()
+{
+    return Levels{ g_volume.load(), g_rainVolume.load(), g_snowVolume.load(), g_tiresVolume.load(), g_tiresBright.load() };
+}
+
+// The tires' brightness: a gentle low-pass over them (two poles), opening up as you ride faster -
+// the brush harder, not faster. Its cutoff eased, never stepping.
+double g_tiresCut = 9000.0, g_tiresLp1 = 0.0, g_tiresLp2 = 0.0;
+double Brightened(double s, double bright)
+{
+    const double to = 9000.0 * std::pow(1.8, std::fmin(std::fmax(bright, 0.0), 1.0));  // 9 to ~16 kHz: clear, only airier faster
+    g_tiresCut += (to - g_tiresCut) * 0.0005;
+    const double a = Pole(g_tiresCut);
+    g_tiresLp1 += (s - g_tiresLp1) * a;
+    g_tiresLp2 += (g_tiresLp1 - g_tiresLp2) * a;
+    return g_tiresLp2;
+}
+
+void Fill(short* out, int count, const Levels& v)
 {
     {
         std::lock_guard<std::mutex> lock(g_pendingLock);
@@ -176,7 +209,7 @@ void Fill(short* out, int count, float volume, float rainVolume)
         for (Clap& c : g_playing)
             if (c.on)
                 s += c.Sample();
-        s = s * volume + g_rain.Sample(rainVolume);
+        s = s * v.strikes + g_rain.Sample(v.rain) + g_snow.Sample(v.snow) + Brightened(g_tires.Sample(v.tires), v.tiresBright);
         // Soft-limited: a close strike on top of the rain stays whole, never clipping hard.
         s = Limit(s) * g_focus;
         out[i] = static_cast<short>(s * 32000.0);
@@ -211,7 +244,7 @@ DWORD WINAPI AudioThread(void*)
         headers[i].lpData = reinterpret_cast<LPSTR>(samples[i]);
         headers[i].dwBufferLength = sizeof samples[i];
         waveOutPrepareHeader(device, &headers[i], sizeof headers[i]);
-        Fill(samples[i], kBlock, 0.0f, 0.0f);
+        Fill(samples[i], kBlock, Levels{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
         waveOutWrite(device, &headers[i], sizeof headers[i]);
     }
     while (!g_stop.load()) {
@@ -219,7 +252,7 @@ DWORD WINAPI AudioThread(void*)
         for (int i = 0; i < kBuffers; ++i) {
             if (!(headers[i].dwFlags & WHDR_DONE))
                 continue;
-            Fill(samples[i], kBlock, g_volume.load(), g_rainVolume.load());
+            Fill(samples[i], kBlock, Now());
             waveOutWrite(device, &headers[i], sizeof headers[i]);
         }
     }
@@ -280,7 +313,7 @@ void AudioThread()
     Log("weather sound: sound output open (%d Hz, ALSA)", kRate);
     static short samples[kBlock];
     while (!g_stop.load()) {
-        Fill(samples, kBlock, g_volume.load(), g_rainVolume.load());
+        Fill(samples, kBlock, Now());
         long n = write(pcm, samples, kBlock);
         if (n < 0 && recover)
             n = recover(pcm, static_cast<int>(n), 1);
@@ -325,22 +358,29 @@ void Strike(double metres, double delay)
         g_pending[g_pendingCount++] = Pending{ metres, delay };
 }
 
-void Update(double strikes, double rain)
+void Update(double strikes, double rain, double snow, double tires, double rolling, double bright)
 {
-    if (strikes <= 0.0 && rain <= 0.0) {
+    if (strikes <= 0.0 && rain <= 0.0 && snow <= 0.0 && tires <= 0.0) {
         g_volume = 0.0f;
         g_rainVolume = 0.0f;
+        g_snowVolume = 0.0f;
+        g_tiresVolume = 0.0f;
         if (Running()) {
             StopAudio();
             for (Clap& c : g_playing)
                 c.on = false;
             g_rain.level = 0.0;
+            g_snow.level = 0.0;
+            g_tires.level = 0.0;
         }
         return;
     }
     // The sliders as loudness is heard: their squares (100%: as loud as it goes without clipping).
     g_volume = static_cast<float>(strikes * strikes);
     g_rainVolume = static_cast<float>(rain * rain);
+    g_snowVolume = static_cast<float>(snow * snow);
+    g_tiresVolume = static_cast<float>(tires * tires * std::fmin(std::fmax(rolling, 0.0), 1.0));
+    g_tiresBright = static_cast<float>(std::fmin(std::fmax(bright, 0.0), 1.0));
     StartAudio();
 }
 
@@ -357,7 +397,8 @@ void RenderForTest(double metres, short* out, int count, uint32_t seed)
 // The rain alone at full volume (as Fill mixes it, once faded in).
 void RenderRainForTest(short* out, int count)
 {
-    RainLoop r;
+    Loop r = g_rain;
+    r.at = 0.0;
     r.level = 1.0;
     for (int i = 0; i < count; ++i)
         out[i] = static_cast<short>(Limit(r.Sample(1.0)) * 32000.0);

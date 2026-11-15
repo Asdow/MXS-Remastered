@@ -159,6 +159,10 @@ struct Config {
                                           // as the strike was far
     double snowfall         = 0.5;        // 0..1 how heavily it falls (flakes around you, and the haze they make)
     double snowWind         = 0.2;        // 0..1 how hard the wind blows the falling snow
+    double snowSound        = 0.6;        // 0..1 how loud the snowstorm sounds (0: silent; thunder.h): a
+                                          // blizzard's wind, louder the more it snows and blows
+    double snowTires        = 0.6;        // 0..1 how loud your tires sound in the snow (0: silent; thunder.h):
+                                          // a crunch that plays louder and faster the faster you ride
     bool   ultraGraphics    = false;      // more ground detail, further out, lit more strongly (postfx Dirt)
     int    headlightColor   = 0;          // the headlight's colour (every bike's): 0 white, 1 amber, 2 rainbow
     bool   headlightEveryBike = true;     // a headlight on every bike around you too, not just yours (found
