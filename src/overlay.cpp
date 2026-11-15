@@ -1432,7 +1432,7 @@ const RowDef kRows[] = {
         .Help("Turns every effect on this tab on or off (its key is on the KEYBINDS tab). Off is the game "
               "exactly as it looks without the mod.")
         .Col(0),
-    Toggle(kTabGraphics, nullptr,           "Ultra graphics",       &Config::ultraGraphics)
+    Toggle(kTabGraphics, nullptr,           "Better dirt",          &Config::ultraGraphics)
         .Help("More detail in the ground: the dirt's grain and clods reach five times further out, its "
               "bumps catch the sun more strongly, and the track gets patches of lighter, drier and darker, "
               "richer dirt across it, like real ground. Builds on Dirt detail (GROUND & TIRES). Made to "
@@ -1693,6 +1693,9 @@ const RowDef kRows[] = {
         .Help("How loud the rain sounds: steady rain all around you, louder the harder it rains (silent "
               "with Rainfall off). Played beside the game's own sound, and quiet while the game is in the "
               "background."),
+    Slider(kTabWeather, nullptr,          "Screen drops",              &Config::screenDrops,      0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
+        .Help("Water on the screen, as on a visor or a camera lens in the rain: blurry drops that bead up "
+              "where the rain hits and run down it, leaving a trail. Higher: more of them."),
     Slider(kTabWeather, nullptr,          "Lightning",                 &Config::lightning,        0.0,   1.0,   0.01,   100.0,  0, "%", "Off")
         .Help("A thunderstorm: how often lightning strikes. A bolt comes down out of the clouds somewhere "
               "around you, flickering, and its flash lights up the clouds, the track and the rain. Low: "
@@ -2309,7 +2312,7 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
     const bool rainRow = def.number == &Config::rainfall || def.number == &Config::rainWind || def.number == &Config::wetness ||
                          def.number == &Config::puddles || def.number == &Config::rainReflections ||
                          def.number == &Config::lightning || def.number == &Config::lightningSound ||
-                         def.number == &Config::rainSound;
+                         def.number == &Config::rainSound || def.number == &Config::screenDrops;
     const bool snowRow = def.number == &Config::snowfall || def.number == &Config::snowWind;
     return (rainRow && cfg.weather != kWeatherRain) || (snowRow && cfg.weather != kWeatherSnow);
 }
@@ -2538,7 +2541,7 @@ bool RowInactive(const RowDef& def, const Config& cfg)
             return cfg.timeOfDay < 0 || cfg.headlight <= 0;
         if (def.number == &Config::roostDust || def.flag == &Config::roostEveryBike)
             return cfg.roost <= 0.0;
-        if (def.number == &Config::rainWind || def.number == &Config::rainSound)
+        if (def.number == &Config::rainWind || def.number == &Config::rainSound || def.number == &Config::screenDrops)
             return cfg.rainfall <= 0.0;
         if (def.number == &Config::rainReflections)
             return cfg.wetness <= 0.0 && cfg.puddles <= 0.0;

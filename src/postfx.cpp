@@ -517,6 +517,8 @@ struct Resources {
     Program bolt;                                  // the lightning's bolt (DrawBolt)
     GLuint  boltVao = 0, boltVbo = 0;
     bool    boltTried = false;
+    Program lensDrops;                             // water on the screen in the rain (Config::screenDrops)
+    bool    lensDropsTried = false;
 };
 Resources g_res;
 // The tire dirt's mask this frame (see BeginWheelMask).
@@ -5153,8 +5155,8 @@ bool MakeSnowProgram()
         }
         g_res.snow.id = program;
         g_gl.GenVertexArrays(1, &g_res.snowVao);  // no attributes: everything comes from gl_VertexID
-        Log("postfx: snowfall ready (%s)", version[9] == '5' ? "GLSL 150" : "GLSL 130");
-        if (version[9] != '5' && !error.empty())
+        Log("postfx: snowfall ready (%s)", version[10] == '5' ? "GLSL 150" : "GLSL 130");
+        if (version[10] != '5' && !error.empty())
             LogInfo("the snowfall as GLSL 150 (130 is used)", error);
         return true;
     }
@@ -5226,8 +5228,8 @@ constexpr double kRainBoxMetres   = 22.0;    // the box of drops that wraps roun
 constexpr int    kRainDropsMax    = 45000;   // at 100%: about four in every cubic metre around you (a downpour)
 constexpr double kRainFallMetres  = 8.5;     // m/s, a raindrop's pace
 constexpr double kRainWindMetres  = 6.0;     // m/s at 100% wind
-constexpr double kRainDropMetres  = 0.0015;  // a drop's half width
-constexpr double kRainShutter     = 0.032;   // s: how long a streak the eye sees each drop as (its fall in that time)
+constexpr double kRainDropMetres  = 0.0019;  // a drop's half width (its head; the tail behind it thinner)
+constexpr double kRainShutter     = 0.02;    // s: how long a streak the eye sees each drop as (its fall in that time)
 double g_rainDrift[3] = {};                  // how far the rain has fallen, the wind's part too (wrapped to the box)
 // Your headlight this frame, view space (the composite's own, for the drops in its beam).
 struct RainHeadlight {
@@ -5269,8 +5271,8 @@ bool MakeRainProgram()
         }
         g_res.rain.id = program;
         g_gl.GenVertexArrays(1, &g_res.rainVao);  // no attributes: everything comes from gl_VertexID
-        Log("postfx: rainfall ready (%s)", version[9] == '5' ? "GLSL 150" : "GLSL 130");
-        if (version[9] != '5' && !error.empty())
+        Log("postfx: rainfall ready (%s)", version[10] == '5' ? "GLSL 150" : "GLSL 130");
+        if (version[10] != '5' && !error.empty())
             LogInfo("the rainfall as GLSL 150 (130 is used)", error);
         return true;
     }
@@ -5327,7 +5329,7 @@ bool MakeSplashProgram()
             continue;
         }
         g_res.splash.id = program;
-        Log("postfx: rain splashes ready (%s)", version[9] == '5' ? "GLSL 150" : "GLSL 130");
+        Log("postfx: rain splashes ready (%s)", version[10] == '5' ? "GLSL 150" : "GLSL 130");
         return true;
     }
     LogInfo("the rain's splashes couldn't be built (the rain still falls)", error);
@@ -5517,7 +5519,7 @@ bool BuildOwnProgram(Program& out, const char* vs, const char* fs, const char* n
             continue;
         }
         out.id = program;
-        Log("postfx: %s ready (%s)", name, version[9] == '5' ? "GLSL 150" : "GLSL 130");
+        Log("postfx: %s ready (%s)", name, version[10] == '5' ? "GLSL 150" : "GLSL 130");
         return true;
     }
     LogInfo(name, error);
@@ -6135,6 +6137,28 @@ bool MakeBoltResources()
     return true;
 }
 
+// The screen drops' pass (a fullscreen one, as the others; built on its own, so a driver that
+// can't build it loses only the drops).
+bool MakeLensDropsProgram()
+{
+    if (g_res.lensDropsTried)
+        return g_res.lensDrops.id != 0;
+    g_res.lensDropsTried = true;
+    std::string error;
+    for (const char* version : { "#version 150\n", "#version 130\n" }) {
+        g_res.lensDrops = Program{};
+        g_res.lensDrops.id = BuildProgram(version, shaders::kLensDrops, error);
+        if (g_res.lensDrops.id) {
+            Log("postfx: screen drops ready (%s)", version[10] == '5' ? "GLSL 150" : "GLSL 130");
+            if (version[10] != '5' && !error.empty())
+                LogInfo("the screen drops as GLSL 150 (130 is used)", error);
+            return true;
+        }
+    }
+    LogInfo("the screen drops couldn't be built (the rain still falls)", error);
+    return false;
+}
+
 // The bolt, into the HDR image (after the composite, before the rain falls in front of it).
 void DrawBolt(const double V[16], double now, int h)
 {
@@ -6678,6 +6702,20 @@ void Render(int w, int h)
             Draw(out);
             current = &out;
         }
+    }
+    // ---- Screen drops: water on the glass, over the scene as it now is ----
+    if (rainOn && cfg.screenDrops > 0.0 && cfg.rainfall > 0.0 && MakeLensDropsProgram()) {
+        Target& out = Spare();
+        Program& p = g_res.lensDrops;
+        g_gl.UseProgram(p.id);
+        Bind(p, "u_src", 0, current->tex);
+        g_gl.Uniform1f(p["u_time"], static_cast<float>(std::fmod(now, 3600.0)));
+        g_gl.Uniform1f(p["u_amount"], static_cast<float>(cfg.screenDrops * Clamp(cfg.rainfall * 1.6, 0.0, 1.0)));
+        g_gl.Uniform1f(p["u_aspect"], static_cast<float>(w) / h);
+        g_gl.Uniform1f(p["u_pixel"], 1.0f / static_cast<float>(h));
+        g_gl.Uniform1f(p["u_light"], static_cast<float>(Clamp(snowLight, 0.0, 1.0)));
+        Draw(out);
+        current = &out;
     }
     for (int i = 0; i < 16; ++i)
         g_motion.viewProj[i] = viewProj[i];

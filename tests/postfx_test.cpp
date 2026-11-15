@@ -310,6 +310,13 @@ int main(int argc, char** argv)
                    std::string(getenv("MXCAM_TEST_PUDDLES") ? getenv("MXCAM_TEST_PUDDLES") : "0.8") + "\nReflections=1\n";
     else if (mode == "lightning")
         settings = base + "[Weather]\nRain=1\nRainfall=0.6\nWetness=0.8\nPuddles=0.5\nLightning=1\nLightningSound=0\n";
+    else if (mode == "screendrops")
+        settings = base + "[Weather]\nRain=1\nRainfall=0.8\nWetness=0.8\nPuddles=0.5\nRainSound=0\nScreenDrops=1\n";
+    else if (mode == "rainnight") {  // the rain at night in your headlight: only the drops in its beam seen
+        base.replace(base.find("TimeOfDay=-1"), 12, "TimeOfDay=0");
+        settings = base.replace(base.find("Headlight=0"), 11, "Headlight=1\nHeadlightBeamDeg=22") +
+                   "[Weather]\nRain=1\nRainfall=1\nWetness=0.8\nPuddles=0.5\nRainSound=0\n";
+    }
     else if (mode == "snowperf0")  // timing: the same scene without the weather
         settings = base;
     else if (mode == "shadows")  // screen-space shadows alone
@@ -1309,7 +1316,7 @@ int main(int argc, char** argv)
     Check(errorAfter == GL_NO_ERROR, "no GL errors");
     {
         const Pixel flarePixel = At(flareX, 130), beside = At(flareX - 45, 130);
-        const bool timeOfDay = mode == "night" || mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson" ||
+        const bool timeOfDay = mode == "night" || mode == "rainnight" || mode == "headlight" || mode == "narrowbeam" || mode == "thirdperson" ||
                                mode == "headlightup" || mode == "headlightdown" || mode == "headlightamber" ||
                                mode == "headlightrainbow";
         printf("    lens flare %d %d %d, beside it %d %d %d\n", flarePixel.r, flarePixel.g, flarePixel.b, beside.r, beside.g, beside.b);
@@ -1396,6 +1403,18 @@ int main(int argc, char** argv)
         Check(log.find("postfx: lightning ready") != std::string::npos, "the lightning's shaders compile");
         Check(log.find("lightning: a strike") != std::string::npos, "lightning strikes");
         Check(log.find("shader failed") == std::string::npos, "every effect's shader compiles with the lightning in it");
+    } else if (mode == "screendrops") {
+        std::string log;
+        FILE* in = _wfsopen((dir + L"MXS_REMASTERED.log").c_str(), L"rb", _SH_DENYNO);
+        if (in) {
+            char buffer[4096];
+            size_t got;
+            while ((got = fread(buffer, 1, sizeof buffer, in)) > 0)
+                log.append(buffer, got);
+            fclose(in);
+        }
+        Check(log.find("postfx: screen drops ready (GLSL 150)") != std::string::npos, "the screen drops' shader compiles (as GLSL 150)");
+        Check(log.find("shader failed") == std::string::npos, "every effect's shader compiles with the screen drops in it");
     } else if (mode == "rain") {
         printf("    ground %d %d %d (drawn %d %d %d), sky %d %d %d, box %d %d %d\n", ground.r, ground.g, ground.b,
                drawnGround.r, drawnGround.g, drawnGround.b, sky.r, sky.g, sky.b, box.r, box.g, box.b);

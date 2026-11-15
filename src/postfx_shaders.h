@@ -1011,6 +1011,33 @@ vec3 TraceReflection(vec3 p, vec3 r, float jitter, out float found)
     return vec3(0.0);
 }
 
+// The ground's slope smoothed over about a metre around p (view space), not the one triangle of
+// the track's mesh under it: on a berm or a jump's face the mesh is flat faces at quite different
+// angles, and the wet shine (glancing, it changes fast with the slope) showed each one as a patch.
+// The slopes of six points around it are averaged in, read from the terrain's own depth (nothing
+// standing on it - your arm, the bike, a fence - is in that, so none of them can print a ghost of
+// itself into the shine), each counted less the further it is from p itself (the ground past a
+// crest, behind it on screen, isn't this ground).
+vec3 BroadNormal(vec2 uv, vec3 p, vec3 nLocal)
+{
+    float z = max(-p.z, 1e-3);
+    float s = clamp(0.6 * u_metre * u_proj[1][1] / (2.0 * u_texel.y * z), 1.0, 40.0);  // pixels
+    vec3 sum = nLocal;
+    for (int i = 0; i < 6; ++i) {
+        float a = float(i) * 1.0471976 + 0.5;
+        vec2 suv = uv + vec2(cos(a), sin(a)) * (s * (i - (i / 2) * 2 == 0 ? 1.0 : 0.55)) * u_texel;
+        float d = textureLod(u_terrainDepth, suv, 0.0).r;
+        if (IsSky(d) || !OnScreen(suv))
+            continue;
+        vec3 q = ViewPos(suv, d);
+        float w = 1.0 - smoothstep(1.2 * u_metre, 2.5 * u_metre, length(q - p));
+        vec3 nq = NormalAt(u_terrainDepth, suv, q);
+        if (w > 0.0 && dot(nq, nLocal) > 0.2)
+            sum += nq * w;
+    }
+    return normalize(sum);
+}
+
 // Rain on the ground (WEATHER): the dirt soaked, darker and deeper in colour (more so around the
 // puddles), and muddy water standing in them. Returns the ground's own colour; refl / reflW: what
 // its surface reflects and how much of it, laid over after the lighting (a reflection isn't in the
@@ -1178,8 +1205,10 @@ void main()
                 c = Snow(c, wpD, dwx, dwy, nFloor, z, ground, u_marks > 0.0 ? RutStatsAt(pD) : vec2(0.0), snowCover);
             // (Rain: the soaked dirt and the puddles, on what this pixel shows of the ground too - water
             // stands in a rut's floor.)
+            // (Its slope over a metre or so, not the mesh's one flat face: see BroadNormal.)
             if (u_rain > 0.0 && ground > 0.001)
-                c = Rain(c, p, nView, wpD, nWorld, dir, z, ground, u_marks > 0.0 ? RutStatsAt(pD).x : 0.0, rainRefl, rainReflW);
+                c = Rain(c, p, nView, wpD, normalize(u_viewToWorld * BroadNormal(v_uv, p, nView)), dir, z, ground,
+                         u_marks > 0.0 ? RutStatsAt(pD).x : 0.0, rainRefl, rainReflW);
             // (Not tied to the ground mask: when your bike is drawn before the terrain pass ends, the
             // tire is in the terrain's depth too and counted as ground, and its mud came and went.
             // TireDirt keeps to the tire around its own axle.)
@@ -1300,15 +1329,15 @@ void main()
     side = sl > 1e-6 ? side / sl : vec3(1.0, 0.0, 0.0);
     float z = -mid.z;
     float shown = max(u_width, 0.6 * u_pixel * max(z, 0.0));
-    v_alpha = (0.3 + 0.25 * Random(id, 4u)) * sqrt(u_width / shown)
+    v_alpha = (0.17 + 0.15 * Random(id, 4u)) * sqrt(u_width / shown)
             * smoothstep(0.35 * u_metre, 1.2 * u_metre, z)                    // not right in front of the lens
             * (1.0 - smoothstep(0.38 * u_box, 0.5 * u_box, length(rel)));   // nor where the box wraps
     float al = length(axis);
     vec3 along = al > 1e-6 ? axis / al : vec3(0.0, 1.0, 0.0);
     vec3 v = (c.y > 0.0 ? head : tail) + side * (c.x * shown) + along * (c.y * shown);
-    // In your headlight's beam (as the composite's HeadlightOne, the cone seen from the plate, and the
-    // glow around it - a real lamp's light spills past its beam's edge, and rain shows it): lit up,
-    // bright near the bike, fading with the distance.
+    // In your headlight's beam (as the composite's HeadlightOne, the cone seen from the plate, with only
+    // a faint edge past it - at night the drops outside the beam stay unseen): lit up, bright near the
+    // bike, fading with the distance.
     v_light = u_colour;
     if (u_headOn > 0.0) {
         vec3 q = mid - u_headPos;
@@ -1317,9 +1346,9 @@ void main()
             float sideA = atan(dot(q, u_headRight), ahead);
             float downA = atan(-dot(q, u_headUp), ahead);
             vec2 e = vec2(sideA / u_headBeam.x, (downA - u_headBeam.y) / u_headBeam.z);
-            float cone = smoothstep(1.0, 0.45, length(e)) + 0.5 * smoothstep(2.2, 0.8, length(e));
+            float cone = smoothstep(1.0, 0.5, length(e)) + 0.06 * smoothstep(1.3, 0.9, length(e));
             float reach = 1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach));
-            v_light += u_headColor * (cone * reach * smoothstep(0.5 * u_metre, 1.5 * u_metre, d) * u_headOn * 4.0);
+            v_light += u_headColor * (cone * reach * smoothstep(0.5 * u_metre, 1.5 * u_metre, d) * u_headOn * 5.0);
         }
     }
     v_corner = c;
@@ -1343,8 +1372,14 @@ void main()
 {
     if (v_alpha < 0.002)
         discard;
-    float across = 1.0 - v_corner.x * v_corner.x;
-    float along = smoothstep(-1.0, 0.1, v_corner.y) * (1.0 - smoothstep(0.8, 1.0, v_corner.y));  // its tail fainter
+    // A drop, not a stripe: a round bright head with a thin tail behind it, fading out.
+    float t = v_corner.y;  // -1 the tail, 1 just past the head
+    float width = mix(0.3, 1.0, smoothstep(-1.0, 0.75, t));
+    float x = v_corner.x / width;
+    float across = max(1.0 - x * x, 0.0);
+    float along = smoothstep(-1.0, -0.1, t) * (1.0 - smoothstep(0.82, 1.0, t));
+    float head = exp(-(t - 0.76) * (t - 0.76) * 45.0);
+    across *= 0.45 + 1.1 * head;
     float d = texture(u_depth, gl_FragCoord.xy * u_texel).r;
     float seen = 1.0;
     if (d < 0.999999) {
@@ -1491,7 +1526,7 @@ void main()
         if (ahead > 0.0 && d < 70.0 * u_headReach) {
             vec2 e = vec2(atan(dot(q, u_headRight), ahead) / u_headBeam.x,
                           (atan(-dot(q, u_headUp), ahead) - u_headBeam.y) / u_headBeam.z);
-            float cone = smoothstep(1.0, 0.45, length(e)) + 0.3 * smoothstep(2.0, 0.8, length(e));
+            float cone = smoothstep(1.0, 0.5, length(e)) + 0.05 * smoothstep(1.3, 0.9, length(e));
             float reach = 1.0 / (1.0 + d * d / (144.0 * u_headReach * u_headReach));
             v_light += u_headColor * (cone * reach * u_headOn * 3.0);
         }
@@ -2382,6 +2417,222 @@ void main()
     float core = exp(-2.0 * (x / v_core) * (x / v_core));
     float glow = exp(-x / (0.8 * v_core + 1.3));
     o_color = vec4((u_coreColour * core + u_glowColour * glow) * v_bright, 0.0);
+}
+)GLSL";
+
+// ---- Screen drops (WEATHER, Config::screenDrops): water on the lens in the rain ----------------
+// A pass over the finished HDR image (after depth of field and motion blur: the water is on the
+// glass, not out in the scene), drawn from screen position and time alone. Drops run down the glass
+// in fits and starts (in columns, two to a column, each run starting somewhere new), each pulling a
+// thin wandering film behind it with small beads left on it, that dries away once it's gone. Between
+// them, many beads sit where the rain landed (tiny ones thickest, in patches), wiped away where a
+// drop runs. Each is a little dome of clear water: the scene through it upside down, squeezed most
+// toward its edge, the sky reflected along its upper edge, a small highlight; a drop's film behind
+// it only bends what's seen a little.
+constexpr const char* kLensDrops = R"GLSL(
+uniform sampler2D u_src;
+uniform float u_time;     // s
+uniform float u_amount;   // 0..1: how much water
+uniform float u_aspect;   // width / height
+uniform float u_light;    // the weather's light (for the glint)
+uniform float u_pixel;    // a pixel, in screen heights
+
+uint Hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+float R(vec2 cell, float k)
+{
+    ivec2 c = ivec2(cell);
+    return float(Hash(uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(k) * 83492791u) & 0xffffffu) / 16777216.0;
+}
+float ValueNoise(vec2 p)
+{
+    vec2 i = floor(p), f = p - i;
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(R(i, 90.0), R(i + vec2(1.0, 0.0), 90.0), f.x),
+               mix(R(i + vec2(0.0, 1.0), 90.0), R(i + vec2(1.0, 1.0), 90.0), f.x), f.y);
+}
+
+// What the water at a point is: how much of it (0 = none), where its lens looks (an offset, screen
+// heights), its surface's normal (z toward you), how soft what's seen through it is, and how near
+// its edge.
+struct Hit { float m; vec2 off; vec3 n; float blur; float rim; };
+Hit None() { return Hit(0.0, vec2(0.0), vec3(0.0, 0.0, 1.0), 0.0, 0.0); }
+void Keep(inout Hit best, Hit h) { if (h.m > best.m) best = h; }
+
+// A drop (a bead, or a running drop's head), rel from its middle: a little dome of water, a touch
+// out of round. Clear: the scene through it upside down, squeezed most toward its edge.
+Hit Round(vec2 rel, float radius, float shown, float seed)
+{
+    if (shown <= 0.0 || radius <= 0.0)
+        return None();
+    vec2 d = rel / radius;
+    d.y *= d.y > 0.0 ? 1.1 : 0.92;  // heavier at the bottom
+    d.x *= 0.8 + 0.45 * fract(seed * 7.31);  // some wider, some narrower
+    float l = length(d);
+    if (l >= 1.1)
+        return None();
+    if (l > 0.2)
+        l *= 1.0 + 0.06 * sin(atan(d.y, d.x) * 3.0 + seed * 6.283) + 0.03 * sin(atan(d.y, d.x) * 5.0 + seed * 17.0);
+    if (l >= 1.0)
+        return None();
+    Hit h;
+    float edge = clamp(2.0 * u_pixel / radius, 0.25, 0.6);
+    h.m = smoothstep(1.0, 1.0 - edge, l) * min(shown, 1.0);
+    float z = sqrt(max(1.0 - l * l, 0.0));
+    h.n = normalize(vec3(d, max(z, 0.08)));
+    h.off = -d * (radius + 0.22 * (0.6 + 0.4 * (1.0 - z)));  // a wide view through it, upside down
+    h.blur = 0.0008 + radius * 0.1;  // (sharper than the glass around it: a lens, focused)
+    h.rim = smoothstep(0.78, 1.0, l);
+    return h;
+}
+
+// The thin stream a running drop leaves: a long narrow lens, the scene across it flipped side to
+// side (bright along one edge and dark along the other, as what's beside it is).
+Hit Film(float across, float width, float shown)
+{
+    float a = across / width;
+    if (abs(a) >= 1.0 || shown <= 0.0)
+        return None();
+    Hit h;
+    float edge = clamp(2.0 * u_pixel / width, 0.35, 0.8);
+    h.m = smoothstep(1.0, 1.0 - edge, abs(a)) * min(shown, 1.0);
+    float z = sqrt(max(1.0 - a * a, 0.0));
+    h.n = normalize(vec3(a, 0.0, max(z, 0.1)));
+    h.off = vec2(-a * 0.07, 0.0);
+    h.blur = 0.002;
+    h.rim = smoothstep(0.6, 1.0, abs(a)) * 0.5;
+    return h;
+}
+
+const float kColumn = 0.05;  // screen heights
+
+float Wander(float y, vec2 s) { return 0.22 * sin(y * 9.0 + s.x * 6.283) + 0.08 * sin(y * 31.0 + s.y * 6.283); }
+float WanderSlope(float y, vec2 s) { return 1.98 * cos(y * 9.0 + s.x * 6.283) + 2.48 * cos(y * 31.0 + s.y * 6.283); }
+
+// One running drop (column col, slot 0 or 1): now and then it starts somewhere up the glass (or above
+// it) and runs down off the bottom, held back and let go, leaving a film and small beads behind it.
+void Runner(inout Hit best, inout float wipe, vec2 q, float col, float slot, float share)
+{
+    vec2 id = vec2(col, slot);
+    if (R(id, 60.0) > share)
+        return;
+    float period = 5.5 + 4.0 * R(id, 61.0);
+    float life = u_time / period + R(id, 62.0);
+    float round_ = floor(life);
+    float t = (life - round_) * period;  // s into this run
+    vec2 key = id * vec2(1.0, 101.0) + vec2(round_ * 7.0, round_ * 13.0);
+    vec2 seed = vec2(R(key, 63.0), R(key, 64.0));
+    float start = 0.45 + 0.7 * R(key, 65.0);  // (1 is the top of the screen)
+    float speed = max(0.15 + 0.3 * R(key, 66.0), (start + 0.08) / (period - 2.2));
+    float k = 6.2831853 * (0.4 + 0.9 * R(key, 67.0));
+    float headY = start - speed * (t - sin(k * t) / k);  // in fits and starts
+    float exitT = (start + 0.08) / speed;
+    float fade = 1.0 - smoothstep(exitT, exitT + 1.8, t);  // what it left dries once it's gone
+    if (fade <= 0.0 || q.y > start + 0.02)
+        return;
+    float x0 = (col + 0.5) * kColumn + (R(key, 68.0) - 0.5) * 0.5 * kColumn;
+    float radius = 0.011 + 0.009 * R(key, 69.0);
+    // Its head.
+    if (headY > -0.05) {
+        vec2 rel = vec2(q.x - x0 - kColumn * Wander(headY, seed), q.y - headY);
+        rel.y *= rel.y > 0.0 ? 0.62 : 1.0;  // drawn out upward, where it came from
+        Keep(best, Round(rel, radius * 0.72 * smoothstep(0.0, 0.4, t), 1.0, seed.x));  // (about twice its stream's width)
+    }
+    // Where it has been, from where it started down to it.
+    if (q.y > headY && q.y < start) {
+        float slope = kColumn * WanderSlope(q.y, seed);
+        float pathX = x0 + kColumn * Wander(q.y, seed);
+        float across = (q.x - pathX) / sqrt(1.0 + slope * slope);
+        float above = q.y - headY;
+        float width = radius * 0.38 * mix(1.0, 0.6, smoothstep(0.0, 0.6, above)) * smoothstep(start, start - 0.04, q.y);
+        wipe = max(wipe, (1.0 - smoothstep(width * 2.0, width * 4.0, abs(across))) * fade);
+        Keep(best, Film(across, width, fade));
+        // Small beads it left on its way, here and there.
+        const float S = 0.02;
+        float j = floor(q.y / S);
+        vec2 piece = vec2(j, key.x * 3.0 + key.y);
+        if (R(piece, 70.0) < 0.5) {
+            float by = (j + 0.4 + 0.2 * R(piece, 71.0)) * S;
+            if (by > headY + radius * 1.2 && by < start - 0.01) {
+                float bx = x0 + kColumn * Wander(by, seed) + (R(piece, 72.0) - 0.5) * radius * 0.5;
+                float br = min(radius * (0.18 + 0.27 * R(piece, 73.0)), 0.0065) * (0.6 + 0.4 * fade);
+                Keep(best, Round(q - vec2(bx, by), br, fade, R(piece, 74.0)));
+            }
+        }
+    }
+}
+
+// Beads: in cells `size` tall, one in some of them, landing, sitting a long while and drying away,
+// then landing again somewhere else in the cell.
+void Beads(inout Hit best, vec2 q, float size, float share, float layer)
+{
+    vec2 g = q / size;
+    vec2 cell = floor(g), f = g - cell;
+    float period = 10.0 + 20.0 * R(cell, layer + 1.0);
+    float life = u_time / period + R(cell, layer + 2.0);
+    float round_ = floor(life), age = life - round_;
+    vec2 key = cell + vec2(round_ * 17.0, round_ * 31.0);
+    if (R(key, layer + 3.0) > share)
+        return;
+    vec2 centre = 0.38 + 0.24 * vec2(R(key, layer + 4.0), R(key, layer + 5.0));
+    float shown = smoothstep(0.0, 0.01, age) * (1.0 - smoothstep(0.7, 1.0, age));
+    float r = 0.1 + 0.22 * R(key, layer + 6.0) * R(key, layer + 7.0) * 1.6;
+    Keep(best, Round((f - centre) * size, min(r, 0.3) * size * (0.6 + 0.4 * shown), shown, R(key, layer + 8.0)));
+}
+
+vec3 Blurred(vec2 uv, float r)
+{
+    vec2 a = vec2(r / u_aspect, r);
+    vec3 sum = textureLod(u_src, uv, 0.0).rgb;
+    for (int i = 0; i < 12; ++i) {  // a disc, spiralling out
+        float f = (float(i) + 0.5) / 12.0;
+        float angle = float(i) * 2.39996;
+        sum += textureLod(u_src, clamp(uv + a * sqrt(f) * vec2(cos(angle), sin(angle)), 0.0, 1.0), 0.0).rgb;
+    }
+    return sum / 13.0;
+}
+
+void main()
+{
+    // Behind wet glass the scene is a little soft.
+    vec3 scene = Blurred(v_uv, 0.003 * u_amount);
+    vec2 q = vec2(v_uv.x * u_aspect, v_uv.y);
+    Hit best = None();
+    float wipe = 0.0;
+    float col = floor(q.x / kColumn);
+    for (int i = -1; i <= 1; ++i) {
+        Runner(best, wipe, q, col + float(i), 0.0, 0.85 * u_amount);
+        Runner(best, wipe, q, col + float(i), 1.0, 0.85 * u_amount);
+    }
+    if (wipe < 0.5) {  // (a running drop wipes the beads off its way)
+        float clump = mix(0.3, 1.0, smoothstep(0.25, 0.75, ValueNoise(q * 2.5 + 3.1)));
+        Beads(best, q, 0.014, 0.85 * u_amount * clump, 0.0);
+        Beads(best, q + 0.37, 0.034, 0.7 * u_amount * clump, 10.0);
+        Beads(best, q + 0.71, 0.075, 0.4 * u_amount, 20.0);
+    }
+    vec3 c = scene;
+    if (best.m > 0.0) {
+        vec3 n = best.n;
+        vec2 uv = clamp(v_uv + vec2(best.off.x / u_aspect, best.off.y), 0.0, 1.0);
+        vec3 water = Blurred(uv, best.blur);
+        // Its edge: a little darker toward the bottom (light bent away), and on its upper side the
+        // sky reflected, more the more it's turned away from you.
+        float below = clamp(-n.y * 1.4, 0.0, 1.0), above = clamp(n.y * 1.4 + 0.2, 0.0, 1.0);
+        water *= 1.0 - best.rim * (0.35 + 0.25 * below);  // a thin dark edge
+        vec3 sky = Blurred(vec2(v_uv.x, 0.92), 0.04);
+        float fresnel = pow(1.0 - n.z, 3.0);
+        water = mix(water, sky, fresnel * above * 0.4);
+        // A small sharp highlight, from the light above.
+        float spec = pow(max(dot(n, normalize(vec3(-0.35, 0.75, 0.55))), 0.0), 60.0);
+        water += spec * (1.0 * Luma(sky) + 0.3 * u_light);
+        c = mix(c, water, best.m);
+    }
+    o_color = vec4(c, 1.0);
 }
 )GLSL";
 

@@ -151,6 +151,8 @@ struct Config {
                                           // and what's on screen: bikes, trees, the track's banners)
     double rainSound        = 0.6;        // 0..1 how loud the rain sounds (0: silent; thunder.h), with how
                                           // hard it rains
+    double screenDrops      = 0.0;        // 0..1 water on the screen in the rain (0: none): blurry drops that
+                                          // bead up and run down it (postfx kLensDrops)
     double lightning        = 0.0;        // 0..1 how often lightning strikes in the rain (0: never): a bolt in
                                           // the sky, the clouds and the ground lit by its flash (postfx)
     double lightningSound   = 0.7;        // 0..1 how loud a strike sounds (0: silent; thunder.h), heard as late
