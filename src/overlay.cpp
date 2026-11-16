@@ -43,6 +43,7 @@
 #include "logo_png.h"
 #include "mathlib.h"
 #include "overlay.h"
+#include "paths.h"
 #include "postfx.h"
 #include "replay.h"
 #include "sound_packs.h"
@@ -1755,6 +1756,8 @@ struct PanelState {
     float  grabX = 0, grabY = 0;      // the mouse against the offset when the drag began
     float  zoom         = 1.0f;       // its size against the usual (its bottom right corner dragged; kept while the game runs)
     bool   resizing     = false;      // its corner being dragged
+    bool   notes        = false;      // the patch notes shown in the box instead of the settings
+    int    notesPage    = 0;          // which version's (0: the newest)
     float  resizeScale = 1, resizeW = 0, resizeH = 0, resizeX = 0, resizeY = 0;  // when that began: the size, the mouse
     float  baseScale    = 1.0f;       // this window's usual scale, and the biggest the whole panel fits at
     float  fitScale     = 1.0f;
@@ -2254,6 +2257,7 @@ void StartSearch(double now)
     if (g_panel.renaming >= 0)
         FinishRename(true, now);
     g_panel.searchFocus = true;
+    g_panel.notes = false;
     g_panel.searchStarted = now;
     g_panel.listening = -1;
     PrimeTyping();
@@ -2364,7 +2368,7 @@ bool WeatherRowHidden(const RowDef& def, const Config& cfg)
 
 bool RowShown(int i)
 {
-    if (i < 0 || i >= kRowCount)
+    if (i < 0 || i >= kRowCount || g_panel.notes)
         return false;
     const RowDef& def = kRows[i];
     if (WeatherRowHidden(def, EditConfig()))
@@ -2660,6 +2664,226 @@ std::string ClipboardText()
 bool CopyToClipboard(const std::string& text) { return platform::ClipboardSet(text); }
 std::string ClipboardText() { return platform::ClipboardGet(); }
 #endif
+
+// ===========================================================================
+// Patch notes (MXS_REMASTERED_patch_notes.txt, next to the DLL): every version's notes, newest first,
+// shown in the menu's box ("WHAT'S NEW" under the tabs, or the startup card's link). The file is the
+// author's own, written as posted: "# v1.4 | 2026-11-12" starts a version, "## " a section heading,
+// "- " a bullet, any other line a headline; **text** is bold. Read once.
+// ===========================================================================
+struct NoteSpan { std::string text; bool bold = false; };
+struct NoteLine {
+    enum Kind { Version, Headline, Heading, Bullet, Blank } kind = Blank;
+    std::string version, date;  // a Version line's
+    std::vector<NoteSpan> spans;
+};
+std::vector<NoteLine> g_notes;
+std::vector<size_t> g_notePages;  // where each version's notes start in g_notes (newest first)
+std::string g_notesNewest;  // the newest version ("v1.4"), for the startup card's link ("" with no notes)
+bool g_notesRead = false;
+
+// "2026-11-12" -> "NOV 12, 2026" (anything else as it is).
+std::string NoteDate(const std::string& iso)
+{
+    static const char* const kMonths[] = { "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
+    int y = 0, m = 0, d = 0;
+    if (sscanf_s(iso.c_str(), "%d-%d-%d", &y, &m, &d) != 3 || m < 1 || m > 12)
+        return iso;
+    char text[32];
+    snprintf(text, sizeof text, "%s %d, %d", kMonths[m - 1], d, y);
+    return text;
+}
+
+// Its words, bold where it has **...** (the marks themselves left out).
+std::vector<NoteSpan> NoteSpans(const std::string& text)
+{
+    std::vector<NoteSpan> spans;
+    bool bold = false;
+    size_t at = 0;
+    while (at <= text.size()) {
+        const size_t mark = text.find("**", at);
+        const std::string part = text.substr(at, mark == std::string::npos ? std::string::npos : mark - at);
+        if (!part.empty())
+            spans.push_back(NoteSpan{ part, bold });
+        if (mark == std::string::npos)
+            break;
+        bold = !bold;
+        at = mark + 2;
+    }
+    return spans;
+}
+
+void ReadNotes()
+{
+    if (g_notesRead)
+        return;
+    g_notesRead = true;
+    std::string text;
+    for (const wchar_t* folder : { paths::GameFolder(), paths::DataFolder() }) {
+        if (!folder || !folder[0])
+            continue;
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"%sMXS_REMASTERED_patch_notes.txt", folder);
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path, L"rb") != 0 || !f)
+            continue;
+        char buffer[4096];
+        size_t got;
+        while ((got = fread(buffer, 1, sizeof buffer, f)) > 0)
+            text.append(buffer, got);
+        fclose(f);
+        break;
+    }
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF)
+        text.erase(0, 3);  // (a UTF-8 mark at its start)
+    // The font holds Latin-1: a few of UTF-8's common marks as their nearest, anything else left out.
+    std::string clean;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c < 0x80) {
+            clean += static_cast<char>(c);
+        } else if (c == 0xE2 && i + 2 < text.size() && static_cast<unsigned char>(text[i + 1]) == 0x80) {
+            const unsigned char k = static_cast<unsigned char>(text[i + 2]);
+            clean += k == 0x98 || k == 0x99 ? "'" : k == 0x9C || k == 0x9D ? "\"" : k == 0x93 || k == 0x94 ? "-" : k == 0xA2 ? "\xB7" : "";
+            i += 2;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < text.size()) {
+            const unsigned v = (c & 0x1Fu) << 6 | (static_cast<unsigned char>(text[i + 1]) & 0x3Fu);
+            if (v < 0x100)
+                clean += static_cast<char>(v);
+            ++i;
+        }
+    }
+    size_t at = 0;
+    while (at < clean.size()) {
+        size_t end = clean.find('\n', at);
+        if (end == std::string::npos)
+            end = clean.size();
+        std::string line = clean.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        NoteLine n;
+        if (line.rfind("# ", 0) == 0) {
+            n.kind = NoteLine::Version;
+            const std::string rest = line.substr(2);
+            const size_t bar = rest.find('|');
+            n.version = rest.substr(0, bar);
+            while (!n.version.empty() && n.version.back() == ' ')
+                n.version.pop_back();
+            if (bar != std::string::npos) {
+                size_t d = bar + 1;
+                while (d < rest.size() && rest[d] == ' ')
+                    ++d;
+                n.date = NoteDate(rest.substr(d));
+            }
+            if (g_notesNewest.empty())
+                g_notesNewest = n.version;
+            g_notePages.push_back(g_notes.size());
+        } else if (line.rfind("## ", 0) == 0) {
+            n.kind = NoteLine::Heading;
+            n.spans = NoteSpans(line.substr(3));
+        } else if (line.rfind("- ", 0) == 0) {
+            n.kind = NoteLine::Bullet;
+            n.spans = NoteSpans(line.substr(2));
+        } else if (!line.empty()) {
+            n.kind = NoteLine::Headline;
+            n.spans = NoteSpans(line);
+        }
+        g_notes.push_back(n);
+    }
+    Log("panel: patch notes: %d line(s), newest %s", static_cast<int>(g_notes.size()),
+        g_notesNewest.empty() ? "(none: MXS_REMASTERED_patch_notes.txt not found)" : g_notesNewest.c_str());
+}
+
+// Lays one version's notes (page: 0 the newest) out cw wide from (x, y) - drawing them when draw - and
+// returns how tall they are. Bold words in white, the rest a softer grey; each word wraps whole onto
+// the next line.
+float LayoutNotes(int page, float x, float y, float cw, bool draw, float s, float clipTop, float clipBottom)
+{
+    const auto S = [s](float v) { return std::round(v * s); };
+    const float top = y;
+    const uint32_t soft = Rgba(196, 196, 202, 1.0f);
+    const auto Words = [&](const std::vector<NoteSpan>& spans, FontId font, float left, float width, float lineH,
+                           uint32_t plain, uint32_t bold, float tracking) {
+        float px = left;
+        const float space = TextWidth(font, " ", tracking);
+        bool lineStart = true;
+        for (const NoteSpan& span : spans) {
+            size_t at = 0;
+            while (at < span.text.size()) {
+                size_t end = span.text.find(' ', at);
+                if (end == std::string::npos)
+                    end = span.text.size();
+                const std::string word = span.text.substr(at, end - at);
+                at = end + 1;
+                if (word.empty()) {
+                    if (!lineStart)
+                        px += space;
+                    continue;
+                }
+                const float ww = TextWidth(font, word.c_str(), tracking);
+                if (!lineStart && px + ww > left + width) {
+                    y += lineH;
+                    px = left;
+                    lineStart = true;
+                }
+                if (draw && y + lineH >= clipTop && y <= clipBottom)
+                    Text(font, px, y, word.c_str(), span.bold ? bold : plain, tracking);
+                px += ww + space;
+                lineStart = false;
+            }
+            // (a span ending mid-word, the next starting right after it: no space between them)
+            if (!span.text.empty() && span.text.back() != ' ' && !lineStart)
+                px -= space;
+        }
+        y += lineH;
+    };
+    const size_t first = page >= 0 && page < static_cast<int>(g_notePages.size()) ? g_notePages[static_cast<size_t>(page)] : 0;
+    const size_t last = page + 1 < static_cast<int>(g_notePages.size()) ? g_notePages[static_cast<size_t>(page) + 1] : g_notes.size();
+    for (size_t i = first; i < last; ++i) {
+        const NoteLine& n = g_notes[i];
+        switch (n.kind) {
+        case NoteLine::Version: {
+            const float vh = LineHeight(kFontTab);
+            if (draw && y + vh >= clipTop && y <= clipBottom) {
+                Text(kFontTab, x, y, n.version.c_str(), kAccentHot, 0);
+                if (!n.date.empty()) {
+                    const float vw = TextWidth(kFontTab, n.version.c_str(), 0);
+                    Text(kFontSmall, x + vw + S(16), y + std::round((vh - LineHeight(kFontSmall)) * 0.5f) + S(2), n.date.c_str(), kDim, S(1));
+                }
+            }
+            y += vh + S(12);
+            break;
+        }
+        case NoteLine::Headline:
+            Words(n.spans, kFontLabel, x, cw, LineHeight(kFontLabel) + S(6), White(1.0f), White(1.0f), 0);
+            break;
+        case NoteLine::Heading:
+            y += S(12);
+            Words(n.spans, kFontSection, x, cw, LineHeight(kFontSection) + S(4), kSection, kSection, 0);
+            if (draw)
+                Rect(x, y + S(2), cw, std::fmax(1.0f, S(1)), kLine);
+            y += S(12);
+            break;
+        case NoteLine::Bullet: {
+            const float lh = LineHeight(kFontBody) + S(6);
+            if (draw && y + lh >= clipTop && y <= clipBottom)
+                Disc(x + S(8), y + std::round(LineHeight(kFontBody) * 0.55f), std::fmax(1.5f, S(2.5f)), kSection);
+            Words(n.spans, kFontBody, x + S(24), cw - S(24), lh, soft, White(1.0f), 0);
+            break;
+        }
+        case NoteLine::Blank:
+            y += S(8);
+            break;
+        }
+    }
+    if (g_notes.empty()) {
+        if (draw)
+            Text(kFontLabel, x, y, "No patch notes found (MXS_REMASTERED_patch_notes.txt, next to opengl32.dll).", kDim, 0);
+        y += LineHeight(kFontLabel);
+    }
+    return y - top;
+}
 
 // Where the panel is on screen (at the atlas's scale): its left, top, width and height.
 struct PanelPlace { float x = 0, y = 0, w = 0, h = 0; };
@@ -3017,7 +3241,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
 
     // ---- Tabs (down the left) ----
     {
-        if (g_panel.selected == kTabBarItem && in.step) {
+        if (g_panel.notes && in.step && !g_notePages.empty())  // (the notes up: the arrows go through the versions)
+            g_panel.notesPage = Clamp(g_panel.notesPage + (in.step > 0 ? 1 : -1), 0, static_cast<int>(g_notePages.size()) - 1);
+        else if (g_panel.selected == kTabBarItem && in.step) {
             g_panel.tab = (g_panel.tab + in.step + kTabCount) % kTabCount;
             ClearSearch();
         }
@@ -3031,7 +3257,7 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             g_panel.tabBar += (wanted - g_panel.tabBar) * static_cast<float>(1.0 - std::exp(-dt / 0.06));
             if (std::fabs(wanted - g_panel.tabBar) < 0.002f)
                 g_panel.tabBar = wanted;
-            if (g_panel.search.empty())
+            if (g_panel.search.empty() && !g_panel.notes)
                 GradientH(sideX, std::round(top + g_panel.tabBar * itemH), sideW, barH, kAccent, kAccentDeep);
         }
         for (int tab = 0; tab < kTabCount; ++tab) {
@@ -3040,9 +3266,10 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             if (hot && in.pressed) {
                 g_panel.tab = tab;
                 g_panel.selected = kTabBarItem;
+                g_panel.notes = false;
                 ClearSearch();
             }
-            const bool current = !g_panel.search.size() && tab == g_panel.tab;
+            const bool current = !g_panel.search.size() && !g_panel.notes && tab == g_panel.tab;
             if (hot && !current)
                 GradientH(sideX, iy, sideW, barH, White(0.08f), White(0.0f));
             Text(kFontTab, sideX + S(24), iy + std::round((barH - LineHeight(kFontTab)) * 0.5f), kTabs[tab],
@@ -3050,9 +3277,28 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
         }
         if (g_panel.selected == kTabBarItem)
             Marker(sideX - S(12), std::round(top + g_panel.tabBar * itemH), barH);
-        // Under the tabs, at the bottom: the keys, and the credit.
+        // Under the tabs, at the bottom: the patch notes' button, the keys, and the credit.
         const float lh = LineHeight(kFontSmall);
         const float creditY = buttonsY - S(22) - lh;
+        {
+            const char* label = "WHAT'S NEW";
+            const float bh = S(34), bw = sideW, bx = sideX, by = creditY - S(16) - 2 * lh - S(4) - S(22) - bh;
+            const bool hot = in.Inside(bx, by, bw, bh);
+            if (hot && in.pressed) {
+                ReadNotes();
+                ClearSearch();
+                g_panel.notes = !g_panel.notes;
+                g_panel.notesPage = 0;
+            }
+            RoundedRect(bx - thin, by - thin, bw + 2 * thin, bh + 2 * thin, S(5) + thin,
+                        g_panel.notes ? kAccent : (hot ? kOutline : Rgba(66, 66, 72, 1.0f)));
+            RoundedRect(bx, by, bw, bh, S(5), g_panel.notes ? Rgba(60, 10, 14, 1.0f) : Rgba(30, 30, 33, 1.0f));
+            const float tw = TextWidth(kFontSmall, label, S(2));
+            Text(kFontSmall, bx + std::round((bw - tw) * 0.5f), by + std::round((bh - lh) * 0.5f), label,
+                 g_panel.notes || hot ? White(1.0f) : kLabel, S(2));
+            OfferHelp("Every update's patch notes, newest first. Click a tab to go back to the settings.", by, by + bh, bx, bw,
+                      hot, false);
+        }
         char hint[64];
         snprintf(hint, sizeof hint, "%s TO CLOSE", KeyName(cfg.menuKey));
         Text(kFontSmall, sideX + S(4), creditY - S(16) - 2 * lh - S(4), hint, kDim, S(1));
@@ -3081,11 +3327,24 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             listH += rowH;
         }
     }
+    // The patch notes: a row of the versions along the top of the box (one page each), the chosen one's
+    // notes under it, scrolled.
+    const float notesBarH = S(64);
+    if (g_panel.notes) {
+        ReadNotes();
+        g_panel.notesPage = Clamp(g_panel.notesPage, 0, std::max(0, static_cast<int>(g_notePages.size()) - 1));
+        listH = notesBarH + S(14) + LayoutNotes(g_panel.notesPage, cx, 0, cw, false, s, 0, 0) + S(30);
+    }
     const float maxScroll = std::fmax(0.0f, listH - boxH);
     {
-        if (g_panel.listTab != g_panel.tab || g_panel.listQuery != g_panel.query) {  // a new list: from its top
+        static bool listNotes = false;
+        static int listPage = -1;
+        if (g_panel.listTab != g_panel.tab || g_panel.listQuery != g_panel.query || listNotes != g_panel.notes ||
+            (g_panel.notes && listPage != g_panel.notesPage)) {  // a new list (or another version's notes): from its top
             g_panel.listTab = g_panel.tab;
             g_panel.listQuery = g_panel.query;
+            listNotes = g_panel.notes;
+            listPage = g_panel.notesPage;
             g_panel.scroll = g_panel.scrollTarget = 0;
         }
         if (in.wheel != 0 && in.Inside(boxX, boxY, boxR + S(36) - boxX, boxH))
@@ -3299,7 +3558,30 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
             g_keepRanges.push_back({ keptBegin, g_batch.size() });
         y += rowH;
     }
-    if (rowsShown == 0) {
+    if (g_panel.notes) {
+        LayoutNotes(g_panel.notesPage, cx, boxY + notesBarH + S(14) - g_panel.scroll, cw, true, s, boxY + notesBarH - S(60),
+                    boxB + S(10));
+        // The versions, one button each (the chosen one red), over a solid strip the notes scroll under.
+        Rect(boxX, boxY, boxW, notesBarH, Rgba(8, 8, 10, 1.0f));
+        Rect(cx, boxY + notesBarH - S(1), cw, std::fmax(1.0f, S(1)), kLine);
+        const float bh = S(34), by = boxY + std::round((notesBarH - bh) * 0.5f), gapX = S(8);
+        float bx = cx;
+        for (size_t v = 0; v < g_notePages.size(); ++v) {
+            const char* name = g_notes[g_notePages[v]].version.c_str();
+            const float bw = std::fmax(S(64), TextWidth(kFontLabel, name, 0) + S(28));
+            if (bx + bw > cx + cw)
+                break;
+            const bool chosen = static_cast<int>(v) == g_panel.notesPage;
+            const bool hot = in.Inside(bx, by, bw, bh);
+            if (hot && in.pressed)
+                g_panel.notesPage = static_cast<int>(v);
+            RoundedRect(bx, by, bw, bh, S(5),
+                        chosen ? kAccent : (hot ? Rgba(54, 54, 60, 1.0f) : Rgba(30, 30, 33, 1.0f)));
+            Text(kFontLabel, bx + std::round((bw - TextWidth(kFontLabel, name, 0)) * 0.5f),
+                 by + std::round((bh - LineHeight(kFontLabel)) * 0.5f), name, chosen || hot ? White(1.0f) : kLabel, 0);
+            bx += bw + gapX;
+        }
+    } else if (rowsShown == 0) {
         char none[96];
         snprintf(none, sizeof none, "Nothing matches \"%s\"", g_panel.query.c_str());
         Text(kFontLabel, cx, boxY + S(30), none, kDim, 0);
@@ -3349,7 +3631,9 @@ void BuildPanel(int screenWidth, int screenHeight, const Input& in, double now)
     {
         char readout[256];
         const camera::Telemetry& t = camera::LastTelemetry();
-        if (searching) {
+        if (g_panel.notes) {
+            snprintf(readout, sizeof readout, "PATCH NOTES   \xB7   ARROW KEYS OR CLICK A VERSION   \xB7   CLICK A TAB TO GO BACK TO THE SETTINGS");
+        } else if (searching) {
             snprintf(readout, sizeof readout, "%d SETTING%s FOUND   \xB7   ESC CLEARS THE SEARCH", rowsShown, rowsShown == 1 ? "" : "S");
         } else if (g_panel.tab == kTabGraphics) {
             const char* tires = postfx::TireStatusText();
@@ -3794,6 +4078,11 @@ uint32_t Faded(uint32_t color, float a)
 // a thin red line fading out to both sides, and "Press [key] to open the menu" with the key drawn as a
 // key cap. Near-black, a little lighter at the top, a faint red glow rising from its bottom, a thin
 // red outline and a soft shadow round it. It rises a little into place as it fades in.
+// The startup card's link to the patch notes ("v1.4 - View patch notes"), where it was drawn (screen
+// pixels; w 0: none), and whether the mouse is on it.
+struct { float x = 0, y = 0, w = 0, h = 0; bool hot = false; } g_hintLink;
+bool g_openNotes = false;  // the link clicked: the menu opens on the notes
+
 void BuildStartupHint(int width, int height, double now)
 {
     const float s = g_atlasScale;
@@ -3817,8 +4106,15 @@ void BuildStartupHint(int width, int height, double now)
     const float beforeW = TextWidth(kFontLabel, before, 0), afterW = TextWidth(kFontLabel, after, 0);
     const float lineW = beforeW + gap + keyW + gap + afterW;
     const float padX = S(40), padTop = S(28), padBottom = S(26), divGap = S(18);
-    const float w = std::round(std::fmax(logoW, lineW) + padX * 2);
-    const float h = std::round(padTop + logoH + divGap + 1 + divGap + keyH + padBottom);
+    // Under it: the newest version's patch notes, a link.
+    ReadNotes();
+    char link[64] = "";
+    if (!g_notesNewest.empty())
+        snprintf(link, sizeof link, "%s - View patch notes", g_notesNewest.c_str());
+    const float linkH = link[0] ? LineHeight(kFontLabel) : 0.0f, linkGap = link[0] ? S(16) : 0.0f;
+    const float linkW = link[0] ? TextWidth(kFontLabel, link, 0) : 0.0f;
+    const float w = std::round(std::fmax(std::fmax(logoW, lineW), linkW) + padX * 2);
+    const float h = std::round(padTop + logoH + divGap + 1 + divGap + keyH + linkGap + linkH + padBottom);
     const float rise = std::round((1.0f - ease) * S(16));
     const float x = std::round((width - w) * 0.5f), y = std::round((height - h) * 0.5f) + rise, r = S(16);
     // Its shadow: soft, a little below it.
@@ -3860,6 +4156,19 @@ void BuildStartupHint(int width, int height, double now)
          rowY + std::round((keyH - keyTextH) * 0.5f), key, White(a), S(1));
     px += keyW + gap;
     Text(kFontLabel, px, ty, after, Faded(kLabel, a), 0);
+    // The link: brighter, underlined, under the mouse.
+    g_hintLink.w = 0;
+    if (link[0]) {
+        const float lx2 = std::round(x + (w - linkW) * 0.5f), ly2 = rowY + keyH + linkGap;
+        const uint32_t colour = g_hintLink.hot ? Rgba(255, 90, 96, 1.0f) : kAccentHot;
+        Text(kFontLabel, lx2, ly2, link, Faded(colour, a), 0);
+        if (g_hintLink.hot)
+            Rect(lx2, ly2 + linkH + S(1), linkW, std::fmax(1.0f, S(1)), Faded(colour, a));
+        g_hintLink.x = lx2 - S(6);
+        g_hintLink.y = ly2 - S(4);
+        g_hintLink.w = linkW + S(12);
+        g_hintLink.h = linkH + S(8);
+    }
 }
 
 // Draws the startup hint over this frame (the menu closed), while it lasts.
@@ -3882,11 +4191,22 @@ void StartupHintFrame(HWND window, double now)
         return;
     if (g_hintStart < 0)
         g_hintStart = now;
+    // The mouse on the patch notes' link (its place as last drawn).
+    g_hintLink.hot = false;
+    if (g_hintLink.w > 0 && g_hintLeaveAt < 0) {
+        POINT cursor;
+        if (GetCursorPos(&cursor) && ScreenToClient(window, &cursor))
+            g_hintLink.hot = cursor.x >= g_hintLink.x && cursor.x < g_hintLink.x + g_hintLink.w && cursor.y >= g_hintLink.y &&
+                             cursor.y < g_hintLink.y + g_hintLink.h;
+    }
     if (g_hintLeaveAt < 0 && testAt < 0) {
-        // Its time up, or a click (in the game's window, after its first moment): going.
+        // Its time up (not while the mouse is on the link), or a click (in the game's window, after its
+        // first moment): going. A click on the link opens the menu on the patch notes.
         const bool clicked = window == GetForegroundWindow() &&
                              ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000) != 0;
-        if (now - g_hintStart >= kHintHold || (clicked && now - g_hintStart > 0.3))
+        if (clicked && now - g_hintStart > 0.3 && g_hintLink.hot)
+            g_openNotes = true;
+        if ((now - g_hintStart >= kHintHold && !g_hintLink.hot) || (clicked && now - g_hintStart > 0.3))
             g_hintLeaveAt = now;
     }
     if (HintLeaving(now) >= 1.0f) {
@@ -4290,7 +4610,11 @@ void OverlayFrame(HDC dc)
     if (!g_panel.open) {
         if (!window || !g_glAvailable)
             return;
-        if (!((menuKey && focus) || testOpen)) {
+        // (For automated tests: opened on the patch notes.)
+        static const bool testNotes = GetEnvironmentVariableA("MXCAM_TEST_MENU_NOTES", nullptr, 0) > 0;
+        if (testNotes && testOpen)
+            g_openNotes = true;
+        if (!((menuKey && focus) || testOpen || g_openNotes)) {
             DabIndicatorFrame(window);
             StartupHintFrame(window, now);  // (which key opens the menu, for a few seconds after the start)
             return;
@@ -4301,6 +4625,13 @@ void OverlayFrame(HDC dc)
         else if (g_hintStart < 0)
             g_hintDone = true;
         OpenPanel(window);
+        if (g_openNotes) {
+            g_openNotes = false;
+            ReadNotes();
+            ClearSearch();
+            g_panel.notes = true;
+            g_panel.notesPage = 0;
+        }
     } else if (g_panel.askRestart && focus && escape) {
         g_panel.askRestart = false;  // Esc on the notice: read, the menu stays open
     } else if (g_panel.askDefaults && focus && escape) {

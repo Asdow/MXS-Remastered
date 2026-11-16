@@ -1,0 +1,153 @@
+# v1.5 | 2026-11-15
+MXS Remastered v1.5 OUT NOW
+
+## What's new?
+- Rain weather: Rainfall, puddles that reflect the surroundings, wets the track, lightning and thunder (with sound), rain sound, screen drops (blurry water drops and streams on screen), water spray from rear tire
+- Snow improvements: Snow amount slider, snow tires, snowstorm sound, tire sound in snow, new snow texture
+- Roost: Rear tire throws out dust and dirt (both adjustable) that match color of ground you are on
+- "Better dirt" option: Gives the ground extra detail
+- New headlight colors: Amber and rainbow
+- New dirt slide sound (sound of tires sliding on dirt while braking hard)
+- New popup loading menu: features new logo, lightsweep effect, vignette that fades away
+- Mod menu can now be moved around (clicking and holding the top)
+- Mod menu can be resized (icon in bottom right that you click and hold)
+- Menu opacity option (in "Other" tab)
+- Patch notes tab
+- Detailed shadows optimization
+- Linux support (experimental)
+
+## Bug fixes
+- Fixed black horizontal lines appearing while in fullscreen
+- Fixed dirt looking too bright in some spots
+- Fixed dirt textures visibly repeating in grid pattern
+- Fixed snow pattern shifting/jumping while driving
+
+# v1.4 | 2026-11-12
+MXS Remastered v1.4 OUT NOW
+
+## What's new?
+- **Complete UI menu over hall (made by me, NOT ai)**
+- **New option for 450 sound mod** (clear version with less muffle)
+- **2 extra preset slots** (5 total now)
+- **Preset naming**
+- **Shadow softness setting**
+- **Better look left/right/behind for 3rd person**
+- **Use the look around feature without having the first person mod on**
+- **Confirmation popup when you click "default" in the mod menu**
+- **Cancel button in bottom of menu when you start changing settings**
+
+## Bug fixes
+- Fixed mud going on bike instead of tires
+- Fixed mud going on helmet instead of tires
+- Shadow resolution setting actually works now (higher effects FPS)
+- Rider/bike shadows fixed in 3rd person
+- Fixed glitchy shadows in berms/corners
+- Fixed shadows loading in only when you get near
+- Fixed rider/bike duplicating and doing slimy shit when going over ruts
+- Fixed pixelated shadows on rider gear
+
+# v1.3 | 2026-11-09
+BIGGEST UPDATE YET FOR MXS Remastered - v1.3
+
+## What's new?
+- **First look at weather**: Snow - Grey slush in ruts; 3D snowflakes flying around (adjustable); wind slider that effects how the snowflakes move
+- **Sound mods** (only 250f and 450 currently)
+- **Brake squeal sound** (slider for loudness)
+- **Toggle option to have tire dirt and tread marks for every bike**
+- **Toggle option for headlights on every bike**
+- **Added headlight pitch slider**
+- **Dirt depth slider** (credits to @Asdow)
+- **Dirt trail cache slider** that lets you choose how much of the past trails you want to see (credits to @Asdow)
+- **Dab indicator** (works for both sticky dab on and off)
+- **Added key bind options** for look left/right and behind (used to only work with the d-pad)
+- **Preset codes:** You can now copy your preset code for your first person settings and graphics settings (separate codes for each) and share them with others to paste in the menu to load your preset. This **does not** effect weather settings, replay settings, key binds, and the "Other" tab in the menu.
+- **Pop up message** when opening game that displays the key bind to open the mod menu
+
+## Bug fixes
+- You no longer have to run the game as administrator
+- Whip lock fixed (no longer snaps the camera weirdly while going over jumps)
+- Fixed camera pitch changing after a big crash or changing unrelated settings
+- Saving settings no longer freezes the game
+- Fixed headlights while in 3rd person (no longer sways to the opposite direction of where you are turning)
+- Fixed headlights flickering
+- Log files and settings files now start with "MXS_REMASTERED" instead of "MXCam"
+- Fixed toggle HUD setting (disappears instantly now and no longer hides the actual game menu)
+- UI sizing fixed
+- Fixed weird polygon meshes appearing on rider gear
+
+# v1.2 | 2026-11-07
+MXS Remastered - v1.2 OUT NOW
+
+## What's new?
+- Increased max shadow distance from 60 meters to 200 meters
+- Increased max steadiness to 200%
+- Added shadow resolution setting
+- Added pitch option for the headlight (the higher the pitch, the more ahead you can see)
+
+## Bug fixes
+- Fixed a bunch of issues with shadows not rendering properly
+- Fixed corners having weird glitchy shadow patches
+- Fixed tire dirt and tread marks disappearing randomly
+- Rider/bike shadows are more consistent
+
+# v1.1 | 2026-11-05
+MXS Remastered - v1.1 OUT NOW
+
+## What's new?
+- Presets: Easily switch between 3 setting profiles
+- Added new tab in the mod menu called "Other"
+- Toggle button for the HUD
+- Toggle button for the cursor
+- Windowed full screen (borderless, instant alt+tab)
+- Option for fading menu while changing graphics (this is so you can actually see everything changing instead of the screen being covered with the menu)
+
+## Bug fixes
+- Fixed the weird lines that kept showing up for people. This was an issue with running the game in full screen which would cause screen tearing issues. I added a windowed full screen option that fixes this.
+- Fixed more stuttering problems with the first person camera (don't use whip lock for now its buggy)
+- Rider and bike shadows are a little better now in first person (still needs improvement)
+- Fixed weird box shadow that would follow the shadow around
+
+# v1.0 | 2026-11-04
+INTRODUCING MXS REMASTERED - NOW APPROVED BY rF
+I'M MAKING IT COMPLETELY FREE FOR EVERYBODY, ALL THESE MFS TRYNA MAKE MONEY
+
+## First Person Camera (includes everything from MXCam + more)
+- Dynamic first person view that rides with the bike instead of being stuck to it
+- Stabilization: horizon lock, pitch lock, steadiness control
+- Neck and G-forces: your head compresses on landings and nods with impacts
+- Look to apex: your head turns into corners (currently buggy)
+- Controller d-pad look left, right, and behind
+- Air control: looser view in the air, with an optional whip lock that keeps the view on your line during whips and scrubs
+- Adjustable head position, look-down angle, and smoothing, plus an option to hide your torso and head at high FOVs
+
+## Replay/Spectating Cameras
+- 3rd person chase cam (locked view in the works)
+- Helmet cam: top, left side, right side, or chest mount, with GoPro-style stabilization
+
+## Shaders
+- Time of day: a full day/night cycle with sunsets, stars, and a moonlit nights and the sun lighting the bikes from where it is
+- Bike headlight for night riding (currently buggy in 3rd person)
+- Real-time shadows from bikes, riders, trees and track objects, plus ambient occlusion
+- Tire marks: your tires dig ruts into the track (currently buggy)
+- Tire dirt: mud builds up on your tires (currently buggy)
+- Dirt detail: high-res grain, pebbles, and clods on the track up close
+- Sun rays, bloom, depth of field, motion blur
+- Sharper image: anti-aliasing (FXAA), sharpening, anisotropic and trilinear filtering
+- Color controls: brightness, contrast, saturation, vignette
+
+## Easy to use
+- Pull up the in-game menu with (E)
+- Hotkeys (changeable in the keybinds tab): F8 toggles the camera mod and F7 toggles the shaders
+- Only want the shaders? Turn the camera mod off and keep the graphics
+
+## What's next?
+- Fix bugs with dirt build up on the tires and the tire marks in the ground
+- Fix bugs with the headlight in 3rd person
+- Fix head and rear wheel not showing in shadow while in 1st person
+- 3rd person locked camera for replays/spectating
+- Settings presets to easily switch between different profiles
+- Roost/dust kickup from tires
+- Weather effects
+- Sound mods?
+
+LOVE YOU ALL <3

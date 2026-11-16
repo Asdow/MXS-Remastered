@@ -144,6 +144,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="src\gl_exports.inl" />
+    <None Include="MXS_REMASTERED_patch_notes.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Include="MXS_REMASTERED.ini">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
